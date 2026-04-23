@@ -1,0 +1,67 @@
+[project]
+name = "codebase-rag"
+version = "0.1.0"
+description = "Codebase RAG - Git-aware semantic code knowledge base"
+requires-python = ">=3.11"
+dependencies = [
+    # --- Qdrant ---
+    "qdrant-client>=1.12.0",
+
+    # --- LLM / Embedding ---
+    "httpx>=0.27.0",
+    "tiktoken>=0.8.0",
+
+    # --- Web 框架 ---
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "aiohttp>=3.10.0",
+
+    # --- MCP ---
+    "mcp>=1.18.0",
+
+    # --- 配置 ---
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "pyyaml>=6.0",
+    "watchfiles>=1.0.0",
+
+    # --- 调度 ---
+    "apscheduler>=3.10.0",
+
+    # --- 日志 ---
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+codebase-rag = "codebase_rag.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codebase_rag"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

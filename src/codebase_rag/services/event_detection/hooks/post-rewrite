@@ -1,0 +1,14 @@
+#!/bin/sh
+# Codebase RAG Event Hook - TEMPLATE
+# This is a template file. Actual hook scripts are generated dynamically
+# by the Event Detection Service with project-specific configuration.
+#
+# Hook type: post-rewrite
+# Triggered after: git commit --amend, git rebase
+# Purpose: Notify RAG system of history rewrite (CONTENT_COMMIT event)
+
+curl -s -X POST "http://127.0.0.1:9876/hook" \
+  -H "Content-Type: application/json" \
+  -d "{\"project_id\":\"__PROJECT_ID__\",\"hook_type\":\"post-rewrite\",\"args\":\"$@\"}" \
+  --max-time 2 \
+  || true

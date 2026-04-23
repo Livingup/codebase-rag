@@ -1,0 +1,32 @@
+# Environment variables (API keys)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# AICode 工作目录
+.workflowagent/
+/.venv/

@@ -1,0 +1,757 @@
+# =============================================================================
+# Codebase RAG — 配置文件模板
+# 复制为 config.yaml 并填入实际值后使用
+# curl -X POST http://127.0.0.1:18080/api/v1/config/reload
+# =============================================================================
+
+system:
+  data_dir: "G:/App/code base rag"
+  log:
+    level: "INFO"
+    format: "text"                         # "json" 或 "text"
+    file: null                             # 全量日志文件路径（null = 仅 stdout）
+    error_file: "G:/App/code base rag/error.log"         # WARNING + ERROR 专用日志文件
+    max_bytes: 52428800                    # 日志轮转：单文件最大字节数（默认 50MB）
+    backup_count: 5                        # 日志轮转：保留备份文件数
+
+# --- 04-Embedding 服务 ---
+embedding:
+  dense:
+    active_provider: "gemini"
+    providers:
+      gemini:
+        api_base_url: "https://generativelanguage.googleapis.com"
+        model_name: "gemini-embedding-001"
+        dimension: 3072
+        batch_size: 100
+        max_tokens_per_text: 2048
+        request_timeout: 30
+        api_keys:
+          - key: "${GEMINI_EMBED_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+
+  sparse:
+    active_provider: "dashscope"
+    providers:
+      dashscope:
+        api_base_url: "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding"
+        model_name: "text-embedding-v4"
+        dimension: 2048
+        batch_size: 10
+        max_tokens_per_text: 2048
+        request_timeout: 30
+        api_keys:
+          - key: "${DASHSCOPE_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+
+  max_concurrency: 3
+
+# --- 01-Qdrant 存储服务 ---
+qdrant_storage:
+  connection:
+    host: "localhost"
+    port: 6333
+    grpc_port: 6334
+    prefer_grpc: true
+    timeout: 30
+  collection:
+    name: "codebase"
+    dense_vector:
+      name: "dense_vectors"
+      size: 3072                           # 必须与 embedding dense dimension 一致
+      distance: "Cosine"
+    sparse_vector:
+      name: "sparse_vectors"               # 必须与已有集合一致
+
+# --- 02-内存 Qdrant 服务 ---
+memory_qdrant:
+  cache:
+    max_branches: 5
+    idle_timeout_minutes: 720             # 活跃实例空闲超时（分钟），超时后释放内存，下次搜索自动重建。0=永不释放
+  instance:
+    dense_vector:
+      name: "dense_vectors"
+      size: 3072                           # 必须与上方一致
+      distance: "Cosine"
+    sparse_vector:
+      name: "sparse_vectors"               # 必须与上方一致
+
+# --- 03-Agent 服务 ---
+# api_format: "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu"
+# 第三方 OpenAI 兼容服务：新增 provider 条目，api_format 设为 "openai_chat"，修改 api_base_url 即可
+agent:
+  llm:
+    models:
+      gemini-3.1-pro:
+        name: "gemini-3.1-pro"
+        context_window: 1048576
+        max_output_tokens: 65536
+        compression_threshold: 200000
+        supports_tool_calling: true
+        supports_structured_output: true
+      gemini-3-flash:
+        name: "gemini-3-flash"
+        context_window: 1048576
+        max_output_tokens: 65536
+        compression_threshold: 200000
+        supports_tool_calling: true
+        supports_structured_output: true
+      gemini-2.5-flash:
+        name: "gemini-2.5-flash"
+        context_window: 1048576
+        max_output_tokens: 65536
+        compression_threshold: 200000
+        supports_tool_calling: true
+        supports_structured_output: true
+      gemini-2.5-pro:
+        name: "gemini-2.5-pro"
+        context_window: 1048576
+        max_output_tokens: 65536
+        compression_threshold: 200000
+        supports_tool_calling: true
+        supports_structured_output: true
+      gpt-5.4:
+        name: "gpt-5.4"
+        context_window: 1048576
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
+      claude-opus-4-6:
+        name: "claude-opus-4-6"
+        context_window: 1000000
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
+      claude-sonnet-4-6:
+        name: "claude-sonnet-4-6"
+        context_window: 1000000
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
+      glm-5.1:
+        name: "glm-5.1"
+        context_window: 200000
+        max_output_tokens: 65536
+        compression_threshold: 180000
+        supports_tool_calling: true
+        supports_structured_output: true
+      glm-4.7:
+        name: "glm-4.7"
+        context_window: 200000
+        max_output_tokens: 65536
+        compression_threshold: 180000
+        supports_tool_calling: true
+        supports_structured_output: true
+      glm-4.7-flash:
+        name: "glm-4.7-flash"
+        context_window: 200000
+        max_output_tokens: 65536
+        compression_threshold: 180000
+        supports_tool_calling: true
+        supports_structured_output: true
+    providers:
+      # gemini:
+      #   api_format: "gemini"
+      #   api_base_url: "https://generativelanguage.googleapis.com"
+      #   models:
+      #     - id: "gemini-3.1-pro"
+      #       tool_choice: "auto"
+      #       thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
+      #     - id: "gemini-3-flash"
+      #       tool_choice: "auto"
+      #       thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
+      #     - id: "gemini-2.5-flash"
+      #       tool_choice: "auto"
+      #       thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
+      #     - id: "gemini-2.5-pro"
+      #       tool_choice: "auto"
+      #       thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
+      #   api_keys:
+      #     - key: "${GEMINI_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+      # openai:
+      #   api_format: "openai_chat"
+      #   api_base_url: "https://api.openai.com"
+      #   models:
+      #     - id: "gpt-5.4"
+      #       tool_choice: "auto"
+      #       thinking: '{"reasoning_effort":"high"}'
+      #   api_keys:
+      #     - key: "${OPENAI_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+      # openai_responses:
+      #   api_format: "openai_responses"
+      #   api_base_url: "https://api.openai.com"
+      #   models:
+      #     - id: "gpt-5.4"
+      #       tool_choice: "auto"
+      #       thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+      #       # custom_headers:                     # 可选：自定义请求头（适用于 OpenRouter 等第三方代理）
+      #       #   X-Custom-Provider: "my-provider"
+      #       #   HTTP-Referer: "https://my-app.com"
+      #   api_keys:
+      #     - key: "${OPENAI_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+      # anthropic:
+      #   api_format: "anthropic"
+      #   api_base_url: "https://api.anthropic.com"
+      #   models:
+      #     - id: "claude-opus-4-6"
+      #       tool_choice: "auto"
+      #       thinking: '{"thinking":{"type":"enabled","budget_tokens":64000}}'
+      #     - id: "claude-sonnet-4-6"
+      #       tool_choice: "auto"
+      #       thinking: '{"thinking":{"type":"enabled","budget_tokens":64000}}'
+      #   api_keys:
+      #     - key: "${ANTHROPIC_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+      # kiro:
+      #   api_format: "anthropic"
+      #   api_base_url: "${CUSTOM_ANTHROPIC_COMPAT_BASE_URL}"
+      #   models:
+      #     - id: "claude-opus-4-6"
+      #       tool_choice: "auto"
+      #       thinking: '{"thinking":{"type":"enabled","budget_tokens":64000}}'
+      #   api_keys:
+      #     - key: "${CUSTOM_ANTHROPIC_COMPAT_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+      zhipu:
+        api_format: "zhipu"
+        api_base_url: "https://open.bigmodel.cn"
+        models:
+          - id: "glm-5.1"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled","clear_thinking":false}}'
+          - id: "glm-4.7"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled","clear_thinking":false}}'
+          - id: "glm-4.7-flash"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled","clear_thinking":false}}'
+        api_keys:
+          - key: "${ZHIPU_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 5                    # 该服务商最大并发请求数
+      openai_compatible_secondary:
+        api_format: "gemini"
+        api_base_url: "http://localhost:8317"
+        models:
+          - id: "gemini-3.1-pro"
+            alias: "gemini-3.1-pro-preview"
+            tool_choice: "auto"
+            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
+          - id: "gemini-3-flash"
+            alias: "gemini-3-flash-preview"
+            tool_choice: "auto"
+            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
+          - id: "gemini-2.5-flash"
+            tool_choice: "auto"
+            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
+          - id: "gemini-2.5-pro"
+            tool_choice: "auto"
+            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
+        api_keys:
+          - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 10                   # 该服务商最大并发请求数
+      # custom_openai_compatible:
+      #   api_format: "openai_responses"
+      #   api_base_url: "${CUSTOM_OPENAI_COMPAT_BASE_URL}"
+      #   models:
+      #     - id: "gpt-5.4"
+      #       tool_choice: "auto"
+      #       thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+      #   api_keys:
+      #     - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
+      #   retry:
+      #     max_retries_per_key: 3
+      #     retry_base_delay: 1.0
+      #     retry_backoff_multiplier: 2.0
+      #     key_cooldown_seconds: 60
+      #   max_concurrency: 5                  # 该服务商最大并发请求数
+#      custom_openai_compatible:
+#        api_format: "openai_responses"
+#        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+#        models:
+#          - id: "gpt-5.4"
+#            tool_choice: "auto"
+#            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+#            custom_headers:
+#              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
+#        api_keys:
+#          - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
+#        retry:
+#          max_retries_per_key: 3
+#          retry_base_delay: 1.0
+#          retry_backoff_multiplier: 2.0
+#          key_cooldown_seconds: 60
+#        max_concurrency: 2                    # 该服务商最大并发请求数
+      custom_openai_compatible:
+        api_format: "openai_responses"
+        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+        models:
+          - id: "gpt-5.4"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:                    
+              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
+        api_keys:
+          - key: "${custom_openai_compatible_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 5                    # 该服务商最大并发请求数
+      openai_compatible_primary:
+        api_format: "openai_responses"
+        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+        models:
+          - id: "gpt-5.4"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:                    
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"
+        api_keys:
+          - key: "${OPENAI_COMPAT_PRIMARY_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 5                    # 该服务商最大并发请求数                
+    default_provider: "openai_compatible_primary"
+    default_model: "gpt-5.4"
+  context_compression:                     # 上下文压缩 agent 的 LLM 配置
+    provider: "openai_compatible_primary"                      # 用哪个 provider 驱动压缩（null = default_provider）
+    model: "gpt-5.4"                       # 用哪个模型（null = default_model）
+    temperature: 0.0
+    timeout: 600                            # 压缩 agent 超时（秒）
+
+# --- 05-事件检测服务 ---
+event_detection:
+  hook_receiver:
+    mode: "http"                        # "http" | "named_pipe"
+    http:
+      host: "127.0.0.1"
+      port: 9876
+      endpoint: "/hook"
+    named_pipe:
+      path: "\\\\.\\pipe\\codebase-rag-hook"  # Windows Named Pipe
+      # path: "/tmp/codebase-rag-hook.sock"   # Unix Domain Socket
+  watcher:
+    enabled: true                       # 兜底文件系统监听
+    debounce_ms: 500                    # 防抖窗口（毫秒）
+    watch_paths:                        # 相对于 .git/ 的监听路径
+      - "HEAD"
+      - "refs/heads/"
+      - "MERGE_HEAD"
+      - "REBASE_HEAD"
+  dedup:
+    window_ms: 1000                     # 去重窗口（毫秒），hook + watcher 合并为一次
+
+# --- 06-管理 API 服务 ---
+management_api:
+  server:
+    host: "127.0.0.1"
+    port: 18080
+  registry_path: "G:/App/code base rag/project_registry.json"  # 项目注册表持久化路径，重启自动恢复
+
+# --- 07-Git 操作服务 ---
+git_operations:
+  git_executable: "git"
+  command_timeout: 30
+  max_concurrency: 4
+  file_filter:
+    # Layer 1 黑名单
+    exclude_patterns:
+      - "node_modules/**"
+      - "vendor/**"
+      - ".venv/**"
+      - "venv/**"
+      - "dist/**"
+      - "build/**"
+      - "out/**"
+      - "__pycache__/**"
+      - ".eggs/**"
+      - "*.egg-info/**"
+      - ".idea/**"
+      - ".vscode/**"
+      - ".vs/**"
+      - "*.min.js"
+      - "*.min.css"
+      - "*.map"
+      - "package-lock.json"
+      - "yarn.lock"
+      - "pnpm-lock.yaml"
+      - "poetry.lock"
+      - "Cargo.lock"
+      - "go.sum"
+      - ".gitignore"
+      - "*.md"
+      - "*.rst"
+      - "*.log"
+      - "*.txt"
+      - "*.csv"
+      - "*.tsv"
+      - "*.svg"
+      - "*.png"
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.gif"
+      - "*.ico"
+      - "*.woff"
+      - "*.woff2"
+      - "*.ttf"
+      - "*.eot"
+      - "*.pdf"
+      - "*.zip"
+      - "*.tar"
+      - "*.gz"
+      - "*.jar"
+      - "*.bin"
+      - "*.dat"
+      - "*.db"
+      - "*.sqlite"
+      - "*.pyc"
+      - "*.pyo"
+      - "*.class"
+      - "*.so"
+      - "*.dll"
+      - "*.exe"
+
+    # Layer 2 白名单
+    include_extensions:
+      - py
+      - js
+      - mjs
+      - cjs
+      - ts
+      - mts
+      - cts
+      - tsx
+      - jsx
+      - java
+      - go
+      - rs
+      - cpp
+      - c
+      - h
+      - cs
+      - rb
+      - php
+      - swift
+      - kt
+      - scala
+      - vue
+      - svelte
+      - dart
+      - lua
+      - r
+      - m
+      - ex
+      - exs
+      - erl
+      - hrl
+      - hs
+      - clj
+      - cljs
+      - groovy
+      - pl
+      - pm
+      - proto
+      - graphql
+      - gql
+      - sol
+      - zig
+      - yml
+      - yaml
+      - toml
+      - json
+      - jsonc
+      - xml
+      - ini
+      - cfg
+      - conf
+      - env
+      - properties
+      - tf
+      - hcl
+      - dockerfile
+      - gradle
+      - cmake
+      - md
+      - rst
+      - sh
+      - bash
+      - ps1
+      - bat
+      - html
+      - css
+      - scss
+      - less
+      - sql
+
+    include_filenames:
+      - Dockerfile
+      - Makefile
+      - Jenkinsfile
+      - Procfile
+      - Gemfile
+      - Rakefile
+      - .gitignore
+      - .env.example
+      - .env.local
+      - .env.production
+      - requirements.txt
+      - setup.py
+      - setup.cfg
+      - pyproject.toml
+      - package.json
+      - tsconfig.json
+      - docker-compose.yml
+      - docker-compose.yaml
+
+    # Layer 3 灰区 LLM 判断
+    uncertain:
+      enabled: true
+      binary_detection: true
+      classify_batch_size: 50
+      store_path: "G:/App/code base rag/gray_area_classifications.json"  # 灰区分类经验持久化
+
+# --- 08-工作流编排服务 ---
+workflow:
+  data_dir: "G:/App/code base rag"             # 重试队列/死信队列持久化目录
+  initialization:
+    mode: "full"                 # "incremental" = 仅跟踪增量（默认） | "full" = 全量初始化
+    max_file_concurrency: 5     # 全量初始化时并发处理的文件数（通过 asyncio.Semaphore 控制）
+
+  knowledge_producer:                   # 源码业务描述生成 agent 的 LLM 负载配置
+    timeout: 3600                        # agent 超时（秒）
+    max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
+    max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
+    providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
+      - provider: "zhipu"               # 引用 agent.llm.providers 中的 key
+        model: "glm-5.1"          # 引用该 provider 下 models[].id
+        priority: 40
+
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3-flash"
+        priority: 31
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-flash"
+        priority: 33
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-pro"
+        priority: 32
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3.1-pro"
+        priority: 30
+
+#      - provider: "custom_openai_compatible"
+#        model: "gpt-5.4"
+#        priority: 20
+
+      - provider: "openai_compatible_primary"
+        model: "gpt-5.4"
+        priority: 10
+
+      # - provider: "custom_openai_compatible"
+      #   model: "gpt-5.4"
+      #   priority: 10
+  gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
+    timeout: 30                         # agent 超时（秒）
+    max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
+    providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
+      - provider: "zhipu"
+        model: "glm-4.7-flash"
+        priority: 30
+      - provider: "zhipu"
+        model: "glm-4.7"
+        priority: 31
+      - provider: "zhipu"
+        model: "glm-5.1"
+        priority: 32
+
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3-flash"
+        priority: 10
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-flash"
+        priority: 11
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-pro"
+        priority: 12
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3.1-pro"
+        priority: 13
+
+      # - provider: "custom_openai_compatible"
+      #   model: "gpt-5.4"
+      #   priority: 20
+      # - provider: "custom_openai_compatible"
+      #   model: "gpt-5.4"
+      #   priority: 15
+  compensation:                           # 失败文件补偿任务配置
+    enabled: true                         # 是否启用后台补偿
+    scan_interval: 60                     # 扫描间隔基准（秒）
+    base_backoff: 30                      # 退避基准时长（秒）
+    max_backoff: 1800                     # 退避上限（秒，默认30分钟）
+    batch_size: 10                        # 每轮最多处理文件数
+    max_file_retries: 50                  # 单文件最大重试次数，超过后归档死信队列
+
+# --- 09-GC 服务 ---
+gc:
+  schedule:
+    enabled: true
+    cron: "0 3 * * *"                   # 默认每天凌晨 3 点
+  policy:
+    orphan_grace_period_days: 7         # 孤儿宽限期（天）
+  scan:
+    batch_size: 500                     # 扫描 Qdrant 时每批次获取的 file_version_id 数量
+    max_delete_batch_size: 100          # 单次 GC 最大删除数量
+    max_concurrency: 2                  # 多项目并行扫描并发数
+  orphan_store:
+    path: "G:/App/code base rag/gc_orphans.json"      # 孤儿记录持久化文件
+
+# --- 11-Context Engine 服务 ---
+context_engine:
+  provider: "openai_compatible_primary"
+  model: "gpt-5.4"
+  max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
+  # provider: "custom_openai_compatible"
+  # model: "gpt-5.4"
+  # provider: "openai_compatible_secondary"
+  # model: "gemini-3-flash"
+  # provider: "openai_compatible_secondary"
+  # model: "gemini-3.1-pro"
+  mcp_servers:                         # 需要接入的 MCP 服务（key 对应 mcp_client.servers）
+    codebase_rag:
+      include_tools:                   # 工具白名单（不配置或为空 → 引入该服务所有工具）
+        - "codebase_search"
+  rg_timeout: 10                       # 单次 ripgrep 子进程超时（秒）
+  max_file_read_lines: 500             # 单次 read_file 最大行数（超过则截断）
+
+# --- MCP Client 服务 ---
+mcp_client:
+  servers:
+    codebase_rag:                               # 本系统的 MCP Server（codebase_search 等）
+      transport: "streamable_http"              # 传输协议：streamable_http / sse / stdio
+      url: "http://127.0.0.1:19090/mcp"         # MCP 端点 URL（与 mcp.servers 配置一致）
+      headers: {}                               # 自定义请求头（认证等）
+      timeout: 300                              # 请求超时（秒），codebase_search 含 LLM 重排序
+    # --- HTTP MCP Server 示例 ---
+    # remote_tools:
+    #   transport: "streamable_http"
+    #   url: "http://localhost:29090/mcp"
+    #   headers:
+    #     Authorization: "Bearer your-token"
+    #   timeout: 30
+    # --- stdio MCP Server 示例 ---
+    # local_tools:
+    #   transport: "stdio"
+    #   command: "npx"
+    #   args: ["-y", "@some/mcp-server"]
+    #   env:
+    #     API_KEY: "your-api-key"
+    #   timeout: 30
+
+# --- 10-MCP 服务 ---
+mcp:
+  servers:
+    codebase_rag:                         # 服务 ID
+      host: "127.0.0.1"
+      port: 19090
+      name: "codebase-rag"               # MCP 协议元数据：服务名称
+      version: "1.0.0"                   # MCP 协议元数据：服务版本
+      # 同一端口同时提供两种传输：
+      #   SSE (legacy):       GET /sse + POST /messages   → 客户端 URL: http://host:port/sse
+      #   Streamable HTTP:    POST|GET|DELETE /mcp         → 客户端 URL: http://host:port/mcp
+    # --- 未来扩展示例 ---
+    # drawing:
+    #   host: "127.0.0.1"
+    #   port: 19091
+    #   name: "drawing-service"
+    #   version: "1.0.0"
+  reranker:
+    providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
+      - provider: "zhipu"                 # 引用 agent.llm.providers 中的 key
+        model: "glm-4.7-flash"            # 引用该 provider 下 models[].id
+        priority: 30
+      - provider: "zhipu"
+        model: "glm-4.7"
+        priority: 31
+      - provider: "zhipu"
+        model: "glm-5.1"
+        priority: 32
+
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3-flash"
+        priority: 10
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-flash"
+        priority: 11
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-pro"
+        priority: 12
+      - provider: "openai_compatible_secondary"
+        model: "gemini-3.1-pro"
+        priority: 13
+      - provider: "openai_compatible_primary"
+        model: "gpt-5.4"
+        priority: 15  
+
+#      - provider: "custom_openai_compatible"
+#        model: "gpt-5.4"
+#        priority: 20
+    recall_limit: 80                    # Stage 1 向量召回最大候选数
+    timeout: 3600                         # 重排序 agent 超时（秒）
+    max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
+  pending_knowledge:
+    store_dir: "G:/App/code base rag/pending_knowledge"  # Git 风格 hash 寻址存储目录
+    ttl_minutes: 0                       # 缓存淘汰超时（分钟），0 = 禁用淘汰
+    point_token_limit: 2048              # 单条知识描述最大 tokens
