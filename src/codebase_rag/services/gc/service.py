@@ -194,11 +194,14 @@ class GCService:
             )
 
             # Step 2: Collect all active file_version_ids (union across branches)
+            # include_uncertain=True because gray-area files that passed L3
+            # classification have knowledge points in Qdrant — excluding them
+            # here would cause false orphan marking and eventual deletion.
             active_ids: Set[str] = set()
             try:
                 for branch in branches:
                     file_tree = await self._git_ops.get_file_tree(
-                        repo_path, branch.name,
+                        repo_path, branch.name, include_uncertain=True,
                     )
                     for entry in file_tree:
                         active_ids.add(entry.file_version_id)
