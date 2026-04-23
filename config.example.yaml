@@ -650,7 +650,7 @@ gc:
     enabled: true
     cron: "0 3 * * *"                   # 默认每天凌晨 3 点
   policy:
-    orphan_grace_period_days: 7         # 孤儿宽限期（天）
+    orphan_grace_period_days: 30        # 孤儿宽限期（天）
   scan:
     batch_size: 500                     # 扫描 Qdrant 时每批次获取的 file_version_id 数量
     max_delete_batch_size: 100          # 单次 GC 最大删除数量
