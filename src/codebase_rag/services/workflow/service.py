@@ -570,7 +570,7 @@ class WorkflowOrchestratorService:
         deleted_count = 0
         renamed_count = 0
         skipped_count = 0
-        cache_hit_count = 0
+        pending_cache_written_count = 0
         total_points = 0
         total_agent_calls = 0
         failed_files: List[FailedFile] = []
@@ -579,7 +579,7 @@ class WorkflowOrchestratorService:
 
         # Step 2A: Process added files
         async def _process_added(entry) -> None:
-            nonlocal added_count, skipped_count, cache_hit_count, total_points, total_agent_calls
+            nonlocal added_count, skipped_count, pending_cache_written_count, total_points, total_agent_calls
             async with file_sem:
                 try:
                     pts, skipped, agents, cache_hit = await self._process_file_with_agent(
@@ -592,7 +592,7 @@ class WorkflowOrchestratorService:
                     if skipped:
                         skipped_count += 1
                     elif cache_hit:
-                        cache_hit_count += 1
+                        pending_cache_written_count += 1
                     else:
                         added_count += 1
                 except Exception as e:
@@ -614,7 +614,7 @@ class WorkflowOrchestratorService:
 
         # Step 2M: Process modified files
         async def _process_modified(entry) -> None:
-            nonlocal modified_count, skipped_count, cache_hit_count, total_points, total_agent_calls
+            nonlocal modified_count, skipped_count, pending_cache_written_count, total_points, total_agent_calls
             async with file_sem:
                 try:
                     # Get old descriptions for context
@@ -635,7 +635,7 @@ class WorkflowOrchestratorService:
                     if skipped:
                         skipped_count += 1
                     elif cache_hit:
-                        cache_hit_count += 1
+                        pending_cache_written_count += 1
                     else:
                         modified_count += 1
                 except Exception as e:
@@ -741,12 +741,14 @@ class WorkflowOrchestratorService:
         logger.info(
             "workflow_content_commit_complete",
             project_id=project_id,
-            added=added_count,
-            modified=modified_count,
+            agent_generated_added_files=added_count,
+            agent_generated_modified_files=modified_count,
             deleted=deleted_count,
             renamed=renamed_count,
-            skipped=skipped_count,
-            cache_hit=cache_hit_count,
+            content_dedup_skipped_files=skipped_count,
+            pending_cache_written_files=pending_cache_written_count,
+            qdrant_points_written=total_points,
+            agent_calls=total_agent_calls,
             failed=len(failed_files),
             duration_s=round(duration, 2),
         )
@@ -757,7 +759,7 @@ class WorkflowOrchestratorService:
             deleted_files=deleted_count,
             renamed_files=renamed_count,
             skipped_files=skipped_count,
-            cache_hit_files=cache_hit_count,
+            cache_hit_files=pending_cache_written_count,
             failed_files=failed_files,
             total_points_written=total_points,
             total_agent_calls=total_agent_calls,
