@@ -57,11 +57,12 @@ embedding:
 # --- 01-Qdrant 存储服务 ---
 qdrant_storage:
   connection:
-    host: "localhost"
-    port: 6333
-    grpc_port: 6334
-    prefer_grpc: true
-    timeout: 30
+    host: "103.236.88.224"               # 中心化 Qdrant：腾讯云 NAT VPS（多用户共享同一仓库知识库）
+    port: ${QDRANT_PORT}                          # NAT 公网端口 → 容器内 6333 (HTTP REST)
+    grpc_port: ${QDRANT_GRPC_PORT}                     # NAT 公网端口 → 容器内 6334 (gRPC)
+    prefer_grpc: false                   # 公网链路优先 HTTP，gRPC 经 NAT 复杂度高
+    timeout: 60                          # 公网链路加大超时（秒）
+    api_key: "${QDRANT_API_KEY}"         # 远程 Qdrant 鉴权密钥，存放在 .env
   collection:
     name: "codebase"
     dense_vector:
@@ -125,6 +126,13 @@ agent:
         compression_threshold: 300000
         supports_tool_calling: true
         supports_structured_output: true
+      gpt-5.5:
+        name: "gpt-5.5"
+        context_window: 400000
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true        
       claude-opus-4-6:
         name: "claude-opus-4-6"
         context_window: 1000000
@@ -356,6 +364,11 @@ agent:
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
             custom_headers:                    
               X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"
+          - id: "gpt-5.5"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:                    
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"              
         api_keys:
           - key: "${OPENAI_COMPAT_PRIMARY_KEY_1}"
         retry:
@@ -365,10 +378,10 @@ agent:
           key_cooldown_seconds: 60
         max_concurrency: 5                    # 该服务商最大并发请求数                
     default_provider: "openai_compatible_primary"
-    default_model: "gpt-5.4"
+    default_model: "gpt-5.5"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
     provider: "openai_compatible_primary"                      # 用哪个 provider 驱动压缩（null = default_provider）
-    model: "gpt-5.4"                       # 用哪个模型（null = default_model）
+    model: "gpt-5.5"                       # 用哪个模型（null = default_model）
     temperature: 0.0
     timeout: 600                            # 压缩 agent 超时（秒）
 
@@ -597,7 +610,7 @@ workflow:
 #        priority: 20
 
       - provider: "openai_compatible_primary"
-        model: "gpt-5.4"
+        model: "gpt-5.5"
         priority: 10
 
       # - provider: "custom_openai_compatible"
@@ -661,7 +674,7 @@ gc:
 # --- 11-Context Engine 服务 ---
 context_engine:
   provider: "openai_compatible_primary"
-  model: "gpt-5.4"
+  model: "gpt-5.5"
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   # provider: "custom_openai_compatible"
   # model: "gpt-5.4"
@@ -742,7 +755,7 @@ mcp:
         model: "gemini-3.1-pro"
         priority: 13
       - provider: "openai_compatible_primary"
-        model: "gpt-5.4"
+        model: "gpt-5.5"
         priority: 15  
 
 #      - provider: "custom_openai_compatible"
