@@ -741,9 +741,17 @@ class McpService:
     # =========================================================================
 
     def _read_project_id(self, project_path: str) -> str:
-        """Read project_id from .git/codebase-rag/project_id.
+        """Read project_id from the ``.git/codebase-rag/project_id`` cache.
 
-        Raises ProjectNotRegisteredError if not found.
+        The authoritative project_id is derived from the repository's root
+        commit by ``ManagementApiService._resolve_project_id_with_migration``
+        at registration time and written into this cache file.  MCP read
+        paths consult the cache directly (sync, no git subprocess) so the
+        per-call hot path stays fast.  Stale cache values are healed
+        automatically the next time the project is registered.
+
+        Raises ProjectNotRegisteredError if the cache file is missing or
+        empty (project has never been registered).
         """
         id_file = os.path.join(
             project_path, ".git", _PROJECT_META_DIR, _PROJECT_ID_FILE,

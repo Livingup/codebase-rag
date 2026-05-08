@@ -608,7 +608,91 @@ class QdrantStorageService:
         return fvids
 
     # =========================================================================
-    # 2.8 Collection management
+    # 2.8 Rebrand project_id (migration for project_id derivation upgrade)
+    # =========================================================================
+
+    async def rebrand_project_id(
+        self, old_project_id: str, new_project_id: str,
+    ) -> int:
+        """Rewrite all stored points from ``old_project_id`` to ``new_project_id``.
+
+        Used when the project_id derivation rule changes (e.g. random uuid4
+        → deterministic uuid5(root_commit)) and existing knowledge points
+        must be re-attributed to the new project identity.  Idempotent: a
+        no-op when both ids are equal or no points reference the old id.
+
+        Args:
+            old_project_id: The project_id currently stored in payloads.
+            new_project_id: The target project_id to rewrite payloads to.
+
+        Returns:
+            Number of points whose payload was rewritten.
+        """
+        self._check_initialized()
+        assert self._client is not None
+        assert self._semaphore is not None
+
+        if old_project_id == new_project_id:
+            return 0
+
+        collection = self._config.collection.name
+        old_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="project_id",
+                    match=models.MatchValue(value=old_project_id),
+                ),
+            ]
+        )
+
+        # Step 1: count points to rebrand (for observability only)
+        try:
+            async with self._semaphore:
+                count_result = await self._client.count(
+                    collection_name=collection,
+                    count_filter=old_filter,
+                    exact=True,
+                )
+        except Exception as e:
+            raise QdrantOperationError(
+                f"Failed to count points for rebrand "
+                f"({old_project_id} -> {new_project_id}): {e}"
+            ) from e
+
+        affected = count_result.count
+        if affected == 0:
+            logger.info(
+                "rebrand_project_id_noop",
+                old_project_id=old_project_id,
+                new_project_id=new_project_id,
+            )
+            return 0
+
+        # Step 2: rewrite payload field via set_payload + filter selector
+        try:
+            async with self._semaphore:
+                await self._client.set_payload(
+                    collection_name=collection,
+                    payload={"project_id": new_project_id},
+                    points=models.FilterSelector(filter=old_filter),
+                    wait=True,
+                )
+        except Exception as e:
+            raise QdrantOperationError(
+                f"Failed to rebrand project_id "
+                f"({old_project_id} -> {new_project_id}): {e}"
+            ) from e
+
+        logger.info(
+            "rebrand_project_id_done",
+            old_project_id=old_project_id,
+            new_project_id=new_project_id,
+            affected=affected,
+        )
+        return affected
+
+    # =========================================================================
+    # 2.9 Collection management
     # =========================================================================
 
     async def ensure_collection(self) -> None:

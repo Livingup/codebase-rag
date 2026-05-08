@@ -104,6 +104,7 @@ class ServiceContainer:
             gc=self.gc,
             qdrant_storage=self.qdrant_storage,
             embedding=self.embedding,
+            pending_knowledge_store=self.pending_knowledge_store,
         )
         self.mcp_service = McpService(
             config_manager=cm,

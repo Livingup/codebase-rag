@@ -49,6 +49,9 @@ from codebase_rag.services.management_api.models import (
     ServiceUnavailableError,
     TaskResponse,
 )
+from codebase_rag.services.mcp_service.pending_knowledge_store import (
+    PendingKnowledgeStore,
+)
 from codebase_rag.services.memory_qdrant.models import SearchFilters as MemorySearchFilters
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService
@@ -59,6 +62,29 @@ logger = get_logger(__name__)
 # Directory inside .git/ for project metadata
 _PROJECT_META_DIR = "codebase-rag"
 _PROJECT_ID_FILE = "project_id"
+
+# Derivation namespace for deterministic project_id generation.
+# Bumping the version segment (e.g. v2) would force a re-derivation across
+# all already-registered repositories on next register_project().
+_PROJECT_ID_DERIVATION_PREFIX = "codebase-rag:project_id:v1"
+
+
+def _derive_project_id_from_root_commit(root_commit: str) -> str:
+    """Derive a deterministic project_id from a Git root commit hash.
+
+    Uses uuid5 over a namespaced derivation input so the result is stable
+    across users / clones / mirrors of the same repository — the only
+    Git-native value satisfying "cross-user consistent + push-invariant +
+    no external coordination" simultaneously.
+
+    Args:
+        root_commit: Hex-encoded SHA-1 of the repository's root commit.
+
+    Returns:
+        Hex string UUID (uuid5).
+    """
+    derivation_input = f"{_PROJECT_ID_DERIVATION_PREFIX}:{root_commit}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, derivation_input))
 
 
 class ManagementApiService:
@@ -85,6 +111,7 @@ class ManagementApiService:
         gc: GCService,
         qdrant_storage: QdrantStorageService,
         embedding: EmbeddingService,
+        pending_knowledge_store: PendingKnowledgeStore,
     ) -> None:
         self._config_manager = config_manager
         self._git_ops = git_ops
@@ -94,6 +121,7 @@ class ManagementApiService:
         self._gc = gc
         self._qdrant = qdrant_storage
         self._embedding = embedding
+        self._pending_store = pending_knowledge_store
 
         # In-memory project registry: project_id → ProjectRecord
         self._projects: Dict[str, ProjectRecord] = {}
@@ -138,7 +166,9 @@ class ManagementApiService:
 
         Steps:
           1. Validate .git/ exists
-          2. Get or generate project_id (persisted in .git/codebase-rag/project_id)
+          2. Derive project_id deterministically from the Git root commit;
+             migrate any data attributed to a stale id (cached from a prior
+             derivation rule) to the new id before continuing
           3. Register to event detection service
           4. Register to workflow orchestrator
           5. Trigger full initialization (async)
@@ -151,8 +181,9 @@ class ManagementApiService:
                 f"Invalid Git repository: {validation.error}"
             )
 
-        # Step 2: Get or create project_id
-        project_id = self._get_or_create_project_id(git_repo_path)
+        # Step 2: Resolve deterministic project_id (derived from root commit)
+        # and migrate any pre-existing data attributed to a stale id.
+        project_id = await self._resolve_project_id_with_migration(git_repo_path)
 
         # Check if already registered with a different path
         existing = self._projects.get(project_id)
@@ -668,30 +699,134 @@ class ManagementApiService:
     # Internal helpers
     # =========================================================================
 
-    def _get_or_create_project_id(self, git_repo_path: str) -> str:
-        """Get existing project_id from .git/codebase-rag/project_id, or create one."""
+    async def _resolve_project_id_with_migration(
+        self, git_repo_path: str,
+    ) -> str:
+        """Derive project_id from the repo's root commit; migrate stale data.
+
+        The project_id is computed deterministically from the Git root
+        commit so two clones / mirrors of the same repository always yield
+        the same id without coordination.  The ``.git/codebase-rag/
+        project_id`` file is kept as a read-side cache (consumed by
+        ``McpService._read_project_id``), but its value is no longer
+        authoritative — every register_project() rebuilds the id from
+        scratch and migrates Qdrant / orphan / workflow / pending /
+        registry state if the cache disagrees.
+
+        Raises:
+            ManagementApiError: If the repository has no commits yet, or
+                writing the cache file fails.
+        """
+        # Step 1: Get root commit (deterministic project identity anchor)
+        root_commit = await self._git_ops.get_root_commit(git_repo_path)
+        if not root_commit:
+            raise ManagementApiError(
+                f"Repository '{git_repo_path}' has no commits yet. At "
+                f"least one commit is required to derive a stable project_id. "
+                f"Please make an initial commit and retry."
+            )
+
+        # Step 2: Derive deterministic project_id
+        new_project_id = _derive_project_id_from_root_commit(root_commit)
+
+        # Step 3: Read cached project_id (if any)
         git_dir = os.path.join(git_repo_path, ".git")
         meta_dir = os.path.join(git_dir, _PROJECT_META_DIR)
         id_file = os.path.join(meta_dir, _PROJECT_ID_FILE)
-
+        cached_id: Optional[str] = None
         if os.path.exists(id_file):
-            with open(id_file, "r", encoding="utf-8") as f:
-                existing_id = f.read().strip()
-            if existing_id:
-                return existing_id
+            try:
+                with open(id_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    cached_id = content
+            except OSError as e:
+                logger.warning(
+                    "project_id_cache_read_failed",
+                    path=id_file,
+                    error=str(e),
+                )
 
-        # Generate new UUID
-        new_id = str(uuid.uuid4())
-        os.makedirs(meta_dir, exist_ok=True)
-        with open(id_file, "w", encoding="utf-8") as f:
-            f.write(new_id)
+        # Step 4: Migrate if cached id differs from derived id
+        if cached_id and cached_id != new_project_id:
+            await self._migrate_project_id(cached_id, new_project_id)
+
+        # Step 5: Persist derived id to cache (covers first-register and
+        # post-migration cases).  Skipped only when cache already matches.
+        if cached_id != new_project_id:
+            try:
+                os.makedirs(meta_dir, exist_ok=True)
+                with open(id_file, "w", encoding="utf-8") as f:
+                    f.write(new_project_id)
+            except OSError as e:
+                raise ManagementApiError(
+                    f"Failed to write project_id cache at '{id_file}': {e}"
+                ) from e
+
+            logger.info(
+                "project_id_resolved",
+                project_id=new_project_id,
+                root_commit=root_commit[:8],
+                migrated_from=cached_id,
+                repo_path=git_repo_path,
+            )
+
+        return new_project_id
+
+    async def _migrate_project_id(self, old_id: str, new_id: str) -> None:
+        """Coordinate cross-service re-attribution of all data tied to old_id.
+
+        Order of operations is chosen so any mid-flight crash can be safely
+        retried on the next ``register_project`` call — each step is
+        idempotent and a no-op when the source id has nothing to migrate.
+
+        Steps:
+          1. Qdrant payload rewrite + orphan store rewrite (via GC service)
+          2. Workflow retry/dead-letter files + in-memory dicts
+          3. Pending knowledge cache files (pre-commit knowledge points)
+          4. Destroy old in-memory Qdrant instances (rebuilt on next search)
+          5. Local project registry (in-memory + persistent file)
+        """
+        if old_id == new_id:
+            return
 
         logger.info(
-            "project_id_created",
-            project_id=new_id,
-            repo_path=git_repo_path,
+            "project_id_migration_started",
+            old_project_id=old_id,
+            new_project_id=new_id,
         )
-        return new_id
+
+        # 1) Persistent points + orphan tracking
+        await self._gc.rebrand_project_id(old_id, new_id)
+
+        # 2) Workflow retry/dead-letter persistence + in-memory state
+        self._workflow.rebrand_project_id(old_id, new_id)
+
+        # 3) Pending pre-commit knowledge cache
+        self._pending_store.rebrand_project_id(old_id, new_id)
+
+        # 4) Drop stale in-memory Qdrant instances; will be rebuilt on demand
+        try:
+            await self._memory.destroy_all_instances(old_id)
+        except Exception:
+            logger.exception(
+                "memory_instance_destroy_failed_during_rebrand",
+                old_project_id=old_id,
+                new_project_id=new_id,
+            )
+
+        # 5) Local registry (in-memory dict + persisted JSON)
+        if old_id in self._projects:
+            record = self._projects.pop(old_id)
+            record.project_id = new_id
+            self._projects[new_id] = record
+            self._save_registry()
+
+        logger.info(
+            "project_id_migration_done",
+            old_project_id=old_id,
+            new_project_id=new_id,
+        )
 
     async def _get_project_summary(
         self, project_id: str, repo_path: str,

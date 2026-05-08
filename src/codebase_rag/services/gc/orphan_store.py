@@ -134,3 +134,25 @@ class OrphanStore:
         for fvid in to_remove:
             del self._records[fvid]
         return len(to_remove)
+
+    def rebrand_project_id(
+        self, old_project_id: str, new_project_id: str,
+    ) -> int:
+        """Rewrite ``project_id`` field on every record matching old id.
+
+        Used during project_id derivation upgrade — orphan tracking must
+        follow the new project identity so the grace-period clock and
+        eventual deletion target the right tenant.
+
+        Returns:
+            Number of records whose project_id was rewritten.
+        """
+        if old_project_id == new_project_id:
+            return 0
+
+        affected = 0
+        for rec in self._records.values():
+            if rec.project_id == old_project_id:
+                rec.project_id = new_project_id
+                affected += 1
+        return affected

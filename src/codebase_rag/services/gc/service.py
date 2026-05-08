@@ -469,6 +469,57 @@ class GCService:
         return result
 
     # =========================================================================
+    # 2.6 Rebrand project_id (migration for project_id derivation upgrade)
+    # =========================================================================
+
+    async def rebrand_project_id(
+        self, old_project_id: str, new_project_id: str,
+    ) -> int:
+        """Re-attribute orphan tracking records and Qdrant points to the new id.
+
+        Coordinates the cross-store rewrite:
+          1. Rewrite ``project_id`` on every Qdrant point payload.
+          2. Rewrite ``project_id`` on every in-memory orphan record.
+          3. Persist the orphan store to disk.
+
+        Idempotent: a no-op when both ids are equal.
+
+        Returns:
+            Number of Qdrant points whose payload was rewritten.  (Orphan
+            records are tracked separately via the log entry.)
+        """
+        if old_project_id == new_project_id:
+            return 0
+
+        # Step 1: Rewrite Qdrant payloads
+        affected_points = await self._qdrant.rebrand_project_id(
+            old_project_id, new_project_id,
+        )
+
+        # Step 2: Rewrite orphan records and persist
+        affected_orphans = self._orphan_store.rebrand_project_id(
+            old_project_id, new_project_id,
+        )
+        if affected_orphans > 0:
+            try:
+                self._orphan_store.save()
+            except Exception:
+                logger.exception(
+                    "orphan_store_save_after_rebrand_failed",
+                    old_project_id=old_project_id,
+                    new_project_id=new_project_id,
+                )
+
+        logger.info(
+            "gc_rebrand_project_id_done",
+            old_project_id=old_project_id,
+            new_project_id=new_project_id,
+            affected_points=affected_points,
+            affected_orphans=affected_orphans,
+        )
+        return affected_points
+
+    # =========================================================================
     # Internal: scheduled GC loop
     # =========================================================================
 

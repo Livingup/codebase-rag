@@ -202,6 +202,75 @@ class WorkflowOrchestratorService:
         """Unregister a project."""
         self._project_repos.pop(project_id, None)
 
+    def rebrand_project_id(
+        self, old_project_id: str, new_project_id: str,
+    ) -> int:
+        """Re-attribute workflow state from ``old_project_id`` to ``new_project_id``.
+
+        Migrates everything keyed by project_id within the orchestrator:
+          1. Rename retry-queue and dead-letter persistence files on disk.
+          2. Re-key in-memory ``_retry_queues`` / ``_dead_letters`` /
+             ``_project_repos`` dicts.
+          3. Rewrite ``project_id`` field on every ``FailedFileRecord`` /
+             ``DeadLetterRecord`` so a future save round-trips the new id.
+
+        Idempotent: a no-op when both ids are equal.
+
+        Returns:
+            Total number of records (retry + dead-letter) whose project_id
+            field was rewritten.
+        """
+        if old_project_id == new_project_id:
+            return 0
+
+        # Step 1: Rename persistence files (best-effort; missing is fine)
+        for old_path, new_path in (
+            (self._retry_queue_path(old_project_id),
+             self._retry_queue_path(new_project_id)),
+            (self._dead_letter_path(old_project_id),
+             self._dead_letter_path(new_project_id)),
+        ):
+            if os.path.exists(old_path):
+                try:
+                    os.replace(old_path, new_path)
+                except OSError:
+                    logger.exception(
+                        "workflow_rebrand_rename_failed",
+                        old_path=old_path,
+                        new_path=new_path,
+                    )
+
+        # Step 2: Re-key in-memory dicts
+        affected = 0
+        if old_project_id in self._retry_queues:
+            queue = self._retry_queues.pop(old_project_id)
+            for r in queue:
+                if r.project_id == old_project_id:
+                    r.project_id = new_project_id
+                    affected += 1
+            self._retry_queues[new_project_id] = queue
+
+        if old_project_id in self._dead_letters:
+            dl = self._dead_letters.pop(old_project_id)
+            for r in dl:
+                if r.project_id == old_project_id:
+                    r.project_id = new_project_id
+                    affected += 1
+            self._dead_letters[new_project_id] = dl
+
+        if old_project_id in self._project_repos:
+            self._project_repos[new_project_id] = self._project_repos.pop(
+                old_project_id,
+            )
+
+        logger.info(
+            "workflow_rebrand_project_id_done",
+            old_project_id=old_project_id,
+            new_project_id=new_project_id,
+            affected_records=affected,
+        )
+        return affected
+
     # =========================================================================
     # 2.1 Event reception (callback for EventDetectionService.subscribe)
     # =========================================================================

@@ -395,7 +395,45 @@ class GitOperationsService:
         return branches
 
     # =========================================================================
-    # 2.7 Get blob hash for a single file
+    # 2.7 Get root commit (deterministic project identity)
+    # =========================================================================
+
+    async def get_root_commit(self, repo_path: str) -> Optional[str]:
+        """Return the deterministic root commit hash of the repository.
+
+        Used as a stable, cross-clone identity anchor for the repository —
+        independent of remote URL, branch / tag refs, working directory, or
+        local config.  Any two clones of the same repository (regardless of
+        URL changes, renames, mirrors, or migrations) share the same root
+        commit, making this the only Git-native value that yields cross-user
+        consistent project identification without external coordination.
+
+        For repositories with multiple root commits (e.g. merged subtrees,
+        ``git replace`` grafts), the lexicographically smallest hash is
+        returned so the result is fully deterministic.
+
+        Returns:
+            Hex-encoded SHA-1 of the chosen root commit, or ``None`` if the
+            repository has no committed history yet (e.g. freshly
+            ``git init``'d with no commits).
+        """
+        try:
+            stdout = await self._run_git(
+                repo_path, ["rev-list", "--max-parents=0", "HEAD"],
+            )
+        except (GitCommandError, GitRefNotFoundError):
+            # Empty repo: HEAD points to an unborn branch and rev-list fails
+            return None
+
+        roots = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not roots:
+            return None
+
+        # Deterministic ordering: lexicographically smallest root commit hash
+        return min(roots)
+
+    # =========================================================================
+    # 2.8 Get blob hash for a single file
     # =========================================================================
 
     async def get_blob_hash(
@@ -423,7 +461,7 @@ class GitOperationsService:
         return parts[0].split()[2]
 
     # =========================================================================
-    # 2.8 Get blob hash for a working directory file
+    # 2.9 Get blob hash for a working directory file
     # =========================================================================
 
     async def get_workdir_blob_hash(
@@ -463,7 +501,7 @@ class GitOperationsService:
         return blob_hash
 
     # =========================================================================
-    # 2.9 Validate repository
+    # 2.10 Validate repository
     # =========================================================================
 
     async def validate_repository(self, repo_path: str) -> RepoValidation:
@@ -484,7 +522,7 @@ class GitOperationsService:
             return RepoValidation(is_valid=False, error=str(e))
 
     # =========================================================================
-    # 2.9 Compute file_version_id (also used internally)
+    # 2.11 Compute file_version_id (also used internally)
     # =========================================================================
 
     # Exposed as module-level function below

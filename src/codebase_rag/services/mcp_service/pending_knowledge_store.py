@@ -217,6 +217,76 @@ class PendingKnowledgeStore:
         return removed
 
     # =========================================================================
+    # Rebrand project_id (migration for project_id derivation upgrade)
+    # =========================================================================
+
+    def rebrand_project_id(
+        self, old_project_id: str, new_project_id: str,
+    ) -> int:
+        """Rewrite ``project_id`` field on every cached entry matching old id.
+
+        Pending knowledge entries are addressed by file_version_id, not
+        project_id, so a full directory scan is required.  Entries whose
+        ``project_id`` field does not match ``old_project_id`` are left
+        untouched, preserving multi-tenant safety on a shared store.
+
+        Returns:
+            Number of entry files whose project_id was rewritten.
+        """
+        if old_project_id == new_project_id:
+            return 0
+        if not os.path.isdir(self._store_dir):
+            return 0
+
+        affected = 0
+        for prefix_dir in os.listdir(self._store_dir):
+            prefix_path = os.path.join(self._store_dir, prefix_dir)
+            if not os.path.isdir(prefix_path) or len(prefix_dir) != 2:
+                continue
+
+            for fname in os.listdir(prefix_path):
+                if not fname.endswith(".json"):
+                    continue
+                fpath = os.path.join(prefix_path, fname)
+
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(
+                        "pending_knowledge_rebrand_read_failed",
+                        path=fpath,
+                        error=str(e),
+                    )
+                    continue
+
+                if data.get("project_id") != old_project_id:
+                    continue
+
+                data["project_id"] = new_project_id
+                tmp_path = fpath + ".tmp"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False)
+                    os.replace(tmp_path, fpath)
+                    affected += 1
+                except OSError as e:
+                    logger.warning(
+                        "pending_knowledge_rebrand_write_failed",
+                        path=fpath,
+                        error=str(e),
+                    )
+
+        if affected > 0:
+            logger.info(
+                "pending_knowledge_rebranded",
+                old_project_id=old_project_id,
+                new_project_id=new_project_id,
+                affected=affected,
+            )
+        return affected
+
+    # =========================================================================
     # Stats
     # =========================================================================
 
