@@ -7,7 +7,6 @@ Internal dependencies:
   - 05-Event Detection Service (project registration/unregistration)
   - 08-Workflow Orchestrator Service (init, sync, status)
   - 02-Memory Qdrant Service (semantic search)
-  - 09-GC Service (manual GC, orphan status, cleanup)
   - 01-Qdrant Storage Service (storage stats)
   - 07-Git Operations Service (repo validation, HEAD info)
   - 04-Embedding Service (query vectorization for search)
@@ -15,7 +14,6 @@ Internal dependencies:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tempfile
@@ -29,13 +27,11 @@ from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import ManagementApiConfig
 from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.event_detection.service import EventDetectionService
-from codebase_rag.services.gc.service import GCService
 from codebase_rag.services.git_operations.service import GitOperationsService
 from codebase_rag.services.management_api.models import (
     BatchRegisterProjectResponse,
     BatchRegisterResultItem,
     DeleteProjectResponse,
-    GCStatusResponse,
     HealthResponse,
     ManagementApiError,
     ProjectDetailResponse,
@@ -49,9 +45,7 @@ from codebase_rag.services.management_api.models import (
     ServiceUnavailableError,
     TaskResponse,
 )
-from codebase_rag.services.mcp_service.pending_knowledge_store import (
-    PendingKnowledgeStore,
-)
+from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.memory_qdrant.models import SearchFilters as MemorySearchFilters
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService
@@ -96,7 +90,6 @@ class ManagementApiService:
         event_detection: Event detection service instance.
         workflow: Workflow orchestrator service instance.
         memory_qdrant: Memory Qdrant service instance.
-        gc: GC service instance.
         qdrant_storage: Qdrant storage service instance.
         embedding: Embedding service instance.
     """
@@ -108,20 +101,18 @@ class ManagementApiService:
         event_detection: EventDetectionService,
         workflow: WorkflowOrchestratorService,
         memory_qdrant: MemoryQdrantService,
-        gc: GCService,
         qdrant_storage: QdrantStorageService,
         embedding: EmbeddingService,
-        pending_knowledge_store: PendingKnowledgeStore,
+        knowledge_sync: KnowledgeSyncService,
     ) -> None:
         self._config_manager = config_manager
         self._git_ops = git_ops
         self._event_detection = event_detection
         self._workflow = workflow
         self._memory = memory_qdrant
-        self._gc = gc
         self._qdrant = qdrant_storage
         self._embedding = embedding
-        self._pending_store = pending_knowledge_store
+        self._knowledge_sync = knowledge_sync
 
         # In-memory project registry: project_id → ProjectRecord
         self._projects: Dict[str, ProjectRecord] = {}
@@ -484,8 +475,6 @@ class ManagementApiService:
         task_id = str(uuid.uuid4())
 
         if force:
-            # Clean existing data first
-            await self._gc.cleanup_project(project_id)
             await self._memory.destroy_all_instances(project_id)
 
         self._workflow.enqueue_initialization(project_id, branch, head.commit_hash)
@@ -530,54 +519,6 @@ class ManagementApiService:
             message=message,
         )
 
-    async def trigger_gc(
-        self,
-        project_id: Optional[str] = None,
-        force: bool = False,
-    ) -> TaskResponse:
-        """Trigger garbage collection."""
-        task_id = str(uuid.uuid4())
-
-        if project_id:
-            record = self._projects.get(project_id)
-            if not record:
-                raise ProjectNotFoundError(f"Project '{project_id}' not found")
-            asyncio.create_task(
-                self._safe_gc(project_id, record.git_repo_path, force)
-            )
-        else:
-            # GC for all projects
-            for pid, rec in self._projects.items():
-                asyncio.create_task(
-                    self._safe_gc(pid, rec.git_repo_path, force)
-                )
-
-        logger.info(
-            "gc_triggered",
-            project_id=project_id or "all",
-            task_id=task_id,
-            force=force,
-        )
-
-        return TaskResponse(
-            task_id=task_id,
-            status="started",
-            message="GC started",
-        )
-
-    async def _safe_gc(
-        self, project_id: str, repo_path: str, force: bool,
-    ) -> None:
-        """Run GC safely."""
-        try:
-            await self._gc.trigger_gc(project_id, repo_path, force=force)
-        except Exception as e:
-            logger.error(
-                "background_gc_failed",
-                project_id=project_id,
-                error=str(e),
-            )
-
     # =========================================================================
     # 2.4 Status queries
     # =========================================================================
@@ -619,33 +560,6 @@ class ManagementApiService:
             workflow_progress=wf_progress,
         )
 
-    def get_gc_status(self, project_id: str) -> GCStatusResponse:
-        """Get GC status for a project."""
-        if project_id not in self._projects:
-            raise ProjectNotFoundError(f"Project '{project_id}' not found")
-
-        orphan_status = self._gc.get_orphan_status(project_id)
-        gc_history = self._gc.get_gc_history(project_id=project_id, limit=10)
-
-        return GCStatusResponse(
-            orphan_status={
-                "total_orphans": orphan_status.total_orphans,
-                "expired_orphans": orphan_status.expired_orphans,
-                "pending_orphans": orphan_status.pending_orphans,
-                "oldest_orphan_age_days": orphan_status.oldest_orphan_age_days,
-            },
-            gc_history=[
-                {
-                    "gc_id": r.gc_id,
-                    "project_id": r.project_id,
-                    "trigger": r.trigger,
-                    "started_at": r.started_at.isoformat(),
-                    "deleted_count": r.result.deleted_count,
-                }
-                for r in gc_history
-            ],
-        )
-
     # =========================================================================
     # 2.5 System endpoints
     # =========================================================================
@@ -659,7 +573,6 @@ class ManagementApiService:
             "embedding": "healthy" if self._embedding._initialized else "unhealthy",
             "event_detection": "healthy" if self._event_detection._initialized else "unhealthy",
             "workflow": "healthy" if self._workflow._initialized else "unhealthy",
-            "gc": "healthy" if self._gc._initialized else "unhealthy",
         }
 
         unhealthy = [k for k, v in services.items() if v == "unhealthy"]
@@ -710,7 +623,7 @@ class ManagementApiService:
         project_id`` file is kept as a read-side cache (consumed by
         ``McpService._read_project_id``), but its value is no longer
         authoritative — every register_project() rebuilds the id from
-        scratch and migrates Qdrant / orphan / workflow / pending /
+        scratch and migrates Qdrant / workflow / knowledge sync /
         registry state if the cache disagrees.
 
         Raises:
@@ -781,9 +694,9 @@ class ManagementApiService:
         idempotent and a no-op when the source id has nothing to migrate.
 
         Steps:
-          1. Qdrant payload rewrite + orphan store rewrite (via GC service)
+          1. Qdrant payload rewrite
           2. Workflow retry/dead-letter files + in-memory dicts
-          3. Pending knowledge cache files (pre-commit knowledge points)
+          3. Knowledge sync outbox files
           4. Destroy old in-memory Qdrant instances (rebuilt on next search)
           5. Local project registry (in-memory + persistent file)
         """
@@ -796,14 +709,14 @@ class ManagementApiService:
             new_project_id=new_id,
         )
 
-        # 1) Persistent points + orphan tracking
-        await self._gc.rebrand_project_id(old_id, new_id)
+        # 1) Persistent points
+        await self._qdrant.rebrand_project_id(old_id, new_id)
 
         # 2) Workflow retry/dead-letter persistence + in-memory state
         self._workflow.rebrand_project_id(old_id, new_id)
 
-        # 3) Pending pre-commit knowledge cache
-        self._pending_store.rebrand_project_id(old_id, new_id)
+        # 3) Knowledge sync outbox and latest-version index
+        self._knowledge_sync.rebrand_project_id(old_id, new_id)
 
         # 4) Drop stale in-memory Qdrant instances; will be rebuilt on demand
         try:

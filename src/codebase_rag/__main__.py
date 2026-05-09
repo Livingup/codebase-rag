@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,13 +35,13 @@ from codebase_rag.config.schema import AppConfig
 from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.event_detection.service import EventDetectionService
-from codebase_rag.services.gc.service import GCService
 from codebase_rag.services.git_operations.service import GitOperationsService
 from codebase_rag.services.management_api.routes import create_router as create_api_router
 from codebase_rag.services.management_api.service import ManagementApiService
 from codebase_rag.services.context_engine.service import ContextEngineService
 from codebase_rag.services.mcp_client.service import McpClientService
-from codebase_rag.services.mcp_service.pending_knowledge_store import PendingKnowledgeStore
+from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
+from codebase_rag.services.knowledge_sync.store import KnowledgeSyncStore
 from codebase_rag.services.mcp_service.server import create_mcp_server
 from codebase_rag.services.mcp_service.service import McpService
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
@@ -71,15 +72,14 @@ class ServiceContainer:
             config_manager=cm,
             git_ops=self.git_ops,
         )
-        self.gc = GCService(
-            config_manager=cm,
-            git_ops=self.git_ops,
-            qdrant_storage=self.qdrant_storage,
+        self.knowledge_sync_store = KnowledgeSyncStore(
+            store_dir=os.path.join(cm.config.workflow.data_dir, "knowledge_sync"),
         )
-
-        # Shared pending knowledge cache (used by MCP service + workflow)
-        self.pending_knowledge_store = PendingKnowledgeStore(
-            store_dir=cm.config.mcp.pending_knowledge.store_dir,
+        self.knowledge_sync = KnowledgeSyncService(
+            config_manager=cm,
+            store=self.knowledge_sync_store,
+            qdrant_storage=self.qdrant_storage,
+            memory_qdrant=self.memory_qdrant,
         )
 
         # --- Layer 2: multiple dependencies ---
@@ -91,7 +91,7 @@ class ServiceContainer:
             agent=self.agent,
             embedding=self.embedding,
             token_counter=self.token_counter,
-            pending_knowledge_store=self.pending_knowledge_store,
+            knowledge_sync=self.knowledge_sync,
         )
 
         # --- Layer 3: top-level entry services ---
@@ -101,10 +101,9 @@ class ServiceContainer:
             event_detection=self.event_detection,
             workflow=self.workflow,
             memory_qdrant=self.memory_qdrant,
-            gc=self.gc,
             qdrant_storage=self.qdrant_storage,
             embedding=self.embedding,
-            pending_knowledge_store=self.pending_knowledge_store,
+            knowledge_sync=self.knowledge_sync,
         )
         self.mcp_service = McpService(
             config_manager=cm,
@@ -113,7 +112,7 @@ class ServiceContainer:
             agent=self.agent,
             git_ops=self.git_ops,
             qdrant_storage=self.qdrant_storage,
-            pending_knowledge_store=self.pending_knowledge_store,
+            knowledge_sync=self.knowledge_sync,
         )
         self.context_engine = ContextEngineService(
             config_manager=cm,
@@ -134,7 +133,7 @@ class ServiceContainer:
 
         # Layer 1
         await self.event_detection.initialize()
-        await self.gc.initialize()
+        await self.knowledge_sync.initialize()
 
         # Wire event detection → workflow
         self.event_detection.subscribe(self.workflow.on_git_event)
@@ -162,9 +161,9 @@ class ServiceContainer:
 
         # Layer 2
         await self.workflow.shutdown()
+        await self.knowledge_sync.shutdown()
 
         # Layer 1
-        await self.gc.shutdown()
         await self.event_detection.shutdown()
 
         # Layer 0

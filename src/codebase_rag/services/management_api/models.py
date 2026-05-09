@@ -73,13 +73,6 @@ class RebuildRequest(BaseModel):
     force: bool = False
 
 
-class GCRequest(BaseModel):
-    """POST /gc — trigger garbage collection."""
-
-    project_id: Optional[str] = None
-    force: bool = False
-
-
 class UpdateConfigRequest(BaseModel):
     """PUT /config — update a config value at runtime."""
 
@@ -180,13 +173,6 @@ class ProjectStatusResponse(BaseModel):
     total_knowledge_points: int = 0
     last_sync_time: Optional[str] = None
     workflow_progress: Optional[Dict[str, Any]] = None
-
-
-class GCStatusResponse(BaseModel):
-    """GET /projects/{project_id}/gc response."""
-
-    orphan_status: Dict[str, Any]
-    gc_history: List[Dict[str, Any]]
 
 
 class HealthResponse(BaseModel):

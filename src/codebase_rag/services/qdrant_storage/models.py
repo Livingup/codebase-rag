@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import List
 
 from codebase_rag.common.types import SparseVector
 
@@ -23,15 +23,3 @@ class PointData:
     blob_hash: str
     dense_vector: List[float]
     sparse_vector: SparseVector
-
-
-@dataclass
-class BatchResult:
-    """Result of a batch operation (upsert or delete)."""
-
-    succeeded: List[str] = field(default_factory=list)
-    failed: Dict[str, str] = field(default_factory=dict)
-
-    @property
-    def all_succeeded(self) -> bool:
-        return len(self.failed) == 0

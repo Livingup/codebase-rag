@@ -157,12 +157,11 @@ TOOL_DEFINITIONS: list[Tool] = [
     Tool(
         name="add_file_knowledge",
         description=(
-            "批量提交文件的知识点描述（提交前缓存）。"
+            "提交单个文件版本的知识点描述。"
             "用于编程 Agent 修改或创建文件后、git commit 之前，"
             "主动提供该文件当前工作区版本的业务知识描述。"
-            "后端会自动从工作区读取文件内容计算版本标识并生成嵌入向量，"
-            "缓存知识点直到对应的 git commit 发生时自动落地。"
-            "每个文件支持多条知识描述，每条描述对应一个独立的知识点。"
+            "调用方必须提供当前文件内容对应的 git blob hash，"
+            "后端会校验 blob_hash、生成嵌入向量并通过统一同步协调器落地。"
         ),
         inputSchema={
             "type": "object",
@@ -171,32 +170,30 @@ TOOL_DEFINITIONS: list[Tool] = [
                     "type": "string",
                     "description": "Git 仓库根目录的绝对路径（即 .git/ 所在的父目录）",
                 },
-                "files": {
+                "file_path": {
+                    "type": "string",
+                    "description": "文件路径，相对于仓库根目录",
+                },
+                "blob_hash": {
+                    "type": "string",
+                    "description": "当前工作区文件内容的 Git blob hash，可通过 git hash-object -- <file_path> 计算",
+                },
+                "knowledge_descriptions": {
                     "type": "array",
-                    "description": "按文件分组的知识点列表",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "文件路径，相对于仓库根目录",
-                            },
-                            "knowledge_descriptions": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": (
-                                    "该文件的知识描述文本列表，每条对应一个知识点。"
-                                    "描述应遵循 5 层结构化模板"
-                                    "（项目结构域/业务域/功能描述/目的描述/业务逻辑细节），"
-                                    "便于后续语义检索。"
-                                ),
-                            },
-                        },
-                        "required": ["file_path", "knowledge_descriptions"],
-                    },
+                    "items": {"type": "string"},
+                    "description": (
+                        "该文件的知识描述文本列表，每条对应一个独立知识点。"
+                        "描述应遵循 5 层结构化模板"
+                        "（项目结构域/业务域/功能描述/目的描述/业务逻辑细节）。"
+                    ),
                 },
             },
-            "required": ["git_repo_path", "files"],
+            "required": [
+                "git_repo_path",
+                "file_path",
+                "blob_hash",
+                "knowledge_descriptions",
+            ],
         },
     ),
 ]
@@ -417,32 +414,33 @@ async def handle_add_file_knowledge(
 ) -> list[TextContent]:
     """Handle add_file_knowledge tool call.
 
-    Validates descriptions, generates embeddings, and caches knowledge
-    points in PendingKnowledgeStore for commit-time processing.
+    Validates descriptions, generates embeddings, and submits knowledge
+    points through KnowledgeSyncService.
     """
     git_repo_path = args.get("git_repo_path")
-    files = args.get("files")
+    file_path = args.get("file_path")
+    blob_hash = args.get("blob_hash")
+    descs = args.get("knowledge_descriptions")
 
     if not git_repo_path:
         raise ValueError("Missing required parameter: 'git_repo_path'.")
-    if not files or not isinstance(files, list):
-        raise ValueError("Missing required parameter: 'files' (non-empty array).")
-
-    for f in files:
-        if not f.get("file_path"):
-            raise ValueError("Each file entry must have 'file_path'.")
-        descs = f.get("knowledge_descriptions")
-        if not descs or not isinstance(descs, list):
+    if not file_path or not isinstance(file_path, str):
+        raise ValueError("Missing required parameter: 'file_path'.")
+    if not blob_hash or not isinstance(blob_hash, str):
+        raise ValueError("Missing required parameter: 'blob_hash'.")
+    if not descs or not isinstance(descs, list):
+        raise ValueError(
+            "Missing required parameter: 'knowledge_descriptions' (non-empty array)."
+        )
+    for idx, d in enumerate(descs):
+        if not d or not isinstance(d, str) or not d.strip():
             raise ValueError(
-                f"File '{f['file_path']}': 'knowledge_descriptions' must be a non-empty array."
+                f"knowledge_descriptions[{idx}] must be a non-empty string."
             )
-        for idx, d in enumerate(descs):
-            if not d or not isinstance(d, str) or not d.strip():
-                raise ValueError(
-                    f"File '{f['file_path']}': knowledge_descriptions[{idx}] must be a non-empty string."
-                )
 
-    result = await mcp_service.add_file_knowledge(git_repo_path, files)
+    result = await mcp_service.add_file_knowledge(
+        git_repo_path, file_path, blob_hash, descs,
+    )
 
     parts: List[str] = []
 
@@ -452,14 +450,14 @@ async def handle_add_file_knowledge(
 
     if succeeded_count > 0 and failed_count == 0:
         parts.append(
-            f"已缓存 {succeeded_count} 个文件共 {total_points} 条知识点，"
-            f"等待 git commit 后自动落地。\n"
+            f"已提交 {succeeded_count} 个文件版本共 {total_points} 条知识点，"
+            f"本地可用并已进入统一同步流程。\n"
         )
         for s in result.succeeded:
             parts.append(f"- {s.file_path}: {s.points_count} 条 ✓")
     elif succeeded_count > 0 and failed_count > 0:
         parts.append(
-            f"已缓存 {succeeded_count} 个文件共 {total_points} 条知识点，"
+            f"已提交 {succeeded_count} 个文件版本共 {total_points} 条知识点，"
             f"{failed_count} 个文件失败。\n"
         )
         parts.append("成功:")

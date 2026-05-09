@@ -1,12 +1,14 @@
 """Qdrant Storage Service — persistent KV storage for file_version_id → Points.
 
 Pure storage layer wrapping qdrant-client AsyncQdrantClient.
-No semantic search — only CRUD by file_version_id with project_id isolation.
+No semantic search — only project-scoped persistence by file_version_id.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
 import time
 from typing import Dict, List, Optional, Set
@@ -14,7 +16,6 @@ from typing import Dict, List, Optional, Set
 from qdrant_client import AsyncQdrantClient, models
 
 from codebase_rag.common.logging import get_logger
-from codebase_rag.common.types import SparseVector
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import QdrantStorageConfig
 from codebase_rag.services.qdrant_storage.errors import (
@@ -22,7 +23,7 @@ from codebase_rag.services.qdrant_storage.errors import (
     QdrantOperationError,
     QdrantSchemaError,
 )
-from codebase_rag.services.qdrant_storage.models import BatchResult, PointData
+from codebase_rag.services.qdrant_storage.models import PointData
 
 logger = get_logger(__name__)
 
@@ -31,7 +32,7 @@ class QdrantStorageService:
     """Qdrant Server persistent storage for file knowledge points.
 
     Manages connection lifecycle, collection initialization, and
-    CRUD operations scoped by project_id + file_version_id.
+    file-version persistence scoped by project_id + file_version_id.
 
     Args:
         config: Qdrant storage configuration section from AppConfig.
@@ -114,7 +115,7 @@ class QdrantStorageService:
         file_version_id: str,
         points_data: List[PointData],
     ) -> bool:
-        """Write Points for a file_version_id. Idempotent: delete-then-write.
+        """Write Points for a file_version_id with deterministic point ids.
 
         Args:
             project_id: Project UUID for multi-tenant isolation.
@@ -132,29 +133,28 @@ class QdrantStorageService:
 
         try:
             async with self._semaphore:
-                # Delete existing points for this file_version_id (idempotent)
-                await self._client.delete(
-                    collection_name=collection,
-                    points_selector=models.FilterSelector(
-                        filter=models.Filter(
-                            must=[
-                                models.FieldCondition(
-                                    key="file_version_id",
-                                    match=models.MatchValue(value=file_version_id),
-                                ),
-                                models.FieldCondition(
-                                    key="project_id",
-                                    match=models.MatchValue(value=project_id),
-                                ),
-                            ]
-                        )
-                    ),
+                base_payloads = [
+                    {
+                        "file_version_id": file_version_id,
+                        "file_path": pd.file_path,
+                        "entity_type": pd.entity_type,
+                        "entity_name": pd.entity_name,
+                        "business_description": pd.business_description,
+                        "project_id": project_id,
+                        "blob_hash": pd.blob_hash,
+                    }
+                    for pd in points_data
+                ]
+                knowledge_set_id = self._compute_knowledge_set_id(
+                    project_id, file_version_id, base_payloads,
                 )
+                chunk_count = len(base_payloads)
 
-                # Build Qdrant points
                 points = [
                     models.PointStruct(
-                        id=str(uuid.uuid4()),
+                        id=self._point_id(
+                            project_id, file_version_id, knowledge_set_id, idx,
+                        ),
                         vector={
                             self._config.collection.dense_vector.name: pd.dense_vector,
                             self._config.collection.sparse_vector.name: models.SparseVector(
@@ -163,16 +163,13 @@ class QdrantStorageService:
                             ),
                         },
                         payload={
-                            "file_version_id": file_version_id,
-                            "file_path": pd.file_path,
-                            "entity_type": pd.entity_type,
-                            "entity_name": pd.entity_name,
-                            "business_description": pd.business_description,
-                            "project_id": project_id,
-                            "blob_hash": pd.blob_hash,
+                            **base_payloads[idx],
+                            "knowledge_set_id": knowledge_set_id,
+                            "chunk_index": idx,
+                            "chunk_count": chunk_count,
                         },
                     )
-                    for pd in points_data
+                    for idx, pd in enumerate(points_data)
                 ]
 
                 # Upsert in batches
@@ -189,6 +186,7 @@ class QdrantStorageService:
                 project_id=project_id,
                 file_version_id=file_version_id[:16],
                 points_count=len(points_data),
+                knowledge_set_id=knowledge_set_id[:16],
             )
             return True
 
@@ -203,46 +201,6 @@ class QdrantStorageService:
                 f"Failed to upsert points for {file_version_id}: {e}"
             ) from e
 
-    # =========================================================================
-    # 2.2 Batch upsert multiple files
-    # =========================================================================
-
-    async def batch_upsert_files(
-        self,
-        project_id: str,
-        files_points: Dict[str, List[PointData]],
-    ) -> BatchResult:
-        """Batch upsert points for multiple file_version_ids.
-
-        Partial failures don't affect already succeeded writes.
-        """
-        self._check_initialized()
-        result = BatchResult()
-
-        async def _upsert_one(fvid: str, pdata: List[PointData]) -> None:
-            try:
-                await self.upsert_file_points(project_id, fvid, pdata)
-                result.succeeded.append(fvid)
-            except Exception as e:
-                result.failed[fvid] = str(e)
-
-        # Run concurrently (semaphore controls actual parallelism)
-        tasks = [_upsert_one(fvid, pdata) for fvid, pdata in files_points.items()]
-        await asyncio.gather(*tasks)
-
-        logger.info(
-            "batch_upsert_files",
-            project_id=project_id,
-            total=len(files_points),
-            succeeded=len(result.succeeded),
-            failed=len(result.failed),
-        )
-        return result
-
-    # =========================================================================
-    # 2.3 Get file points
-    # =========================================================================
-
     async def get_file_points(
         self, project_id: str, file_version_id: str
     ) -> List[models.Record]:
@@ -253,33 +211,44 @@ class QdrantStorageService:
 
         collection = self._config.collection.name
 
-        async with self._semaphore:
-            records, _ = await self._client.scroll(
-                collection_name=collection,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="file_version_id",
-                            match=models.MatchValue(value=file_version_id),
-                        ),
-                        models.FieldCondition(
-                            key="project_id",
-                            match=models.MatchValue(value=project_id),
-                        ),
-                    ]
-                ),
-                limit=self._config.scroll_batch_size,
-                with_vectors=True,
-                with_payload=True,
-            )
+        records = []
+        offset = None
+        while True:
+            async with self._semaphore:
+                batch, next_offset = await self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="file_version_id",
+                                match=models.MatchValue(value=file_version_id),
+                            ),
+                            models.FieldCondition(
+                                key="project_id",
+                                match=models.MatchValue(value=project_id),
+                            ),
+                        ]
+                    ),
+                    limit=self._config.scroll_batch_size,
+                    offset=offset,
+                    with_vectors=True,
+                    with_payload=True,
+                )
+            records.extend(batch)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        selected_records = self._select_readable_knowledge_set(records)
 
         logger.debug(
             "get_file_points",
             project_id=project_id,
             file_version_id=file_version_id[:16],
             records_count=len(records),
+            selected_count=len(selected_records),
         )
-        return records
+        return selected_records
 
     # =========================================================================
     # 2.4 Check existence (content-addressing dedup)
@@ -300,26 +269,39 @@ class QdrantStorageService:
         result: Dict[str, bool] = {}
 
         async def _check_one(fvid: str) -> None:
-            async with self._semaphore:
-                count = await self._client.count(
-                    collection_name=collection,
-                    count_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="file_version_id",
-                                match=models.MatchValue(value=fvid),
-                            ),
-                            models.FieldCondition(
-                                key="project_id",
-                                match=models.MatchValue(value=project_id),
-                            ),
-                        ]
-                    ),
-                    exact=True,
-                )
-                result[fvid] = count.count > 0
+            records = []
+            offset = None
+            while True:
+                async with self._semaphore:
+                    batch, next_offset = await self._client.scroll(
+                        collection_name=collection,
+                        scroll_filter=models.Filter(
+                            must=[
+                                models.FieldCondition(
+                                    key="file_version_id",
+                                    match=models.MatchValue(value=fvid),
+                                ),
+                                models.FieldCondition(
+                                    key="project_id",
+                                    match=models.MatchValue(value=project_id),
+                                ),
+                            ]
+                        ),
+                        limit=self._config.scroll_batch_size,
+                        offset=offset,
+                        with_vectors=False,
+                        with_payload=[
+                            "knowledge_set_id",
+                            "chunk_index",
+                            "chunk_count",
+                        ],
+                    )
+                records.extend(batch)
+                if next_offset is None:
+                    break
+                offset = next_offset
+            result[fvid] = self._has_complete_knowledge_set(records)
 
-        # Batch + concurrent checks
         start = time.monotonic()
         batch_size = self._config.scroll_batch_size
         for i in range(0, len(file_version_ids), batch_size):
@@ -338,232 +320,10 @@ class QdrantStorageService:
         )
         return result
 
-    # =========================================================================
-    # 2.5 Delete file points (single)
-    # =========================================================================
-
-    async def delete_file_points(
-        self, project_id: str, file_version_id: str
-    ) -> bool:
-        """Delete all Points for a file_version_id. Idempotent."""
-        self._check_initialized()
-        assert self._client is not None
-        assert self._semaphore is not None
-
-        collection = self._config.collection.name
-
-        try:
-            async with self._semaphore:
-                await self._client.delete(
-                    collection_name=collection,
-                    points_selector=models.FilterSelector(
-                        filter=models.Filter(
-                            must=[
-                                models.FieldCondition(
-                                    key="file_version_id",
-                                    match=models.MatchValue(value=file_version_id),
-                                ),
-                                models.FieldCondition(
-                                    key="project_id",
-                                    match=models.MatchValue(value=project_id),
-                                ),
-                            ]
-                        )
-                    ),
-                )
-
-            logger.info(
-                "delete_file_points",
-                project_id=project_id,
-                file_version_id=file_version_id[:16],
-            )
-            return True
-
-        except Exception as e:
-            logger.error(
-                "delete_file_points_failed",
-                project_id=project_id,
-                file_version_id=file_version_id[:16],
-                error=str(e),
-            )
-            raise QdrantOperationError(
-                f"Failed to delete points for {file_version_id}: {e}"
-            ) from e
-
-    # =========================================================================
-    # 2.6 Batch delete
-    # =========================================================================
-
-    async def batch_delete_files(
-        self, project_id: str, file_version_ids: List[str]
-    ) -> BatchResult:
-        """Batch delete Points for multiple file_version_ids."""
-        self._check_initialized()
-        result = BatchResult()
-
-        async def _delete_one(fvid: str) -> None:
-            try:
-                await self.delete_file_points(project_id, fvid)
-                result.succeeded.append(fvid)
-            except Exception as e:
-                result.failed[fvid] = str(e)
-
-        tasks = [_delete_one(fvid) for fvid in file_version_ids]
-        await asyncio.gather(*tasks)
-
-        logger.info(
-            "batch_delete_files",
-            project_id=project_id,
-            total=len(file_version_ids),
-            succeeded=len(result.succeeded),
-            failed=len(result.failed),
-        )
-        return result
-
-    # =========================================================================
-    # 2.7 Clone points for rename (no LLM / embedding needed)
-    # =========================================================================
-
-    async def clone_points_for_rename(
-        self,
-        project_id: str,
-        blob_hash: str,
-        new_file_version_id: str,
-        new_file_path: str,
-    ) -> int:
-        """Clone existing knowledge points to a new file path for a pure rename.
-
-        Queries points by ``blob_hash`` + ``project_id``, creates new points
-        with identical vectors and business descriptions but updated
-        ``file_version_id`` and ``file_path`` payload fields.
-
-        Args:
-            project_id: Project UUID.
-            blob_hash: Git blob SHA-1 (unchanged by rename).
-            new_file_version_id: hash(new_file_path + blob_hash).
-            new_file_path: The renamed file's new repository-relative path.
-
-        Returns:
-            Number of points cloned.  0 if no source points found.
-        """
-        self._check_initialized()
-        assert self._client is not None
-        assert self._semaphore is not None
-
-        collection = self._config.collection.name
-
-        try:
-            # Query source points by blob_hash + project_id
-            async with self._semaphore:
-                records, _ = await self._client.scroll(
-                    collection_name=collection,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="blob_hash",
-                                match=models.MatchValue(value=blob_hash),
-                            ),
-                            models.FieldCondition(
-                                key="project_id",
-                                match=models.MatchValue(value=project_id),
-                            ),
-                        ]
-                    ),
-                    limit=self._config.scroll_batch_size,
-                    with_vectors=True,
-                    with_payload=True,
-                )
-
-            if not records:
-                logger.info(
-                    "clone_points_no_source",
-                    project_id=project_id,
-                    blob_hash=blob_hash[:16],
-                    new_file_path=new_file_path,
-                )
-                return 0
-
-            # Delete any existing points for the new_file_version_id (idempotent)
-            async with self._semaphore:
-                await self._client.delete(
-                    collection_name=collection,
-                    points_selector=models.FilterSelector(
-                        filter=models.Filter(
-                            must=[
-                                models.FieldCondition(
-                                    key="file_version_id",
-                                    match=models.MatchValue(value=new_file_version_id),
-                                ),
-                                models.FieldCondition(
-                                    key="project_id",
-                                    match=models.MatchValue(value=project_id),
-                                ),
-                            ]
-                        )
-                    ),
-                )
-
-            # Build cloned points with updated payload
-            cloned_points = []
-            for rec in records:
-                payload = dict(rec.payload) if rec.payload else {}
-                payload["file_version_id"] = new_file_version_id
-                payload["file_path"] = new_file_path
-
-                vectors = {}
-                if rec.vector and isinstance(rec.vector, dict):
-                    for vec_name, vec_data in rec.vector.items():
-                        if isinstance(vec_data, models.SparseVector):
-                            vectors[vec_name] = vec_data
-                        else:
-                            vectors[vec_name] = vec_data
-
-                cloned_points.append(models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vectors,
-                    payload=payload,
-                ))
-
-            # Upsert cloned points
-            async with self._semaphore:
-                batch_size = self._config.upsert_batch_size
-                for i in range(0, len(cloned_points), batch_size):
-                    batch = cloned_points[i : i + batch_size]
-                    await self._client.upsert(
-                        collection_name=collection,
-                        points=batch,
-                    )
-
-            logger.info(
-                "clone_points_for_rename",
-                project_id=project_id,
-                blob_hash=blob_hash[:16],
-                new_file_path=new_file_path,
-                new_file_version_id=new_file_version_id[:16],
-                cloned_count=len(cloned_points),
-            )
-            return len(cloned_points)
-
-        except Exception as e:
-            logger.error(
-                "clone_points_for_rename_failed",
-                project_id=project_id,
-                blob_hash=blob_hash[:16],
-                new_file_path=new_file_path,
-                error=str(e),
-            )
-            raise QdrantOperationError(
-                f"Failed to clone points for rename {new_file_path}: {e}"
-            ) from e
-
-    # =========================================================================
-    # 2.8 Get all file_version_ids for a project (GC use)
-    # =========================================================================
-
     async def get_all_file_version_ids(self, project_id: str) -> Set[str]:
         """Scroll through all Points for a project, extracting file_version_ids.
 
-        Used by GC service to find orphan knowledge points.
+        Used for project-scoped storage inspection.
         """
         self._check_initialized()
         assert self._client is not None
@@ -719,6 +479,91 @@ class QdrantStorageService:
             raise RuntimeError(
                 "QdrantStorageService is not initialized. Call initialize() first."
             )
+
+    @staticmethod
+    def _point_id(
+        project_id: str,
+        file_version_id: str,
+        knowledge_set_id: str,
+        chunk_index: int,
+    ) -> str:
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"codebase-rag:point:{project_id}:{file_version_id}:"
+            f"{knowledge_set_id}:{chunk_index}",
+        ))
+
+    @staticmethod
+    def _compute_knowledge_set_id(
+        project_id: str,
+        file_version_id: str,
+        payloads: List[dict],
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "project_id": project_id,
+                "file_version_id": file_version_id,
+                "payloads": payloads,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _select_readable_knowledge_set(
+        records: List[models.Record],
+    ) -> List[models.Record]:
+        complete_sets = QdrantStorageService._complete_knowledge_sets(records)
+        if complete_sets:
+            selected_id = sorted(complete_sets.keys())[0]
+            return complete_sets[selected_id]
+        return [
+            rec for rec in records
+            if not rec.payload or "knowledge_set_id" not in rec.payload
+        ]
+
+    @staticmethod
+    def _has_complete_knowledge_set(records: List[models.Record]) -> bool:
+        if QdrantStorageService._complete_knowledge_sets(records):
+            return True
+        return any(
+            not rec.payload or "knowledge_set_id" not in rec.payload
+            for rec in records
+        )
+
+    @staticmethod
+    def _complete_knowledge_sets(
+        records: List[models.Record],
+    ) -> Dict[str, List[models.Record]]:
+        grouped: Dict[str, Dict[int, models.Record]] = {}
+        expected_counts: Dict[str, int] = {}
+
+        for rec in records:
+            payload = rec.payload or {}
+            knowledge_set_id = payload.get("knowledge_set_id")
+            chunk_index = payload.get("chunk_index")
+            chunk_count = payload.get("chunk_count")
+            if not isinstance(knowledge_set_id, str):
+                continue
+            if not isinstance(chunk_index, int):
+                continue
+            if not isinstance(chunk_count, int) or chunk_count <= 0:
+                continue
+            grouped.setdefault(knowledge_set_id, {})[chunk_index] = rec
+            expected_counts[knowledge_set_id] = chunk_count
+
+        complete: Dict[str, List[models.Record]] = {}
+        for knowledge_set_id, by_index in grouped.items():
+            chunk_count = expected_counts.get(knowledge_set_id, 0)
+            expected_indexes = set(range(chunk_count))
+            if set(by_index.keys()) == expected_indexes:
+                complete[knowledge_set_id] = [
+                    by_index[idx] for idx in range(chunk_count)
+                ]
+
+        return complete
 
     async def _ensure_collection(self) -> None:
         """Check/create collection and build payload indexes."""

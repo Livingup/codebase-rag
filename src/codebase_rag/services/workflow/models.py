@@ -40,7 +40,7 @@ class ContentCommitResult:
     deleted_files: int
     renamed_files: int = 0             # pure renames (cloned, no LLM needed)
     skipped_files: int = 0             # content-addressing dedup skipped
-    cache_hit_files: int = 0           # pending knowledge cache hits (skip Agent + Embedding)
+    cache_hit_files: int = 0           # knowledge sync cache hits (skip Agent + Embedding)
     failed_files: List[FailedFile] = field(default_factory=list)
     total_points_written: int = 0
     total_agent_calls: int = 0

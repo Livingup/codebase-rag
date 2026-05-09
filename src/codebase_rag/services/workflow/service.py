@@ -21,6 +21,7 @@ from qdrant_client import models
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.token_counter import TokenCounter
+from codebase_rag.common.types import SparseVector
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import WorkflowConfig
 from codebase_rag.services.agent.errors import AgentTaskComplete
@@ -32,8 +33,9 @@ from codebase_rag.services.git_operations.errors import GitFileNotFoundError
 from codebase_rag.services.git_operations.gray_area_store import GrayAreaStore
 from codebase_rag.services.git_operations.models import ChangedFiles, RenamedFileEntry
 from codebase_rag.services.git_operations.service import GitOperationsService
+from codebase_rag.services.knowledge_sync.models import KnowledgeSyncSource
+from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
-from codebase_rag.services.mcp_service.pending_knowledge_store import PendingKnowledgeStore
 from codebase_rag.services.qdrant_storage.models import PointData
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService
 from codebase_rag.services.workflow.models import (
@@ -78,7 +80,7 @@ class WorkflowOrchestratorService:
         agent: AgentService,
         embedding: EmbeddingService,
         token_counter: Optional[TokenCounter] = None,
-        pending_knowledge_store: Optional[PendingKnowledgeStore] = None,
+        knowledge_sync: Optional[KnowledgeSyncService] = None,
     ) -> None:
         self._config_manager = config_manager
         self._git_ops = git_ops
@@ -87,7 +89,7 @@ class WorkflowOrchestratorService:
         self._agent = agent
         self._embedding = embedding
         self._token_counter = token_counter or TokenCounter()
-        self._pending_store = pending_knowledge_store
+        self._knowledge_sync = knowledge_sync
 
         # Task queue: per-project serial, cross-project parallel
         self._task_queue = ProjectTaskQueue()
@@ -639,7 +641,7 @@ class WorkflowOrchestratorService:
         deleted_count = 0
         renamed_count = 0
         skipped_count = 0
-        pending_cache_written_count = 0
+        sync_cache_hit_count = 0
         total_points = 0
         total_agent_calls = 0
         failed_files: List[FailedFile] = []
@@ -648,7 +650,7 @@ class WorkflowOrchestratorService:
 
         # Step 2A: Process added files
         async def _process_added(entry) -> None:
-            nonlocal added_count, skipped_count, pending_cache_written_count, total_points, total_agent_calls
+            nonlocal added_count, skipped_count, sync_cache_hit_count, total_points, total_agent_calls
             async with file_sem:
                 try:
                     pts, skipped, agents, cache_hit = await self._process_file_with_agent(
@@ -661,7 +663,7 @@ class WorkflowOrchestratorService:
                     if skipped:
                         skipped_count += 1
                     elif cache_hit:
-                        pending_cache_written_count += 1
+                        sync_cache_hit_count += 1
                     else:
                         added_count += 1
                 except Exception as e:
@@ -683,7 +685,7 @@ class WorkflowOrchestratorService:
 
         # Step 2M: Process modified files
         async def _process_modified(entry) -> None:
-            nonlocal modified_count, skipped_count, pending_cache_written_count, total_points, total_agent_calls
+            nonlocal modified_count, skipped_count, sync_cache_hit_count, total_points, total_agent_calls
             async with file_sem:
                 try:
                     # Get old descriptions for context
@@ -704,7 +706,7 @@ class WorkflowOrchestratorService:
                     if skipped:
                         skipped_count += 1
                     elif cache_hit:
-                        pending_cache_written_count += 1
+                        sync_cache_hit_count += 1
                     else:
                         modified_count += 1
                 except Exception as e:
@@ -738,35 +740,57 @@ class WorkflowOrchestratorService:
         async def _process_renamed(entry: RenamedFileEntry) -> None:
             nonlocal renamed_count, total_points
             try:
-                # Clone existing points with updated file_path / file_version_id
-                cloned = await self._qdrant.clone_points_for_rename(
-                    project_id=project_id,
-                    blob_hash=entry.blob_hash,
-                    new_file_version_id=entry.new_file_version_id,
-                    new_file_path=entry.new_file_path,
+                if self._knowledge_sync is None:
+                    raise WorkflowError("KnowledgeSyncService is required for rename publishing.")
+
+                source_records = await self._qdrant.get_file_points(
+                    project_id,
+                    entry.old_file_version_id,
                 )
-                if cloned > 0:
-                    # Delete old file_version_id from Qdrant
-                    await self._qdrant.delete_file_points(
+                if (
+                    not source_records
+                    and self._knowledge_sync.has_ready_job(
                         project_id, entry.old_file_version_id,
                     )
-                    # Update in-memory instance
-                    await self._delete_from_memory(
-                        project_id, entry.old_file_version_id,
+                ):
+                    await self._knowledge_sync.ensure_published(
+                        project_id,
+                        entry.old_file_version_id,
+                        update_memory=False,
                     )
-                    await self._upsert_to_memory_from_qdrant(
-                        project_id, entry.new_file_version_id,
+                    source_records = await self._qdrant.get_file_points(
+                        project_id,
+                        entry.old_file_version_id,
                     )
-                    total_points += cloned
+
+                cloned_points = self._records_to_renamed_point_data(
+                    source_records,
+                    entry.new_file_path,
+                    entry.blob_hash,
+                )
+                if cloned_points:
+                    sync_result = await self._knowledge_sync.submit_points(
+                        project_id=project_id,
+                        file_path=entry.new_file_path,
+                        blob_hash=entry.blob_hash,
+                        file_version_id=entry.new_file_version_id,
+                        points=cloned_points,
+                        source="rename_clone",
+                        old_file_version_id=entry.old_file_version_id,
+                        update_latest=True,
+                        update_memory=True,
+                    )
+                    if sync_result.cancelled_stale or sync_result.skipped_existing:
+                        return
+                    total_points += sync_result.points_count
                     renamed_count += 1
                     logger.info(
                         "workflow_file_renamed",
                         old_path=entry.old_file_path,
                         new_path=entry.new_file_path,
-                        cloned_points=cloned,
+                        cloned_points=sync_result.points_count,
                     )
                 else:
-                    # No source points found — fall back to treating as new add
                     logger.warning(
                         "workflow_rename_no_source_fallback",
                         old_path=entry.old_file_path,
@@ -815,7 +839,7 @@ class WorkflowOrchestratorService:
             deleted=deleted_count,
             renamed=renamed_count,
             content_dedup_skipped_files=skipped_count,
-            pending_cache_written_files=pending_cache_written_count,
+            sync_cache_hit_files=sync_cache_hit_count,
             qdrant_points_written=total_points,
             agent_calls=total_agent_calls,
             failed=len(failed_files),
@@ -828,7 +852,7 @@ class WorkflowOrchestratorService:
             deleted_files=deleted_count,
             renamed_files=renamed_count,
             skipped_files=skipped_count,
-            cache_hit_files=pending_cache_written_count,
+            cache_hit_files=sync_cache_hit_count,
             failed_files=failed_files,
             total_points_written=total_points,
             total_agent_calls=total_agent_calls,
@@ -911,6 +935,7 @@ class WorkflowOrchestratorService:
                     pts, was_skipped, _, _ = await self._process_file_with_agent(
                         project_id, repo_path, entry.file_path,
                         entry.blob_hash, fvid, is_new=True,
+                        sync_source="initialization_backfill",
                     )
                     async with progress_lock:
                         total_points += pts
@@ -1118,6 +1143,8 @@ class WorkflowOrchestratorService:
         old_descriptions: Optional[List[str]] = None,
         old_file_version_id: Optional[str] = None,
         skip_memory_update: bool = False,
+        sync_source: KnowledgeSyncSource = "commit_event",
+        update_latest: bool = True,
     ) -> tuple:
         """Process a single file via knowledge_producer agent with tool calling.
 
@@ -1127,6 +1154,23 @@ class WorkflowOrchestratorService:
 
         Returns (points_written, skipped, agent_calls, cache_hit).
         """
+        if self._knowledge_sync is None:
+            raise WorkflowError("KnowledgeSyncService is required for knowledge publishing.")
+
+        if update_latest:
+            self._knowledge_sync.mark_latest_file_version(
+                project_id, file_path, file_version_id,
+            )
+        elif self._knowledge_sync.is_stale_file_version(
+            project_id, file_path, file_version_id,
+        ):
+            logger.info(
+                "workflow_file_stale_skip",
+                file_path=file_path,
+                file_version_id=file_version_id[:16],
+            )
+            return (0, True, 0, False)
+
         # Content-addressing dedup
         existence = await self._qdrant.check_existence(project_id, [file_version_id])
         if existence.get(file_version_id, False):
@@ -1141,31 +1185,15 @@ class WorkflowOrchestratorService:
                     await self._delete_from_memory(project_id, old_file_version_id)
             return (0, True, 0, False)
 
-        # Check pending knowledge cache (pre-commit knowledge from MCP tools)
-        if self._pending_store is not None:
-            pending = await self._pending_store.consume(project_id, file_version_id)
-            if pending is not None:
-                logger.info(
-                    "workflow_pending_cache_hit",
-                    file_path=file_path,
-                    file_version_id=file_version_id[:16],
-                    points=len(pending.points),
-                )
-                # Write pre-built PointData (with pre-generated vectors) to Qdrant
-                await self._qdrant.upsert_file_points(
-                    project_id=project_id,
-                    file_version_id=file_version_id,
-                    points_data=pending.points,
-                )
-                if not skip_memory_update:
-                    await self._upsert_to_memory_from_qdrant(
-                        project_id, file_version_id,
-                    )
-                    if old_file_version_id:
-                        await self._delete_from_memory(
-                            project_id, old_file_version_id,
-                        )
-                return (len(pending.points), False, 0, True)
+        if self._knowledge_sync.has_ready_job(project_id, file_version_id):
+            sync_result = await self._knowledge_sync.ensure_published(
+                project_id,
+                file_version_id,
+                update_memory=not skip_memory_update,
+            )
+            if sync_result.cancelled_stale or sync_result.skipped_existing:
+                return (0, True, 0, True)
+            return (sync_result.points_count, False, 0, True)
 
         # Get file content
         source_code = await self._git_ops.get_file_content(repo_path, blob_hash)
@@ -1311,17 +1339,21 @@ class WorkflowOrchestratorService:
             points_written=len(points_written),
         )
 
-        # Atomic write: all accumulated points in one delete-then-write call
+        # Persist all accumulated points through the unified sync coordinator.
         if points_written:
-            await self._qdrant.upsert_file_points(
-                project_id, file_version_id, points_written,
+            sync_result = await self._knowledge_sync.submit_points(
+                project_id=project_id,
+                file_path=file_path,
+                blob_hash=blob_hash,
+                file_version_id=file_version_id,
+                points=points_written,
+                source=sync_source,
+                old_file_version_id=old_file_version_id,
+                update_latest=update_latest,
+                update_memory=not skip_memory_update,
             )
-
-        # Update in-memory instance (skipped by compensation task)
-        if not skip_memory_update:
-            if old_file_version_id:
-                await self._delete_from_memory(project_id, old_file_version_id)
-            await self._upsert_to_memory_from_qdrant(project_id, file_version_id)
+            if sync_result.cancelled_stale or sync_result.skipped_existing:
+                return (0, True, 1, False)
 
         return (len(points_written), False, 1, False)
 
@@ -1419,6 +1451,44 @@ class WorkflowOrchestratorService:
             for r in records
             if (r.payload or {}).get("business_description")
         ]
+
+    def _records_to_renamed_point_data(
+        self,
+        records: list,
+        new_file_path: str,
+        blob_hash: str,
+    ) -> List[PointData]:
+        dense_name = self._config_manager.config.qdrant_storage.collection.dense_vector.name
+        sparse_name = self._config_manager.config.qdrant_storage.collection.sparse_vector.name
+        entity_name = os.path.basename(new_file_path)
+        points: List[PointData] = []
+
+        for rec in records:
+            payload = rec.payload or {}
+            vector = rec.vector if isinstance(rec.vector, dict) else {}
+            dense_vector = vector.get(dense_name)
+            sparse_vector = vector.get(sparse_name)
+            description = payload.get("business_description")
+            if not isinstance(description, str) or not description:
+                continue
+            if not isinstance(dense_vector, list):
+                continue
+            if not isinstance(sparse_vector, models.SparseVector):
+                continue
+            points.append(PointData(
+                file_path=new_file_path,
+                entity_type=str(payload.get("entity_type") or "file"),
+                entity_name=str(payload.get("entity_name") or entity_name),
+                business_description=description,
+                blob_hash=blob_hash,
+                dense_vector=dense_vector,
+                sparse_vector=SparseVector(
+                    indices=list(sparse_vector.indices),
+                    values=list(sparse_vector.values),
+                ),
+            ))
+
+        return points
 
     # =========================================================================
     # Internal: task execution dispatcher
@@ -2043,7 +2113,20 @@ class WorkflowOrchestratorService:
 
     def _enqueue_retry(self, record: FailedFileRecord) -> None:
         """Add a failed file to the retry queue and persist."""
+        if self._knowledge_sync is not None:
+            self._knowledge_sync.mark_latest_file_version(
+                record.project_id,
+                record.file_path,
+                record.file_version_id,
+            )
         queue = self._retry_queues.setdefault(record.project_id, [])
+        queue[:] = [
+            r for r in queue
+            if not (
+                r.file_path == record.file_path
+                and r.file_version_id != record.file_version_id
+            )
+        ]
         # Deduplicate by file_version_id
         for existing in queue:
             if existing.file_version_id == record.file_version_id:
@@ -2195,10 +2278,6 @@ class WorkflowOrchestratorService:
                         )
                     all_records.extend(self._retry_queues.get(project_id, []))
 
-                if not all_records:
-                    self._comp_consecutive_failures = 0
-                    continue
-
                 self._comp_last_round_at = time.time()
 
                 # Take a batch
@@ -2214,6 +2293,18 @@ class WorkflowOrchestratorService:
 
                 round_success = 0
                 round_failed = 0
+
+                if self._knowledge_sync is not None:
+                    outbox_success, outbox_failed = await self._knowledge_sync.retry_ready_jobs(
+                        batch_size=comp_cfg.batch_size,
+                    )
+                    round_success += outbox_success
+                    round_failed += outbox_failed
+
+                if not all_records:
+                    if round_failed == 0:
+                        self._comp_consecutive_failures = 0
+                    continue
 
                 for record in batch:
                     result = await self._compensation_process_file(record)
@@ -2271,6 +2362,20 @@ class WorkflowOrchestratorService:
             )
             return "dead_lettered"
 
+        if self._knowledge_sync is not None and self._knowledge_sync.is_stale_file_version(
+            project_id,
+            record.file_path,
+            record.file_version_id,
+        ):
+            self._remove_from_retry_queue(record)
+            logger.info(
+                "compensation_skip_stale_file_version",
+                project_id=project_id,
+                file_path=record.file_path,
+                file_version_id=record.file_version_id[:16],
+            )
+            return "success"
+
         # Check blob availability (content is re-read inside _process_file_with_agent)
         try:
             await self._git_ops.get_file_content(
@@ -2300,6 +2405,8 @@ class WorkflowOrchestratorService:
                 is_new=record.is_new,
                 old_file_version_id=record.old_file_version_id,
                 skip_memory_update=True,
+                sync_source="compensation_retry",
+                update_latest=False,
             )
         except Exception as e:
             record.last_error = str(e)[:500]

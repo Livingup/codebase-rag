@@ -61,7 +61,7 @@ class RerankerError(McpServiceError):
 
 
 # =============================================================================
-# Pending Knowledge result models
+# Knowledge query/submission result models
 # =============================================================================
 
 

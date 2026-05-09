@@ -13,8 +13,6 @@ from codebase_rag.services.management_api.models import (
     DeleteProjectResponse,
     ErrorDetail,
     ErrorResponse,
-    GCRequest,
-    GCStatusResponse,
     HealthResponse,
     ProjectDetailResponse,
     ProjectResponse,
@@ -143,16 +141,6 @@ def create_router(service: ManagementApiService) -> APIRouter:
         except ProjectNotFoundError as e:
             _error(404, "PROJECT_NOT_FOUND", str(e))
 
-    @router.post("/gc", response_model=TaskResponse)
-    async def trigger_gc(req: GCRequest = GCRequest()):
-        try:
-            return await service.trigger_gc(
-                project_id=req.project_id,
-                force=req.force,
-            )
-        except ProjectNotFoundError as e:
-            _error(404, "PROJECT_NOT_FOUND", str(e))
-
     # =====================================================================
     # 2.4 Status queries
     # =====================================================================
@@ -163,15 +151,6 @@ def create_router(service: ManagementApiService) -> APIRouter:
     async def project_status(project_id: str):
         try:
             return await service.get_project_status(project_id)
-        except ProjectNotFoundError as e:
-            _error(404, "PROJECT_NOT_FOUND", str(e))
-
-    @router.get(
-        "/projects/{project_id}/gc", response_model=GCStatusResponse,
-    )
-    async def gc_status(project_id: str):
-        try:
-            return service.get_gc_status(project_id)
         except ProjectNotFoundError as e:
             _error(404, "PROJECT_NOT_FOUND", str(e))
 

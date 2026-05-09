@@ -1,12 +1,12 @@
-"""MCP Service — two-stage semantic search with LLM reranking + pending knowledge.
+"""MCP Service — two-stage semantic search with LLM reranking + knowledge sync.
 
 Provides the core search logic used by the MCP Server tools:
   Stage 1: Hybrid vector search (dense + sparse) → recall up to recall_limit candidates
   Stage 2: LLM reranker agent scores candidates → return top_k results
 
-Also provides pending knowledge management:
+Also provides knowledge point management:
   - get_file_knowledge: batch-query committed knowledge descriptions
-  - add_file_knowledge: cache pre-commit knowledge with pre-generated embeddings
+  - add_file_knowledge: submit pre-commit knowledge through KnowledgeSyncService
 
 Internal dependencies:
   - 01-Qdrant Storage Service (committed knowledge query)
@@ -21,12 +21,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 from typing import Dict, List, Optional
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.config.loader import ConfigManager
-from codebase_rag.config.schema import MCPRerankerConfig, PendingKnowledgeConfig
+from codebase_rag.config.schema import KnowledgeSubmissionConfig, MCPRerankerConfig
 from codebase_rag.services.agent.errors import AgentTaskComplete
 from codebase_rag.services.agent.models import AgentDefinition, ToolSchema
 from codebase_rag.services.agent.service import AgentService
@@ -37,6 +36,7 @@ from codebase_rag.services.git_operations.service import (
 )
 from codebase_rag.services.memory_qdrant.models import ActiveInstanceInfo
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
+from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.mcp_service.models import (
     AddFileFailure,
     AddFileSuccess,
@@ -49,10 +49,6 @@ from codebase_rag.services.mcp_service.models import (
     RerankerError,
     RerankerScoreEntry,
     SearchResultPoint,
-)
-from codebase_rag.services.mcp_service.pending_knowledge_store import (
-    PendingKnowledgeEntry,
-    PendingKnowledgeStore,
 )
 from codebase_rag.services.qdrant_storage.models import PointData
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService
@@ -70,7 +66,7 @@ _RERANKER_AGENT_PREFIX = "reranker"
 class McpService:
     """MCP search service with two-stage retrieval + LLM reranking.
 
-    Also provides pending knowledge management for pre-commit caching.
+    Also provides knowledge point submission for pre-commit files.
 
     Args:
         config_manager: Configuration manager.
@@ -79,7 +75,7 @@ class McpService:
         agent: Agent service for reranker execution.
         git_ops: Git operations service for workdir blob hash computation.
         qdrant_storage: Qdrant storage service for committed knowledge query.
-        pending_knowledge_store: Shared pending knowledge cache instance.
+        knowledge_sync: Shared knowledge synchronization service.
     """
 
     def __init__(
@@ -90,7 +86,7 @@ class McpService:
         agent: AgentService,
         git_ops: Optional[GitOperationsService] = None,
         qdrant_storage: Optional[QdrantStorageService] = None,
-        pending_knowledge_store: Optional[PendingKnowledgeStore] = None,
+        knowledge_sync: Optional[KnowledgeSyncService] = None,
     ) -> None:
         self._config_manager = config_manager
         self._embedding = embedding
@@ -98,12 +94,11 @@ class McpService:
         self._agent = agent
         self._git_ops = git_ops
         self._qdrant_storage = qdrant_storage
-        self._pending_store = pending_knowledge_store
+        self._knowledge_sync = knowledge_sync
 
         self._sorted_providers: list = []
         self._reranker_agent_names: List[str] = []
         self._reranker_next_idx: int = 0
-        self._ttl_task: Optional[asyncio.Task] = None
         self._initialized = False
 
     @property
@@ -111,8 +106,8 @@ class McpService:
         return self._config_manager.config.mcp.reranker
 
     @property
-    def _pending_config(self) -> PendingKnowledgeConfig:
-        return self._config_manager.config.mcp.pending_knowledge
+    def _knowledge_submission_config(self) -> KnowledgeSubmissionConfig:
+        return self._config_manager.config.mcp.knowledge_submission
 
     # =========================================================================
     # Lifecycle
@@ -124,22 +119,11 @@ class McpService:
 
         await self._register_reranker_agent()
 
-        # Ensure pending knowledge store directory exists
-        if self._pending_store is not None:
-            self._pending_store.ensure_dir()
-            # Start TTL sweep if enabled
-            ttl = self._pending_config.ttl_minutes
-            if ttl > 0:
-                self._ttl_task = asyncio.create_task(self._ttl_sweep_loop())
-
         self._initialized = True
         logger.info("mcp_service_initialized")
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
-        if self._ttl_task is not None:
-            self._ttl_task.cancel()
-            self._ttl_task = None
         self._initialized = False
         logger.info("mcp_service_shutdown")
 
@@ -520,7 +504,7 @@ class McpService:
         return await self._memory.get_active_instance_info(project_id)
 
     # =========================================================================
-    # 2.5 Pending knowledge — get committed file knowledge
+    # 2.5 Knowledge query — get committed file knowledge
     # =========================================================================
 
     async def get_file_knowledge(
@@ -583,52 +567,64 @@ class McpService:
         return list(results)
 
     # =========================================================================
-    # 2.6 Pending knowledge — add pre-commit knowledge
+    # 2.6 Knowledge synchronization — add pre-commit knowledge
     # =========================================================================
 
     async def add_file_knowledge(
         self,
         project_path: str,
-        files: List[dict],
+        file_path: str,
+        blob_hash: str,
+        knowledge_descriptions: List[str],
     ) -> AddKnowledgeResult:
-        """Cache pre-commit knowledge descriptions with pre-generated embeddings.
+        """Submit pre-commit knowledge descriptions for a single file version.
 
-        For each file, validates token limits, computes workdir blob hash,
-        generates embedding vectors, builds PointData, and stores in
-        PendingKnowledgeStore.
+        Validates token limits, verifies the current worktree blob hash,
+        generates embedding vectors, builds PointData, and submits the file
+        version to KnowledgeSyncService.
 
         Args:
             project_path: Absolute path to the Git repository root.
-            files: List of dicts with 'file_path' and 'knowledge_descriptions'.
+            file_path: Repository-relative file path.
+            blob_hash: Git blob hash for the current worktree file content.
+            knowledge_descriptions: Complete knowledge descriptions for the file.
 
         Returns:
             AddKnowledgeResult with succeeded and failed lists.
         """
         assert self._git_ops is not None, "git_ops dependency required"
-        assert self._pending_store is not None, "pending_knowledge_store required"
+        assert self._knowledge_sync is not None, "knowledge_sync dependency required"
 
         project_id = self._read_project_id(project_path)
-        token_limit = self._pending_config.point_token_limit
+        token_limit = self._knowledge_submission_config.point_token_limit
         result = AddKnowledgeResult()
 
-        for file_entry in files:
-            fp = file_entry["file_path"]
-            descriptions = file_entry["knowledge_descriptions"]
-
-            try:
-                await self._process_add_file(
-                    project_id, project_path, fp, descriptions, token_limit,
+        try:
+            sync_result = await self._process_add_file(
+                project_id,
+                project_path,
+                file_path,
+                blob_hash,
+                knowledge_descriptions,
+                token_limit,
+            )
+            result.succeeded.append(
+                AddFileSuccess(
+                    file_path=file_path,
+                    points_count=(
+                        sync_result.points_count
+                        if sync_result.points_count > 0
+                        else len(knowledge_descriptions)
+                    ),
                 )
-                result.succeeded.append(
-                    AddFileSuccess(file_path=fp, points_count=len(descriptions))
-                )
-            except Exception as e:
-                logger.warning(
-                    "add_file_knowledge_failed",
-                    file_path=fp,
-                    error=str(e),
-                )
-                result.failed.append(AddFileFailure(file_path=fp, error=str(e)))
+            )
+        except Exception as e:
+            logger.warning(
+                "add_file_knowledge_failed",
+                file_path=file_path,
+                error=str(e),
+            )
+            result.failed.append(AddFileFailure(file_path=file_path, error=str(e)))
 
         logger.info(
             "add_file_knowledge_done",
@@ -643,18 +639,19 @@ class McpService:
         project_id: str,
         project_path: str,
         file_path: str,
+        blob_hash: str,
         descriptions: List[str],
         token_limit: int,
-    ) -> None:
+    ):
         """Process a single file for add_file_knowledge.
 
-        Validates tokens, computes blob hash, generates embeddings,
-        builds PointData list, and stores in PendingKnowledgeStore.
+        Validates tokens, verifies blob hash, generates embeddings, builds
+        PointData list, and submits through KnowledgeSyncService.
 
         Raises on any failure (token limit, file not found, etc).
         """
         assert self._git_ops is not None
-        assert self._pending_store is not None
+        assert self._knowledge_sync is not None
 
         # Token validation
         over_limit: List[str] = []
@@ -669,10 +666,16 @@ class McpService:
                 "Token limit exceeded: " + "; ".join(over_limit)
             )
 
-        # Compute workdir blob hash
-        blob_hash = await self._git_ops.get_workdir_blob_hash(
+        # Verify the client-provided blob hash against current worktree content
+        current_blob_hash = await self._git_ops.get_workdir_blob_hash(
             project_path, file_path,
         )
+        if current_blob_hash != blob_hash:
+            raise ValueError(
+                "blob_hash mismatch for "
+                f"{file_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
+                "Please recompute the Git blob hash for the latest file content."
+            )
         fvid = compute_file_version_id(file_path, blob_hash)
 
         # Generate embeddings (dense + sparse) for all descriptions
@@ -692,49 +695,28 @@ class McpService:
                 sparse_vector=emb.sparse_vector,
             ))
 
-        # Store in pending cache
-        entry = PendingKnowledgeEntry(
+        sync_result = await self._knowledge_sync.submit_points(
             project_id=project_id,
             file_path=file_path,
             blob_hash=blob_hash,
             file_version_id=fvid,
             points=points,
-            created_at=time.time(),
+            source="client_submit",
+            update_latest=True,
+            update_memory=True,
+            replace_existing_job=True,
         )
-        await self._pending_store.put(project_id, fvid, entry)
 
         logger.info(
-            "add_file_knowledge_cached",
+            "add_file_knowledge_submitted",
             project_id=project_id,
             file_path=file_path,
             file_version_id=fvid[:16],
             points=len(points),
+            published=sync_result.published,
+            skipped_existing=sync_result.skipped_existing,
         )
-
-    # =========================================================================
-    # 2.7 TTL sweep for pending knowledge cache
-    # =========================================================================
-
-    async def _ttl_sweep_loop(self) -> None:
-        """Background task: periodically clean expired pending knowledge entries."""
-        while True:
-            try:
-                await asyncio.sleep(600)  # 10 minutes
-                ttl = self._pending_config.ttl_minutes
-                if ttl > 0 and self._pending_store is not None:
-                    removed = await self._pending_store.cleanup_expired(
-                        time.time(), ttl,
-                    )
-                    if removed > 0:
-                        logger.info(
-                            "pending_knowledge_ttl_sweep",
-                            removed=removed,
-                            remaining=self._pending_store.total_entries,
-                        )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning("pending_knowledge_ttl_sweep_error", error=str(e))
+        return sync_result
 
     # =========================================================================
     # Internal helpers

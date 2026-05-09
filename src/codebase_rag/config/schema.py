@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # =============================================================================
@@ -401,37 +401,6 @@ class WorkflowConfig(BaseModel):
 
 
 # =============================================================================
-# 09-GC service config
-# =============================================================================
-
-
-class GCScheduleConfig(BaseModel):
-    enabled: bool = True
-    cron: str = "0 3 * * *"
-
-
-class GCPolicyConfig(BaseModel):
-    orphan_grace_period_days: int = 7
-
-
-class GCScanConfig(BaseModel):
-    batch_size: int = 500
-    max_delete_batch_size: int = 100
-    max_concurrency: int = 2
-
-
-class GCOrphanStoreConfig(BaseModel):
-    path: str = "G:/App/code base rag/gc_orphans.json"
-
-
-class GCConfig(BaseModel):
-    schedule: GCScheduleConfig = Field(default_factory=GCScheduleConfig)
-    policy: GCPolicyConfig = Field(default_factory=GCPolicyConfig)
-    scan: GCScanConfig = Field(default_factory=GCScanConfig)
-    orphan_store: GCOrphanStoreConfig = Field(default_factory=GCOrphanStoreConfig)
-
-
-# =============================================================================
 # 11-Context Engine service config
 # =============================================================================
 
@@ -515,17 +484,31 @@ class MCPRerankerConfig(BaseModel):
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
 
 
-class PendingKnowledgeConfig(BaseModel):
-    """预提交知识缓存配置。"""
-    store_dir: str = "G:/App/code base rag/pending_knowledge"
-    ttl_minutes: int = 0          # 0 = 禁用淘汰
+class KnowledgeSubmissionConfig(BaseModel):
+    """MCP knowledge submission limits."""
     point_token_limit: int = 2048  # 单条知识描述最大 tokens
 
 
 class MCPConfig(BaseModel):
     servers: Dict[str, MCPServerInstanceConfig] = Field(default_factory=dict)
     reranker: MCPRerankerConfig = Field(default_factory=MCPRerankerConfig)
-    pending_knowledge: PendingKnowledgeConfig = Field(default_factory=PendingKnowledgeConfig)
+    knowledge_submission: KnowledgeSubmissionConfig = Field(default_factory=KnowledgeSubmissionConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_pending_knowledge(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if "knowledge_submission" in data or "pending_knowledge" not in data:
+            return data
+        legacy = data.get("pending_knowledge")
+        if not isinstance(legacy, dict):
+            return data
+        migrated = dict(data)
+        migrated["knowledge_submission"] = {
+            "point_token_limit": legacy.get("point_token_limit", 2048),
+        }
+        return migrated
 
 
 # =============================================================================
@@ -545,7 +528,6 @@ class AppConfig(BaseModel):
     management_api: ManagementApiConfig = Field(default_factory=ManagementApiConfig)
     git_operations: GitOperationsConfig = Field(default_factory=GitOperationsConfig)
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
-    gc: GCConfig = Field(default_factory=GCConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     context_engine: ContextEngineConfig = Field(default_factory=ContextEngineConfig)
     mcp_client: McpClientConfig = Field(default_factory=McpClientConfig)

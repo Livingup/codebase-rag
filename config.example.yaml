@@ -658,20 +658,6 @@ workflow:
     batch_size: 10                        # 每轮最多处理文件数
     max_file_retries: 50                  # 单文件最大重试次数，超过后归档死信队列
 
-# --- 09-GC 服务 ---
-gc:
-  schedule:
-    enabled: true
-    cron: "0 3 * * *"                   # 默认每天凌晨 3 点
-  policy:
-    orphan_grace_period_days: 30        # 孤儿宽限期（天）
-  scan:
-    batch_size: 500                     # 扫描 Qdrant 时每批次获取的 file_version_id 数量
-    max_delete_batch_size: 100          # 单次 GC 最大删除数量
-    max_concurrency: 2                  # 多项目并行扫描并发数
-  orphan_store:
-    path: "G:/App/code base rag/gc_orphans.json"      # 孤儿记录持久化文件
-
 # --- 11-Context Engine 服务 ---
 context_engine:
   provider: "openai_compatible_primary"
@@ -765,7 +751,5 @@ mcp:
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 3600                         # 重排序 agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
-  pending_knowledge:
-    store_dir: "G:/App/code base rag/pending_knowledge"  # Git 风格 hash 寻址存储目录
-    ttl_minutes: 0                       # 缓存淘汰超时（分钟），0 = 禁用淘汰
+  knowledge_submission:
     point_token_limit: 2048              # 单条知识描述最大 tokens
