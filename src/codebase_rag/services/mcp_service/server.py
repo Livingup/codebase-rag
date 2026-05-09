@@ -177,14 +177,10 @@ TOOL_DEFINITIONS: list[Tool] = [
                 "blob_hash": {
                     "type": "string",
                     "description": (
-                        "当前工作区文件内容对应的 Git blob SHA-1，不是 commit hash、"
-                        "不是 HEAD hash、也不是文件路径 hash。必须基于调用工具时的最新工作区"
-                        "文件内容计算，文件可以未提交、未暂存。推荐命令："
-                        "git -C <git_repo_path> hash-object -- <file_path>。"
-                        "其中 <git_repo_path> 必须是 Git 仓库根目录，<file_path> 必须是"
-                        "相对该仓库根目录的路径，并且必须与本工具参数 file_path 完全一致。"
-                        "后端会用当前工作区文件内容重新计算并校验 blob_hash；"
-                        "如果文件内容在计算后又发生变化，校验会失败，需要重新计算。"
+                        "当前工作区文件内容的 Git blob SHA-1（不是 commit/HEAD/path hash）。"
+                        "用 git -C <git_repo_path> hash-object -- <file_path> 计算；"
+                        "<file_path> 必须相对仓库根目录且与本参数 file_path 一致。"
+                        "后端会按当前工作区内容复算校验。"
                     ),
                 },
                 "knowledge_descriptions": {
