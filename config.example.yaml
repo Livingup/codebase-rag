@@ -57,10 +57,11 @@ embedding:
 # --- 01-Qdrant 存储服务 ---
 qdrant_storage:
   connection:
-    host: "103.236.88.224"               # 中心化 Qdrant：腾讯云 NAT VPS（多用户共享同一仓库知识库）
-    port: ${QDRANT_PORT}                          # NAT 公网端口 → 容器内 6333 (HTTP REST)
+    host: "${QDRANT_HOST}"         # 中心化 Qdrant：腾讯云 NAT VPS（多用户共享同一仓库知识库）
+    port: ${QDRANT_PORT}                          # NAT 公网端口 → 容器内 8443 (HTTPS REST via Caddy)
     grpc_port: ${QDRANT_GRPC_PORT}                     # NAT 公网端口 → 容器内 6334 (gRPC)
     prefer_grpc: false                   # 公网链路优先 HTTP，gRPC 经 NAT 复杂度高
+    https: true
     timeout: 60                          # 公网链路加大超时（秒）
     api_key: "${QDRANT_API_KEY}"         # 远程 Qdrant 鉴权密钥，存放在 .env
   collection:
