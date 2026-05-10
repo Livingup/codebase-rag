@@ -35,13 +35,7 @@ if (-not $RemoteName) {
 if (-not $Branch -and $env:CODEBASE_RAG_GIT_BRANCH) {
     $Branch = $env:CODEBASE_RAG_GIT_BRANCH
 }
-if (-not $CommitMessage -and $env:CODEBASE_RAG_COMMIT_MESSAGE) {
-    $CommitMessage = $env:CODEBASE_RAG_COMMIT_MESSAGE
-}
-if (-not $TagName -and $env:CODEBASE_RAG_RELEASE_TAG) {
-    $TagName = $env:CODEBASE_RAG_RELEASE_TAG
-}
-$createTagEnabled = $CreateTag.IsPresent -or ($env:CODEBASE_RAG_CREATE_TAG -eq "true")
+$createTagEnabled = $CreateTag.IsPresent
 
 Push-Location $SourceRoot
 try {
@@ -56,7 +50,7 @@ try {
     $dirty = (git status --porcelain=v1)
     if ($dirty) {
         if (-not $CommitMessage) {
-            throw "Working tree has uncommitted changes. Pass -CommitMessage or set CODEBASE_RAG_COMMIT_MESSAGE in the env file."
+            throw "Working tree has uncommitted changes. Pass -CommitMessage to commit them."
         }
         Invoke-NativeCommand "git" "add" "-A"
         Invoke-NativeCommand "git" "commit" "-m" $CommitMessage
@@ -65,7 +59,7 @@ try {
     Invoke-NativeCommand "git" "push" "-u" $RemoteName $Branch
 
     if ($createTagEnabled) {
-        if (-not $TagName) { throw "Pass -TagName or set CODEBASE_RAG_RELEASE_TAG when creating a tag." }
+        if (-not $TagName) { throw "Pass -TagName when using -CreateTag." }
         $existingTag = git tag --list $TagName
         if (-not $existingTag) {
             Invoke-NativeCommand "git" "tag" $TagName

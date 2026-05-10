@@ -16,12 +16,7 @@ Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 Assert-Administrator
 
 if (-not $PackageZip) {
-    if ($env:CODEBASE_RAG_UPDATE_PACKAGE_ZIP) {
-        $PackageZip = $env:CODEBASE_RAG_UPDATE_PACKAGE_ZIP
-    }
-    else {
-        throw "PackageZip is required. Pass -PackageZip or set CODEBASE_RAG_UPDATE_PACKAGE_ZIP in the env file."
-    }
+    throw "Pass -PackageZip to specify the release zip file path."
 }
 $ServiceName = Get-CodebaseRagServiceName $ServiceName
 $HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl

@@ -90,31 +90,20 @@ update-from-zip.ps1           # 用户端用最新 zip 更新本地服务，失�
 
 需要管理员权限的脚本必须在“以管理员身份运行”的 PowerShell 中执行。
 
-## 3. 统一资源 `.env` 文件
+## 3. `.env` 资源文件与脚本参数
 
-拿到源码或 zip 包的用户只需要准备一个真实 `.env` 资源文件。所有不确定资源都通过 `.env` 提供，脚本不得要求用户二次开发或修改脚本源码。
+### 3.1 `.env` 只放通用稳定资源
 
-源码仓库中的模板是：
+`.env` 提供不常变化的资源配置：本地路径、API Key、服务名、远程仓库身份等。用户拿到源码或 zip 后只需填写一次。
 
-```text
-.env.example
-```
-
-用户复制为真实资源文件：
+源码仓库模板：
 
 ```powershell
 Copy-Item .\.env.example .\.env
 notepad .\.env
 ```
 
-发布 zip 解压后也包含 `.env.example`，用户同样复制为：
-
-```powershell
-Copy-Item .\.env.example .\.env
-notepad .\.env
-```
-
-`.env` 至少填写运行服务所需资源：
+运行服务必填：
 
 ```text
 CODEBASE_RAG_DATA_DIR
@@ -123,11 +112,9 @@ DASHSCOPE_API_KEY
 GEMINI_EMBED_KEY_1
 ```
 
-如果要打包和发布，还必须填写：
+发布到 Gitee 还需填写：
 
 ```text
-CODEBASE_RAG_RELEASE_VERSION
-CODEBASE_RAG_RELEASE_TAG
 CODEBASE_RAG_GIT_REMOTE
 CODEBASE_RAG_GIT_BRANCH
 GITEE_OWNER
@@ -135,14 +122,26 @@ GITEE_REPO
 GITEE_TOKEN
 ```
 
-脚本读取 `.env` 的顺序固定为：
+脚本读取 `.env` 的顺序：
 
 1. 显式传入 `-EnvFile <path>`。
 2. 环境变量 `CODEBASE_RAG_ENV_FILE`。
 3. 当前执行目录下的 `.env`。
 4. 源码根目录或发布包根目录下的 `.env`。
 
-缺少必填资源变量时，脚本必须直接失败并提示缺少的变量名。
+缺少必填资源变量时，脚本直接失败并提示缺少的变量名。
+
+### 3.2 动态参数通过脚本参数传入
+
+每次发布、推送、更新时会变化的值（版本号、tag、提交消息、zip 路径等）不放 `.env`，由脚本参数显式传入：
+
+- **`-Version`**：发布版本号，构建和发布时必传。
+- **`-TagName`**：Git tag 名称，不传时默认为 `v<Version>`。
+- **`-CommitMessage`**：提交消息，有未提交修改时必传。
+- **`-CreateTag`**：开关，推送时是否创建 tag。
+- **`-ReleaseName`**：Gitee Release 标题，不传时默认为 `CodebaseRAG <Version>`。
+- **`-ReleaseBody`**：Gitee Release 正文，不传时默认为 `CodebaseRAG Windows release <Version>`。
+- **`-PackageZip`**：更新包 zip 路径，更新时必传。
 
 ## 4. 前置依赖
 
@@ -270,7 +269,7 @@ git push origin v0.1.1
 提交、推送并创建版本 tag：
 
 ```powershell
-.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CreateTag
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CommitMessage "release 0.2.0" -CreateTag -TagName v0.2.0
 ```
 
 ## 7. 构建 Windows 发布包
@@ -280,13 +279,13 @@ git push origin v0.1.1
 在仓库根目录执行：
 
 ```powershell
-.\ops\windows\build-windows-release.ps1 -EnvFile .\.env
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env -Version 0.2.0
 ```
 
 跳过测试构建：
 
 ```powershell
-.\ops\windows\build-windows-release.ps1 -EnvFile .\.env -SkipTests
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env -Version 0.2.0 -SkipTests
 ```
 
 ### 7.2 构建输出
@@ -327,13 +326,9 @@ logs/
 
 固定发布目标：Gitee Release。
 
-发布前必须确认 `.env` 已填写：
+发布前必须确认 `.env` 已填写 Gitee 身份资源：
 
 ```text
-CODEBASE_RAG_RELEASE_VERSION
-CODEBASE_RAG_RELEASE_TAG
-CODEBASE_RAG_RELEASE_NAME
-CODEBASE_RAG_RELEASE_BODY
 GITEE_OWNER
 GITEE_REPO
 GITEE_TOKEN
@@ -349,13 +344,13 @@ GITEE_TOKEN
 6. 发布 zip 和 sha256 到 Gitee Release。
 7. 打开 Gitee Release 页面确认附件可下载。
 
-示例：
+示例（以 0.2.0 为例）：
 
 ```powershell
 .\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -InstallDevDependencies
-.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CreateTag
-.\ops\windows\build-windows-release.ps1 -EnvFile .\.env
-.\ops\windows\publish-gitee-release.ps1 -EnvFile .\.env
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CommitMessage "release 0.2.0" -CreateTag -TagName v0.2.0
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env -Version 0.2.0
+.\ops\windows\publish-gitee-release.ps1 -EnvFile .\.env -Version 0.2.0
 ```
 
 ## 9. 用户端首次安装

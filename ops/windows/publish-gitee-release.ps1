@@ -21,38 +21,21 @@ Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 
 Assert-CommandExists "git"
 
-if (-not $SourceRoot) {
-    if ($env:CODEBASE_RAG_SOURCE_ROOT) { $SourceRoot = $env:CODEBASE_RAG_SOURCE_ROOT } else { $SourceRoot = $defaultSourceRoot }
-}
-if (-not $Version) { $Version = Get-CodebaseRagRequiredEnv "CODEBASE_RAG_RELEASE_VERSION" }
-if (-not $TagName) {
-    if ($env:CODEBASE_RAG_RELEASE_TAG) { $TagName = $env:CODEBASE_RAG_RELEASE_TAG } else { $TagName = "v$Version" }
-}
+if (-not $SourceRoot) { $SourceRoot = $defaultSourceRoot }
+if (-not $Version) { throw "Pass -Version to specify the release version." }
+if (-not $TagName) { $TagName = "v$Version" }
 if (-not $Owner) { $Owner = Get-CodebaseRagRequiredEnv "GITEE_OWNER" }
 if (-not $Repo) { $Repo = Get-CodebaseRagRequiredEnv "GITEE_REPO" }
 if (-not $Token) { $Token = Get-CodebaseRagRequiredEnv "GITEE_TOKEN" }
 if (-not $RemoteName) {
     if ($env:CODEBASE_RAG_GIT_REMOTE) { $RemoteName = $env:CODEBASE_RAG_GIT_REMOTE } else { $RemoteName = "origin" }
 }
-if (-not $ReleaseName) {
-    if ($env:CODEBASE_RAG_RELEASE_NAME) { $ReleaseName = $env:CODEBASE_RAG_RELEASE_NAME } else { $ReleaseName = "CodebaseRAG $Version" }
-}
-if (-not $ReleaseBody) {
-    if ($env:CODEBASE_RAG_RELEASE_BODY) { $ReleaseBody = $env:CODEBASE_RAG_RELEASE_BODY } else { $ReleaseBody = "CodebaseRAG Windows release $Version" }
-}
+if (-not $ReleaseName) { $ReleaseName = "CodebaseRAG $Version" }
+if (-not $ReleaseBody) { $ReleaseBody = "CodebaseRAG Windows release $Version" }
 if (-not $ZipPath) {
-    if ($env:CODEBASE_RAG_RELEASE_ZIP) {
-        $ZipPath = $env:CODEBASE_RAG_RELEASE_ZIP
-    }
-    else {
-        $outputRoot = $env:CODEBASE_RAG_RELEASE_OUTPUT_DIR
-        if (-not $outputRoot) { $outputRoot = Join-Path $SourceRoot "dist\release" }
-        $ZipPath = Join-Path $outputRoot "CodebaseRAG-$Version-windows-x64.zip"
-    }
+    $ZipPath = Join-Path $SourceRoot "dist\release\CodebaseRAG-$Version-windows-x64.zip"
 }
-if (-not $Sha256Path) {
-    if ($env:CODEBASE_RAG_RELEASE_SHA256) { $Sha256Path = $env:CODEBASE_RAG_RELEASE_SHA256 } else { $Sha256Path = "$ZipPath.sha256" }
-}
+if (-not $Sha256Path) { $Sha256Path = "$ZipPath.sha256" }
 
 if (-not (Test-Path $ZipPath)) { throw "Release zip does not exist: $ZipPath" }
 if (-not (Test-Path $Sha256Path)) { throw "Release checksum does not exist: $Sha256Path" }

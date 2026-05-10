@@ -15,25 +15,9 @@ Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 Assert-CommandExists "python"
 Assert-CommandExists "git"
 
-if (-not $Version) {
-    $Version = Get-CodebaseRagRequiredEnv "CODEBASE_RAG_RELEASE_VERSION"
-}
-if (-not $SourceRoot) {
-    if ($env:CODEBASE_RAG_SOURCE_ROOT) {
-        $SourceRoot = $env:CODEBASE_RAG_SOURCE_ROOT
-    }
-    else {
-        $SourceRoot = $defaultSourceRoot
-    }
-}
-if (-not $OutputRoot) {
-    if ($env:CODEBASE_RAG_RELEASE_OUTPUT_DIR) {
-        $OutputRoot = $env:CODEBASE_RAG_RELEASE_OUTPUT_DIR
-    }
-    else {
-        $OutputRoot = Join-Path $SourceRoot "dist\release"
-    }
-}
+if (-not $Version) { throw "Pass -Version to specify the release version." }
+if (-not $SourceRoot) { $SourceRoot = $defaultSourceRoot }
+if (-not $OutputRoot) { $OutputRoot = Join-Path $SourceRoot "dist\release" }
 Ensure-Directory $OutputRoot
 
 Push-Location $SourceRoot
