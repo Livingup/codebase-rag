@@ -38,29 +38,29 @@ build/
 正式用户本地服务按“程序目录”和“数据目录”分离：
 
 ```text
-C:\Program Files\CodebaseRAG\
-  current\                    # 当前版本 junction，指向 releases/<version>
-  releases\
-    <version>\
-      .venv\
-      packages\
-      scripts\
+${CODEBASE_RAG_PROGRAM_DIR}/
+  current/                    # 当前版本 junction，指向 releases/<version>
+  releases/
+    <version>/
+      .venv/
+      packages/
+      scripts/
       VERSION
-  service\
+  service/
     run-service.ps1
 
-C:\ProgramData\CodebaseRAG\
-  config\
+${CODEBASE_RAG_DATA_DIR}/
+  config/
     config.yaml
     .env
-  data\
-  logs\
-  backups\
-  runtime\
-  downloads\
+  data/
+  logs/
+  backups/
+  runtime/
+  downloads/
 ```
 
-`C:\Program Files\CodebaseRAG` 可以随版本替换；`C:\ProgramData\CodebaseRAG` 是用户配置、数据、日志和备份目录，更新时不得覆盖。
+`${CODEBASE_RAG_PROGRAM_DIR}` 可以随版本替换；`${CODEBASE_RAG_DATA_DIR}` 是用户配置、数据、日志和备份目录，更新时不得覆盖。两者均由 `.env` 中的同名变量指定，用户可自定义路径。
 
 ## 2. Windows 运维脚本目录
 
@@ -165,7 +165,7 @@ NSSM，用于注册 Windows Service
 
 - 当前源码已完成修改。
 - 确认修改不会破坏正式数据。
-- 如涉及持久化结构变更，先备份 `C:\ProgramData\CodebaseRAG`。
+- 如涉及持久化结构变更，先备份 `${CODEBASE_RAG_DATA_DIR}`。
 - 不要让正式服务和源码实例同时监听同一项目仓库。
 
 ### 5.2 启动源码接管测试
@@ -179,7 +179,7 @@ NSSM，用于注册 Windows Service
 指定正式配置路径：
 
 ```powershell
-.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -ConfigPath "C:\ProgramData\CodebaseRAG\config\config.yaml"
+.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -ConfigPath "${CODEBASE_RAG_DATA_DIR}\config\config.yaml"
 ```
 
 安装开发依赖后接管启动：
@@ -385,13 +385,13 @@ notepad .\.env
 首次安装会复制 `.env` 到正式配置目录：
 
 ```text
-C:\ProgramData\CodebaseRAG\config\.env
+${CODEBASE_RAG_DATA_DIR}\config\.env
 ```
 
 用户只维护真实 `.env` 资源文件；默认不需要修改脚本。只有需要调整服务内部参数时，才编辑：
 
 ```text
-C:\ProgramData\CodebaseRAG\config\config.yaml
+${CODEBASE_RAG_DATA_DIR}\config\config.yaml
 ```
 
 诊断：
@@ -418,9 +418,9 @@ CodebaseRAG-<new-version>-windows-x64.zip
 
 1. 读取当前版本。
 2. 解压新 zip。
-3. 备份 `C:\ProgramData\CodebaseRAG\config`、`data`、`runtime`。
+3. 备份 `${CODEBASE_RAG_DATA_DIR}\config`、`data`、`runtime`。
 4. 停止正式服务。
-5. 安装新版本到 `C:\Program Files\CodebaseRAG\releases\<new-version>`。
+5. 安装新版本到 `${CODEBASE_RAG_PROGRAM_DIR}\releases\<new-version>`。
 6. 切换 `current`。
 7. 启动服务。
 8. 访问健康检查。
@@ -474,8 +474,8 @@ Get-NetTCPConnection -LocalPort 19090 -State Listen
 查看日志：
 
 ```powershell
-Get-Content "C:\ProgramData\CodebaseRAG\logs\service.stdout.log" -Tail 200 -Wait
-Get-Content "C:\ProgramData\CodebaseRAG\logs\service.stderr.log" -Tail 200 -Wait
+Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stdout.log" -Tail 200 -Wait
+Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 ```
 
 卸载服务注册，不删除用户数据：
@@ -488,7 +488,7 @@ Get-Content "C:\ProgramData\CodebaseRAG\logs\service.stderr.log" -Tail 200 -Wait
 
 - 正式服务默认监听 `127.0.0.1`，不要默认暴露到局域网。
 - 用户真实 `.env`、真实配置、密钥、日志、数据不得提交到 Git。
-- 更新不得覆盖 `C:\ProgramData\CodebaseRAG\config\.env` 和 `config.yaml`。
+- 更新不得覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env` 和 `config.yaml`。
 - 发布包只交付运行所需 wheel、依赖 wheel、配置模板和运维脚本。
 - 开发接管测试必须先停正式服务，避免两个实例同时监听同一端口或同一 Git 仓库。
 - 涉及持久化结构变更时，必须先备份再接管测试或更新。
