@@ -83,6 +83,15 @@ if (-not (Test-Path $configPath)) {
 }
 if (-not (Test-Path $envPath)) {
     Copy-Item -Path (Join-Path $PackageRoot ".env.example") -Destination $envPath
+    $envDataDir = $resolvedDataDir -replace "\\", "/"
+    $envContent = Get-Content -Path $envPath -Raw
+    if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {
+        $envContent = $envContent -replace "(?m)^CODEBASE_RAG_DATA_DIR=.*$", "CODEBASE_RAG_DATA_DIR=$envDataDir"
+    }
+    else {
+        $envContent = "CODEBASE_RAG_DATA_DIR=$envDataDir`r`n" + $envContent
+    }
+    Set-Content -Path $envPath -Value $envContent -Encoding UTF8
 }
 
 Set-CodebaseRagCurrentRelease -ProgramDir $resolvedProgramDir -ReleaseDir $releaseDir
