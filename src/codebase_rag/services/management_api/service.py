@@ -178,14 +178,7 @@ class ManagementApiService:
 
         # Check if already registered with a different path
         existing = self._projects.get(project_id)
-        if existing and existing.git_repo_path != git_repo_path:
-            # Update path (repo moved)
-            existing.git_repo_path = git_repo_path
-            logger.info(
-                "project_path_updated",
-                project_id=project_id,
-                new_path=git_repo_path,
-            )
+        path_changed = existing is not None and existing.git_repo_path != git_repo_path
 
         # Step 3: Register to event detection
         await self._event_detection.register_project(project_id, git_repo_path)
@@ -198,7 +191,14 @@ class ManagementApiService:
 
         # Save to registry
         if not display_name:
-            display_name = os.path.basename(git_repo_path)
+            display_name = existing.display_name if existing else os.path.basename(git_repo_path)
+        if path_changed:
+            logger.info(
+                "project_path_updated",
+                project_id=project_id,
+                old_path=existing.git_repo_path,
+                new_path=git_repo_path,
+            )
         record = ProjectRecord(
             project_id=project_id,
             git_repo_path=git_repo_path,
@@ -606,6 +606,7 @@ class ManagementApiService:
             Exception: If config file is invalid or reload fails.
         """
         await self._config_manager.reload()
+        await self._event_detection.reconcile_watchers()
         logger.info("config_reload_triggered_via_api")
 
     # =========================================================================

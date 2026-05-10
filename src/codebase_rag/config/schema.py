@@ -267,7 +267,7 @@ class HookReceiverConfig(BaseModel):
 
 
 class WatcherConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     debounce_ms: int = 500
     watch_paths: List[str] = Field(default_factory=lambda: [
         "HEAD", "refs/heads/", "MERGE_HEAD", "REBASE_HEAD",

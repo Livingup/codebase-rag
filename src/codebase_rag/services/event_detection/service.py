@@ -57,6 +57,12 @@ MANAGED_HOOKS = [
 ]
 
 
+def _same_path(left: str, right: str) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
+
+
 class EventDetectionService:
     """Detects Git HEAD changes and publishes structured events.
 
@@ -164,6 +170,24 @@ class EventDetectionService:
             return self._hook_receiver is not None and self._hook_receiver.is_running
         return True
 
+    async def reconcile_watchers(self) -> None:
+        started = 0
+        stopped = 0
+        async with self._projects_lock:
+            for state in self._projects.values():
+                action = await self._sync_project_watcher(state)
+                if action == "started":
+                    started += 1
+                elif action == "stopped":
+                    stopped += 1
+
+        logger.info(
+            "watchers_reconciled",
+            enabled=self._config.watcher.enabled,
+            started=started,
+            stopped=stopped,
+        )
+
     # =========================================================================
     # 2.1 Project registration
     # =========================================================================
@@ -182,19 +206,36 @@ class EventDetectionService:
         if not os.path.isdir(git_dir):
             raise GitRepoNotFoundError(git_repo_path)
 
+        head = await self._git_ops.get_head_info(git_repo_path)
+
         async with self._projects_lock:
-            if project_id in self._projects:
+            existing = self._projects.get(project_id)
+            if existing is not None:
+                path_changed = not _same_path(existing.git_repo_path, git_repo_path)
+                old_path = existing.git_repo_path
+                if path_changed:
+                    await self._stop_watcher(project_id)
+                    existing.git_repo_path = git_repo_path
+
+                await self.inject_hooks(project_id, git_repo_path)
+                existing.branch_name = head.branch_name
+                existing.commit_hash = head.commit_hash
+                action = await self._sync_project_watcher(existing)
+
                 logger.info(
-                    "project_already_registered",
+                    "project_registration_refreshed",
                     project_id=project_id,
+                    repo=git_repo_path,
+                    old_repo=old_path if path_changed else None,
+                    path_changed=path_changed,
+                    watcher_action=action,
+                    branch=head.branch_name,
+                    commit=head.commit_hash[:8] if head.commit_hash else None,
                 )
                 return True
 
             # Inject hooks
             await self.inject_hooks(project_id, git_repo_path)
-
-            # Read initial HEAD state
-            head = await self._git_ops.get_head_info(git_repo_path)
 
             state = ProjectHeadState(
                 project_id=project_id,
@@ -203,17 +244,7 @@ class EventDetectionService:
                 commit_hash=head.commit_hash,
             )
 
-            # Start watcher if enabled
-            if self._config.watcher.enabled:
-                watcher = GitWatcher(
-                    project_id=project_id,
-                    git_repo_path=git_repo_path,
-                    config=self._config.watcher,
-                    on_change=self._on_watcher_change,
-                )
-                watcher.start()
-                self._watchers[project_id] = watcher
-                state.watcher_active = True
+            await self._sync_project_watcher(state)
 
             self._projects[project_id] = state
 
@@ -275,17 +306,7 @@ class EventDetectionService:
                 commit_hash=last_commit_hash,
             )
 
-            # Start watcher if enabled
-            if self._config.watcher.enabled:
-                watcher = GitWatcher(
-                    project_id=project_id,
-                    git_repo_path=git_repo_path,
-                    config=self._config.watcher,
-                    on_change=self._on_watcher_change,
-                )
-                watcher.start()
-                self._watchers[project_id] = watcher
-                state.watcher_active = True
+            await self._sync_project_watcher(state)
 
             self._projects[project_id] = state
 
@@ -658,9 +679,7 @@ class EventDetectionService:
                 return False
 
             # Stop watcher
-            watcher = self._watchers.pop(project_id, None)
-            if watcher:
-                await watcher.stop()
+            await self._stop_watcher(project_id)
 
             # Remove hooks (restore user originals)
             try:
@@ -676,6 +695,48 @@ class EventDetectionService:
             self._dedup_timestamps.pop(project_id, None)
 
         logger.info("project_unregistered", project_id=project_id)
+        return True
+
+    # =========================================================================
+    # Internal: watcher lifecycle
+    # =========================================================================
+
+    async def _sync_project_watcher(self, state: ProjectHeadState) -> str:
+        watcher = self._watchers.get(state.project_id)
+        if not self._config.watcher.enabled:
+            if watcher:
+                await self._stop_watcher(state.project_id)
+                return "stopped"
+            state.watcher_active = False
+            return "none"
+
+        if watcher and watcher.is_active:
+            state.watcher_active = True
+            return "active"
+
+        watcher = GitWatcher(
+            project_id=state.project_id,
+            git_repo_path=state.git_repo_path,
+            config=self._config.watcher,
+            on_change=self._on_watcher_change,
+        )
+        watcher.start()
+        self._watchers[state.project_id] = watcher
+        state.watcher_active = True
+        return "started"
+
+    async def _stop_watcher(self, project_id: str) -> bool:
+        watcher = self._watchers.pop(project_id, None)
+        if watcher is None:
+            state = self._projects.get(project_id)
+            if state is not None:
+                state.watcher_active = False
+            return False
+
+        await watcher.stop()
+        state = self._projects.get(project_id)
+        if state is not None:
+            state.watcher_active = False
         return True
 
     # =========================================================================

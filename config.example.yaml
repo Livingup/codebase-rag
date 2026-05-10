@@ -398,7 +398,7 @@ event_detection:
       path: "\\\\.\\pipe\\codebase-rag-hook"  # Windows Named Pipe
       # path: "/tmp/codebase-rag-hook.sock"   # Unix Domain Socket
   watcher:
-    enabled: true                       # 兜底文件系统监听
+    enabled: false                      # 兜底文件系统监听
     debounce_ms: 500                    # 防抖窗口（毫秒）
     watch_paths:                        # 相对于 .git/ 的监听路径
       - "HEAD"
