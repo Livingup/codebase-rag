@@ -5,12 +5,12 @@
 # =============================================================================
 
 system:
-  data_dir: "G:/App/code base rag"
+  data_dir: "${CODEBASE_RAG_DATA_DIR}"
   log:
     level: "INFO"
     format: "text"                         # "json" 或 "text"
     file: null                             # 全量日志文件路径（null = 仅 stdout）
-    error_file: "G:/App/code base rag/error.log"         # WARNING + ERROR 专用日志文件
+    error_file: "${CODEBASE_RAG_DATA_DIR}/logs/error.log"         # WARNING + ERROR 专用日志文件
     max_bytes: 52428800                    # 日志轮转：单文件最大字节数（默认 50MB）
     backup_count: 5                        # 日志轮转：保留备份文件数
 
@@ -413,7 +413,7 @@ management_api:
   server:
     host: "127.0.0.1"
     port: 18080
-  registry_path: "G:/App/code base rag/project_registry.json"  # 项目注册表持久化路径，重启自动恢复
+  registry_path: "${CODEBASE_RAG_DATA_DIR}/data/project_registry.json"  # 项目注册表持久化路径，重启自动恢复
 
 # --- 07-Git 操作服务 ---
 git_operations:
@@ -575,11 +575,11 @@ git_operations:
       enabled: true
       binary_detection: true
       classify_batch_size: 50
-      store_path: "G:/App/code base rag/gray_area_classifications.json"  # 灰区分类经验持久化
+      store_path: "${CODEBASE_RAG_DATA_DIR}/data/gray_area_classifications.json"  # 灰区分类经验持久化
 
 # --- 08-工作流编排服务 ---
 workflow:
-  data_dir: "G:/App/code base rag"             # 重试队列/死信队列持久化目录
+  data_dir: "${CODEBASE_RAG_DATA_DIR}/data"             # 重试队列/死信队列持久化目录
   initialization:
     mode: "full"                 # "incremental" = 仅跟踪增量（默认） | "full" = 全量初始化
     max_file_concurrency: 5     # 全量初始化时并发处理的文件数（通过 asyncio.Semaphore 控制）
