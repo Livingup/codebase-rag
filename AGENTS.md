@@ -84,12 +84,67 @@ doctor-local-service.ps1      # 本地诊断 Python/Git/目录/端口/健康检�
 start-source-takeover.ps1     # 停正式服务，用本地最新源码接管正式配置启动测试
 push-source-to-remote.ps1     # 提交并推送源码到远程 Git 仓库
 build-windows-release.ps1     # 构建 Windows 发布 zip
+publish-gitee-release.ps1     # 发布 Windows zip 和 sha256 到 Gitee Release
 update-from-zip.ps1           # 用户端用最新 zip 更新本地服务，失败回滚
 ```
 
 需要管理员权限的脚本必须在“以管理员身份运行”的 PowerShell 中执行。
 
-## 3. 前置依赖
+## 3. 统一资源 `.env` 文件
+
+拿到源码或 zip 包的用户只需要准备一个真实 `.env` 资源文件。所有不确定资源都通过 `.env` 提供，脚本不得要求用户二次开发或修改脚本源码。
+
+源码仓库中的模板是：
+
+```text
+.env.example
+```
+
+用户复制为真实资源文件：
+
+```powershell
+Copy-Item .\.env.example .\.env
+notepad .\.env
+```
+
+发布 zip 解压后也包含 `.env.example`，用户同样复制为：
+
+```powershell
+Copy-Item .\.env.example .\.env
+notepad .\.env
+```
+
+`.env` 至少填写运行服务所需资源：
+
+```text
+CODEBASE_RAG_DATA_DIR
+QDRANT_API_KEY
+DASHSCOPE_API_KEY
+GEMINI_EMBED_KEY_1
+```
+
+如果要打包和发布，还必须填写：
+
+```text
+CODEBASE_RAG_RELEASE_VERSION
+CODEBASE_RAG_RELEASE_TAG
+CODEBASE_RAG_GIT_REMOTE
+CODEBASE_RAG_GIT_BRANCH
+GITEE_OWNER
+GITEE_REPO
+GITEE_TOKEN
+```
+
+脚本读取 `.env` 的顺序固定为：
+
+1. 显式传入 `-EnvFile <path>`。
+2. 环境变量 `CODEBASE_RAG_ENV_FILE`。
+3. 当前执行目录下的 `.env`。
+4. 源码根目录或发布包根目录下的 `.env`。
+
+缺少必填资源变量时，脚本必须直接失败并提示缺少的变量名。
+
+## 4. 前置依赖
 
 开发者和正式用户本机需要：
 
@@ -103,35 +158,35 @@ NSSM，用于注册 Windows Service
 
 `nssm.exe` 需要在 PATH 中，或调用脚本时通过 `-NssmExe` 指定完整路径。
 
-## 4. 开发完成后的本地源码接管测试
+## 5. 开发完成后的本地源码接管测试
 
 用途：开发者本地已经运行正式服务，但需要停掉正式服务，用最新源码接管正式配置和正式端口进行真实环境验证。
 
-### 4.1 执行前要求
+### 5.1 执行前要求
 
 - 当前源码已完成修改。
 - 确认修改不会破坏正式数据。
 - 如涉及持久化结构变更，先备份 `C:\ProgramData\CodebaseRAG`。
 - 不要让正式服务和源码实例同时监听同一项目仓库。
 
-### 4.2 启动源码接管测试
+### 5.2 启动源码接管测试
 
 在仓库根目录执行：
 
 ```powershell
-.\ops\windows\start-source-takeover.ps1
+.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env
 ```
 
 指定正式配置路径：
 
 ```powershell
-.\ops\windows\start-source-takeover.ps1 -ConfigPath "C:\ProgramData\CodebaseRAG\config\config.yaml"
+.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -ConfigPath "C:\ProgramData\CodebaseRAG\config\config.yaml"
 ```
 
 安装开发依赖后接管启动：
 
 ```powershell
-.\ops\windows\start-source-takeover.ps1 -InstallDevDependencies
+.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -InstallDevDependencies
 ```
 
 脚本会执行：
@@ -142,7 +197,7 @@ NSSM，用于注册 Windows Service
 4. 使用正式 `config.yaml` 启动 `python -m codebase_rag`。
 5. 该终端窗口作为源码服务进程，按 `Ctrl+C` 停止。
 
-### 4.3 测试内容
+### 5.3 测试内容
 
 至少验证：
 
@@ -160,7 +215,7 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18080/api/v1/health
 - 配置 reload 是否正常。
 - 日志是否正常。
 
-### 4.4 恢复正式服务
+### 5.4 恢复正式服务
 
 停止源码实例：
 
@@ -171,18 +226,18 @@ Ctrl+C
 恢复正式服务：
 
 ```powershell
-.\ops\windows\start-local-service.ps1
+.\ops\windows\start-local-service.ps1 -EnvFile .\.env
 ```
 
 如果需要重启正式服务：
 
 ```powershell
-.\ops\windows\restart-local-service.ps1
+.\ops\windows\restart-local-service.ps1 -EnvFile .\.env
 ```
 
-## 5. 代码提交到远程 Git 仓库
+## 6. 代码提交到远程 Git 仓库
 
-### 5.1 手动 Git 流程
+### 6.1 手动 Git 流程
 
 ```powershell
 git status --short
@@ -198,43 +253,43 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-### 5.2 使用脚本提交推送
+### 6.2 使用脚本提交推送
 
 提交并推送当前分支：
 
 ```powershell
-.\ops\windows\push-source-to-remote.ps1 -CommitMessage "描述本次修改"
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env
 ```
 
 指定远程和分支：
 
 ```powershell
-.\ops\windows\push-source-to-remote.ps1 -RemoteName origin -Branch master -CommitMessage "描述本次修改"
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -RemoteName origin -Branch master -CommitMessage "描述本次修改"
 ```
 
 提交、推送并创建版本 tag：
 
 ```powershell
-.\ops\windows\push-source-to-remote.ps1 -CommitMessage "Release 0.1.1" -CreateTag -TagName v0.1.1
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CreateTag
 ```
 
-## 6. 构建 Windows 发布包
+## 7. 构建 Windows 发布包
 
-### 6.1 构建命令
+### 7.1 构建命令
 
 在仓库根目录执行：
 
 ```powershell
-.\ops\windows\build-windows-release.ps1 -Version 0.1.1
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env
 ```
 
 跳过测试构建：
 
 ```powershell
-.\ops\windows\build-windows-release.ps1 -Version 0.1.1 -SkipTests
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env -SkipTests
 ```
 
-### 6.2 构建输出
+### 7.2 构建输出
 
 默认输出到：
 
@@ -268,27 +323,42 @@ logs/
 .venv/
 ```
 
-## 7. 发布流程
+## 8. 发布流程
 
-推荐发布步骤：
+固定发布目标：Gitee Release。
+
+发布前必须确认 `.env` 已填写：
+
+```text
+CODEBASE_RAG_RELEASE_VERSION
+CODEBASE_RAG_RELEASE_TAG
+CODEBASE_RAG_RELEASE_NAME
+CODEBASE_RAG_RELEASE_BODY
+GITEE_OWNER
+GITEE_REPO
+GITEE_TOKEN
+```
+
+确定发布步骤：
 
 1. 开发完成后执行源码接管测试。
-2. 提交并推送源码到远程 Git 仓库。
-3. 创建版本 tag。
-4. 构建 Windows zip。
+2. 提交并推送源码到 Gitee 远程仓库。
+3. 创建并推送版本 tag。
+4. 构建 Windows zip 和 sha256。
 5. 在干净 Windows 环境中安装测试。
-6. 上传 zip 和 sha256 到 Gitee Release、对象存储或内部下载服务。
-7. 发布更新说明。
+6. 发布 zip 和 sha256 到 Gitee Release。
+7. 打开 Gitee Release 页面确认附件可下载。
 
 示例：
 
 ```powershell
-.\ops\windows\start-source-takeover.ps1 -InstallDevDependencies
-.\ops\windows\push-source-to-remote.ps1 -CommitMessage "Release 0.1.1" -CreateTag -TagName v0.1.1
-.\ops\windows\build-windows-release.ps1 -Version 0.1.1
+.\ops\windows\start-source-takeover.ps1 -EnvFile .\.env -InstallDevDependencies
+.\ops\windows\push-source-to-remote.ps1 -EnvFile .\.env -CreateTag
+.\ops\windows\build-windows-release.ps1 -EnvFile .\.env
+.\ops\windows\publish-gitee-release.ps1 -EnvFile .\.env
 ```
 
-## 8. 用户端首次安装
+## 9. 用户端首次安装
 
 用户下载并解压：
 
@@ -299,33 +369,32 @@ CodebaseRAG-<version>-windows-x64.zip
 在解压目录执行：
 
 ```powershell
-.\scripts\install-local-service.ps1
-.\scripts\register-local-service.ps1
-.\scripts\start-local-service.ps1
+Copy-Item .\.env.example .\.env
+notepad .\.env
+.\scripts\install-local-service.ps1 -EnvFile .\.env
+.\scripts\register-local-service.ps1 -EnvFile .\.env
+.\scripts\start-local-service.ps1 -EnvFile .\.env
 ```
 
-首次安装后，用户需要编辑：
+首次安装会复制 `.env` 到正式配置目录：
 
 ```text
 C:\ProgramData\CodebaseRAG\config\.env
-C:\ProgramData\CodebaseRAG\config\config.yaml
 ```
 
-至少填写：
+用户只维护真实 `.env` 资源文件；默认不需要修改脚本。只有需要调整服务内部参数时，才编辑：
 
 ```text
-QDRANT_API_KEY
-DASHSCOPE_API_KEY
-GEMINI_EMBED_KEY_1
+C:\ProgramData\CodebaseRAG\config\config.yaml
 ```
 
 诊断：
 
 ```powershell
-.\scripts\doctor-local-service.ps1
+.\scripts\doctor-local-service.ps1 -EnvFile .\.env
 ```
 
-## 9. 用户端下载最新 zip 更新本地服务
+## 10. 用户端下载最新 zip 更新本地服务
 
 用户下载最新：
 
@@ -336,7 +405,7 @@ CodebaseRAG-<new-version>-windows-x64.zip
 在已安装版本或新 zip 解压目录中执行：
 
 ```powershell
-.\scripts\update-from-zip.ps1 -PackageZip "D:\Downloads\CodebaseRAG-<new-version>-windows-x64.zip"
+.\scripts\update-from-zip.ps1 -EnvFile .\.env -PackageZip "D:\Downloads\CodebaseRAG-<new-version>-windows-x64.zip"
 ```
 
 脚本会执行：
@@ -351,7 +420,7 @@ CodebaseRAG-<new-version>-windows-x64.zip
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
 
-## 10. 日常运维命令
+## 11. 日常运维命令
 
 查看服务：
 
@@ -362,25 +431,25 @@ Get-Service CodebaseRAG
 启动服务：
 
 ```powershell
-.\ops\windows\start-local-service.ps1
+.\ops\windows\start-local-service.ps1 -EnvFile .\.env
 ```
 
 停止服务：
 
 ```powershell
-.\ops\windows\stop-local-service.ps1
+.\ops\windows\stop-local-service.ps1 -EnvFile .\.env
 ```
 
 重启服务：
 
 ```powershell
-.\ops\windows\restart-local-service.ps1
+.\ops\windows\restart-local-service.ps1 -EnvFile .\.env
 ```
 
 诊断服务：
 
 ```powershell
-.\ops\windows\doctor-local-service.ps1
+.\ops\windows\doctor-local-service.ps1 -EnvFile .\.env
 ```
 
 手动健康检查：
@@ -406,13 +475,13 @@ Get-Content "C:\ProgramData\CodebaseRAG\logs\service.stderr.log" -Tail 200 -Wait
 卸载服务注册，不删除用户数据：
 
 ```powershell
-.\ops\windows\unregister-local-service.ps1
+.\ops\windows\unregister-local-service.ps1 -EnvFile .\.env
 ```
 
-## 11. 关键约束
+## 12. 关键约束
 
 - 正式服务默认监听 `127.0.0.1`，不要默认暴露到局域网。
-- 用户真实配置、密钥、日志、数据不得提交到 Git。
+- 用户真实 `.env`、真实配置、密钥、日志、数据不得提交到 Git。
 - 更新不得覆盖 `C:\ProgramData\CodebaseRAG\config\.env` 和 `config.yaml`。
 - 发布包只交付运行所需 wheel、依赖 wheel、配置模板和运维脚本。
 - 开发接管测试必须先停正式服务，避免两个实例同时监听同一端口或同一 Git 仓库。

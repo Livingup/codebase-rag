@@ -1,5 +1,6 @@
 param(
-    [string]$ServiceName = "CodebaseRAG",
+    [string]$EnvFile,
+    [string]$ServiceName,
     [string]$ProgramDir,
     [string]$DataDir,
     [string]$NssmExe = "nssm.exe"
@@ -7,9 +8,13 @@ param(
 
 . "$PSScriptRoot\common.ps1"
 
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
+
 Assert-Administrator
 Assert-CommandExists $NssmExe
 
+$ServiceName = Get-CodebaseRagServiceName $ServiceName
 $resolvedProgramDir = Get-CodebaseRagProgramDir $ProgramDir
 $resolvedDataDir = Get-CodebaseRagDataDir $DataDir
 $runServicePath = Join-Path (Join-Path $resolvedProgramDir "service") "run-service.ps1"

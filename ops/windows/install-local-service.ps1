@@ -1,11 +1,15 @@
 param(
     [string]$PackageRoot = (Resolve-Path ".").Path,
+    [string]$EnvFile,
     [string]$ProgramDir,
     [string]$DataDir,
     [string]$Version
 )
 
 . "$PSScriptRoot\common.ps1"
+
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile -BaseDir $PackageRoot
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 
 Assert-Administrator
 Assert-CommandExists "python"
@@ -82,7 +86,12 @@ if (-not (Test-Path $configPath)) {
     Copy-Item -Path (Join-Path $PackageRoot "config.example.yaml") -Destination $configPath
 }
 if (-not (Test-Path $envPath)) {
-    Copy-Item -Path (Join-Path $PackageRoot ".env.example") -Destination $envPath
+    if ($resolvedEnvFile) {
+        Copy-Item -Path $resolvedEnvFile -Destination $envPath
+    }
+    else {
+        Copy-Item -Path (Join-Path $PackageRoot ".env.example") -Destination $envPath
+    }
     $envDataDir = $resolvedDataDir -replace "\\", "/"
     $envContent = Get-Content -Path $envPath -Raw
     if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {
@@ -101,6 +110,7 @@ $runServicePath = Join-Path (Join-Path $resolvedProgramDir "service") "run-servi
 @"
 `$ErrorActionPreference = "Stop"
 `$env:CODEBASE_RAG_CONFIG = "$configPath"
+`$env:CODEBASE_RAG_ENV_FILE = "$envPath"
 `$env:CODEBASE_RAG_DATA_DIR = "$resolvedDataDir"
 `$pythonExe = Join-Path "$resolvedProgramDir" "current\.venv\Scripts\python.exe"
 & `$pythonExe -m codebase_rag --config "$configPath"

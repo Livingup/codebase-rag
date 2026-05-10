@@ -1,12 +1,18 @@
 param(
-    [string]$ServiceName = "CodebaseRAG",
-    [string]$HealthUrl = "http://127.0.0.1:18080/api/v1/health",
+    [string]$EnvFile,
+    [string]$ServiceName,
+    [string]$HealthUrl,
     [int]$TimeoutSeconds = 60
 )
 
 . "$PSScriptRoot\common.ps1"
 
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
+
 Assert-Administrator
+$ServiceName = Get-CodebaseRagServiceName $ServiceName
+$HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl
 Stop-CodebaseRagService -ServiceName $ServiceName -TimeoutSeconds $TimeoutSeconds
 Start-CodebaseRagService -ServiceName $ServiceName -TimeoutSeconds $TimeoutSeconds
 if (-not (Wait-CodebaseRagHealth -HealthUrl $HealthUrl -TimeoutSeconds $TimeoutSeconds)) {

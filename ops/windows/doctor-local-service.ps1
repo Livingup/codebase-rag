@@ -1,12 +1,18 @@
 param(
-    [string]$ServiceName = "CodebaseRAG",
+    [string]$EnvFile,
+    [string]$ServiceName,
     [string]$ProgramDir,
     [string]$DataDir,
-    [string]$HealthUrl = "http://127.0.0.1:18080/api/v1/health"
+    [string]$HealthUrl
 )
 
 . "$PSScriptRoot\common.ps1"
 
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
+
+$ServiceName = Get-CodebaseRagServiceName $ServiceName
+$HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl
 $resolvedProgramDir = Get-CodebaseRagProgramDir $ProgramDir
 $resolvedDataDir = Get-CodebaseRagDataDir $DataDir
 $configPath = Get-CodebaseRagConfigPath $resolvedDataDir
@@ -17,6 +23,7 @@ Write-Host "Program directory: $resolvedProgramDir"
 Write-Host "Data directory: $resolvedDataDir"
 Write-Host "Config file: $configPath"
 Write-Host "Environment file: $envPath"
+Write-Host "Loaded resource env: $resolvedEnvFile"
 
 foreach ($command in @("python", "git")) {
     if (Get-Command $command -ErrorAction SilentlyContinue) {

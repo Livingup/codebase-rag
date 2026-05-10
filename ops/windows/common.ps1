@@ -1,6 +1,73 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Resolve-CodebaseRagEnvFile {
+    param(
+        [string]$EnvFile,
+        [string]$BaseDir
+    )
+    if ($EnvFile) {
+        if (-not (Test-Path $EnvFile)) {
+            throw "Environment file does not exist: $EnvFile"
+        }
+        return (Resolve-Path $EnvFile).Path
+    }
+    if ($env:CODEBASE_RAG_ENV_FILE) {
+        if (-not (Test-Path $env:CODEBASE_RAG_ENV_FILE)) {
+            throw "Environment file does not exist: $($env:CODEBASE_RAG_ENV_FILE)"
+        }
+        return (Resolve-Path $env:CODEBASE_RAG_ENV_FILE).Path
+    }
+    $currentCandidate = Join-Path (Get-Location).Path ".env"
+    if (Test-Path $currentCandidate) {
+        return (Resolve-Path $currentCandidate).Path
+    }
+    if ($BaseDir) {
+        $candidate = Join-Path $BaseDir ".env"
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+    return $null
+}
+
+function Import-CodebaseRagEnvFile {
+    param([string]$EnvFile)
+    if (-not $EnvFile) { return $null }
+    if (-not (Test-Path $EnvFile)) {
+        throw "Environment file does not exist: $EnvFile"
+    }
+
+    foreach ($line in Get-Content -Path $EnvFile -Encoding UTF8) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed) { continue }
+        if ($trimmed.StartsWith("#")) { continue }
+        if ($trimmed.StartsWith("export ")) {
+            $trimmed = $trimmed.Substring(7).Trim()
+        }
+        $index = $trimmed.IndexOf("=")
+        if ($index -le 0) { continue }
+
+        $name = $trimmed.Substring(0, $index).Trim()
+        $value = $trimmed.Substring($index + 1).Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        Set-Item -Path "Env:$name" -Value $value
+    }
+    $env:CODEBASE_RAG_ENV_FILE = (Resolve-Path $EnvFile).Path
+    return $env:CODEBASE_RAG_ENV_FILE
+}
+
+function Get-CodebaseRagRequiredEnv {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $value = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if (-not $value) {
+        throw "Required environment variable is missing: $Name"
+    }
+    return $value
+}
+
 function Get-CodebaseRagProgramDir {
     param([string]$ProgramDir)
     if ($ProgramDir) { return $ProgramDir }
@@ -23,6 +90,20 @@ function Get-CodebaseRagConfigPath {
 function Get-CodebaseRagEnvPath {
     param([string]$DataDir)
     return (Join-Path (Get-CodebaseRagDataDir $DataDir) "config\.env")
+}
+
+function Get-CodebaseRagServiceName {
+    param([string]$ServiceName)
+    if ($ServiceName) { return $ServiceName }
+    if ($env:CODEBASE_RAG_SERVICE_NAME) { return $env:CODEBASE_RAG_SERVICE_NAME }
+    return "CodebaseRAG"
+}
+
+function Get-CodebaseRagHealthUrl {
+    param([string]$HealthUrl)
+    if ($HealthUrl) { return $HealthUrl }
+    if ($env:CODEBASE_RAG_HEALTH_URL) { return $env:CODEBASE_RAG_HEALTH_URL }
+    return "http://127.0.0.1:18080/api/v1/health"
 }
 
 function Get-CodebaseRagCurrentDir {

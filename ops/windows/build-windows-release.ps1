@@ -1,17 +1,38 @@
 param(
-    [Parameter(Mandatory = $true)][string]$Version,
-    [string]$SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
+    [string]$EnvFile,
+    [string]$Version,
+    [string]$SourceRoot,
     [string]$OutputRoot,
     [switch]$SkipTests
 )
 
 . "$PSScriptRoot\common.ps1"
 
+$defaultSourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile -BaseDir $defaultSourceRoot
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
+
 Assert-CommandExists "python"
 Assert-CommandExists "git"
 
+if (-not $Version) {
+    $Version = Get-CodebaseRagRequiredEnv "CODEBASE_RAG_RELEASE_VERSION"
+}
+if (-not $SourceRoot) {
+    if ($env:CODEBASE_RAG_SOURCE_ROOT) {
+        $SourceRoot = $env:CODEBASE_RAG_SOURCE_ROOT
+    }
+    else {
+        $SourceRoot = $defaultSourceRoot
+    }
+}
 if (-not $OutputRoot) {
-    $OutputRoot = Join-Path $SourceRoot "dist\release"
+    if ($env:CODEBASE_RAG_RELEASE_OUTPUT_DIR) {
+        $OutputRoot = $env:CODEBASE_RAG_RELEASE_OUTPUT_DIR
+    }
+    else {
+        $OutputRoot = Join-Path $SourceRoot "dist\release"
+    }
 }
 Ensure-Directory $OutputRoot
 
@@ -52,7 +73,7 @@ try {
         requires_python = ">=3.11"
         requires_git = ">=2.40"
         entrypoint = "codebase-rag --config <config_path>"
-        health_check = "http://127.0.0.1:18080/api/v1/health"
+        health_check = (Get-CodebaseRagHealthUrl $null)
     }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $packageRoot "release-manifest.json") -Encoding UTF8
 

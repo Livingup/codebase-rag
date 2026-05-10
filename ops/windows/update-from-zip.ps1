@@ -1,16 +1,30 @@
 param(
-    [Parameter(Mandatory = $true)][string]$PackageZip,
+    [string]$EnvFile,
+    [string]$PackageZip,
     [string]$ProgramDir,
     [string]$DataDir,
-    [string]$ServiceName = "CodebaseRAG",
-    [string]$HealthUrl = "http://127.0.0.1:18080/api/v1/health",
+    [string]$ServiceName,
+    [string]$HealthUrl,
     [int]$HealthTimeoutSeconds = 60
 )
 
 . "$PSScriptRoot\common.ps1"
 
+$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile
+Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
+
 Assert-Administrator
 
+if (-not $PackageZip) {
+    if ($env:CODEBASE_RAG_UPDATE_PACKAGE_ZIP) {
+        $PackageZip = $env:CODEBASE_RAG_UPDATE_PACKAGE_ZIP
+    }
+    else {
+        throw "PackageZip is required. Pass -PackageZip or set CODEBASE_RAG_UPDATE_PACKAGE_ZIP in the env file."
+    }
+}
+$ServiceName = Get-CodebaseRagServiceName $ServiceName
+$HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl
 $resolvedProgramDir = Get-CodebaseRagProgramDir $ProgramDir
 $resolvedDataDir = Get-CodebaseRagDataDir $DataDir
 $runtimeDir = Join-Path $resolvedDataDir "runtime"
@@ -51,7 +65,7 @@ Write-Host "Pre-update backup: $backupDir"
 
 try {
     Stop-CodebaseRagService -ServiceName $ServiceName
-    & (Join-Path $extractRoot "scripts\install-local-service.ps1") -PackageRoot $extractRoot -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -Version $newVersion
+    & (Join-Path $extractRoot "scripts\install-local-service.ps1") -EnvFile $resolvedEnvFile -PackageRoot $extractRoot -ProgramDir $resolvedProgramDir -DataDir $resolvedDataDir -Version $newVersion
     Start-CodebaseRagService -ServiceName $ServiceName
     if (-not (Wait-CodebaseRagHealth -HealthUrl $HealthUrl -TimeoutSeconds $HealthTimeoutSeconds)) {
         throw "Post-update health check failed: $HealthUrl"
