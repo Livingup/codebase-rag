@@ -30,3 +30,4 @@ htmlcov/
 # AICode 工作目录
 .workflowagent/
 /.venv/
+/.venv-build/

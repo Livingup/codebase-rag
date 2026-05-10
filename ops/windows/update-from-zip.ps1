@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$EnvFile,
     [string]$PackageZip,
     [string]$ProgramDir,
@@ -16,7 +16,7 @@ Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 Assert-Administrator
 
 if (-not $PackageZip) {
-    throw "Pass -PackageZip to specify the release zip file path."
+    throw "Pass -PackageZip to specify the local installation zip file path."
 }
 $ServiceName = Get-CodebaseRagServiceName $ServiceName
 $HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl
@@ -28,7 +28,7 @@ Ensure-Directory $runtimeDir
 Ensure-Directory $downloadsDir
 
 if (-not (Test-Path $PackageZip)) {
-    throw "Release package does not exist: $PackageZip"
+    throw "Installation package does not exist: $PackageZip"
 }
 
 $oldVersionPath = Join-Path $runtimeDir "current-version.txt"
@@ -47,13 +47,13 @@ if (Test-Path $extractRoot) { Remove-Item -Path $extractRoot -Recurse -Force }
 Ensure-Directory $extractRoot
 Expand-Archive -Path $PackageZip -DestinationPath $extractRoot
 
-$manifestPath = Join-Path $extractRoot "release-manifest.json"
+$manifestPath = Join-Path $extractRoot "package-manifest.json"
 if (-not (Test-Path $manifestPath)) {
-    throw "Release package is missing release-manifest.json: $PackageZip"
+    throw "Installation package is missing package-manifest.json: $PackageZip"
 }
 $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 $newVersion = [string]$manifest.version
-if (-not $newVersion) { throw "release-manifest.json is missing version." }
+if (-not $newVersion) { throw "Package manifest is missing version." }
 
 $backupDir = New-CodebaseRagBackup -DataDir $resolvedDataDir
 Write-Host "Pre-update backup: $backupDir"

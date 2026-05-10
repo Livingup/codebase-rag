@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$EnvFile,
     [string]$Version,
     [string]$SourceRoot,
@@ -15,20 +15,27 @@ Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 Assert-CommandExists "python"
 Assert-CommandExists "git"
 
-if (-not $Version) { throw "Pass -Version to specify the release version." }
+if (-not $Version) { throw "Pass -Version to specify the package version." }
 if (-not $SourceRoot) { $SourceRoot = $defaultSourceRoot }
-if (-not $OutputRoot) { $OutputRoot = Join-Path $SourceRoot "dist\release" }
+if (-not $OutputRoot) { $OutputRoot = Join-Path $SourceRoot "dist\packages" }
 Ensure-Directory $OutputRoot
 
 Push-Location $SourceRoot
 try {
+    $buildVenvDir = Join-Path $SourceRoot ".venv-build"
+    if (-not (Test-Path $buildVenvDir)) {
+        Invoke-NativeCommand "python" "-m" "venv" $buildVenvDir
+    }
+    $buildPythonExe = Join-Path $buildVenvDir "Scripts\python.exe"
+    Invoke-NativeCommand $buildPythonExe "-m" "pip" "install" "--upgrade" "pip" "build"
+
     if (-not $SkipTests) {
-        Invoke-NativeCommand "python" "-m" "compileall" "-q" "src"
-        Invoke-NativeCommand "python" "-m" "pytest"
+        Invoke-NativeCommand $buildPythonExe "-m" "pip" "install" "-e" "$SourceRoot[dev]"
+        Invoke-NativeCommand $buildPythonExe "-m" "compileall" "-q" "src"
+        Invoke-NativeCommand $buildPythonExe "-m" "pytest"
     }
 
-    Invoke-NativeCommand "python" "-m" "pip" "install" "--upgrade" "build"
-    Invoke-NativeCommand "python" "-m" "build" "--wheel"
+    Invoke-NativeCommand $buildPythonExe "-m" "build" "--wheel"
 
     $wheel = Get-ChildItem -Path (Join-Path $SourceRoot "dist") -Filter "codebase_rag-*.whl" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $wheel) { throw "Built codebase_rag wheel was not found." }
@@ -41,7 +48,7 @@ try {
     Ensure-Directory (Join-Path $packageRoot "scripts")
 
     Copy-Item -Path $wheel.FullName -Destination (Join-Path $packageRoot "packages")
-    Invoke-NativeCommand "python" "-m" "pip" "download" "--dest" (Join-Path $packageRoot "wheels") $wheel.FullName
+    Invoke-NativeCommand $buildPythonExe "-m" "pip" "download" "--dest" (Join-Path $packageRoot "wheels") $wheel.FullName
 
     Copy-Item -Path (Join-Path $SourceRoot "config.example.yaml") -Destination $packageRoot
     Copy-Item -Path (Join-Path $SourceRoot ".env.example") -Destination $packageRoot
@@ -59,7 +66,7 @@ try {
         entrypoint = "codebase-rag --config <config_path>"
         health_check = (Get-CodebaseRagHealthUrl $null)
     }
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $packageRoot "release-manifest.json") -Encoding UTF8
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $packageRoot "package-manifest.json") -Encoding UTF8
 
     $zipPath = Join-Path $OutputRoot "CodebaseRAG-$Version-windows-x64.zip"
     if (Test-Path $zipPath) { Remove-Item -Path $zipPath -Force }
@@ -68,7 +75,7 @@ try {
     $sha = (Get-FileHash -Algorithm SHA256 $zipPath).Hash
     Set-Content -Path "$zipPath.sha256" -Value "$sha  $(Split-Path $zipPath -Leaf)" -Encoding UTF8
 
-    Write-Host "Release package generated: $zipPath"
+    Write-Host "Installation package generated: $zipPath"
     Write-Host "Checksum file: $zipPath.sha256"
 }
 finally {
