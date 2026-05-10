@@ -9,10 +9,11 @@ system:
   log:
     level: "INFO"
     format: "text"                         # "json" 或 "text"
-    file: null                             # 全量日志文件路径（null = 仅 stdout）
+    file: "${CODEBASE_RAG_DATA_DIR}/logs/app.log"                  # 普通日志文件，支持实时查看
     error_file: "${CODEBASE_RAG_DATA_DIR}/logs/error.log"         # WARNING + ERROR 专用日志文件
-    max_bytes: 52428800                    # 日志轮转：单文件最大字节数（默认 50MB）
-    backup_count: 5                        # 日志轮转：保留备份文件数
+    retention_days: 1                      # 普通日志保留天数
+    max_bytes: 52428800                    # 错误日志分片：单文件最大字节数（默认 50MB）
+    backup_count: 5                        # 错误日志分片：保留备份文件数
 
 # --- 04-Embedding 服务 ---
 embedding:

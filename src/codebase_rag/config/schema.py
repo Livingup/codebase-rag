@@ -40,8 +40,9 @@ class LogConfig(BaseModel):
     format: str = "json"
     file: Optional[str] = None              # all-level log file (None = stdout only)
     error_file: Optional[str] = None        # WARNING + ERROR only log file
-    max_bytes: int = 50 * 1024 * 1024       # log rotation: max file size (default 50MB)
-    backup_count: int = 5                   # log rotation: number of backup files
+    retention_days: int = 1                 # regular log retention in days
+    max_bytes: int = 50 * 1024 * 1024       # error log rotation: max file size
+    backup_count: int = 5                   # error log rotation: number of backup files
 
 
 class SystemConfig(BaseModel):

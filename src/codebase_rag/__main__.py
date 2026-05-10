@@ -370,6 +370,7 @@ def main() -> None:
         format=config.system.log.format,
         file=config.system.log.file,
         error_file=config.system.log.error_file,
+        retention_days=config.system.log.retention_days,
         max_bytes=config.system.log.max_bytes,
         backup_count=config.system.log.backup_count,
     )
