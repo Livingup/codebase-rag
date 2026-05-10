@@ -361,7 +361,18 @@ GITEE_TOKEN
 CodebaseRAG-<version>-windows-x64.zip
 ```
 
-在解压目录执行：
+**首次安装前，用户必须准备 `.env` 配置文件：**
+
+1. 从模板复制：`Copy-Item .\.env.example .\.env`
+2. 用编辑器打开 `.env`，填入所有必需配置：
+   - `CODEBASE_RAG_DATA_DIR`：本地数据存储目录路径
+   - `QDRANT_API_KEY`：Qdrant 向量数据库 API Key
+   - `DASHSCOPE_API_KEY`：阿里云 DashScope API Key（Embedding 用）
+   - `GEMINI_EMBED_KEY_1`：Google Gemini Embedding API Key
+   - 至少一个 Agent LLM Key（如 `ZHIPU_KEY_1`、`GEMINI_KEY_1` 等）
+3. 没有的 Key 直接删掉该行，不要留空占位
+
+准备好 `.env` 后，在解压目录执行安装：
 
 ```powershell
 Copy-Item .\.env.example .\.env
