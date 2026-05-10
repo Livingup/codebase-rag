@@ -213,8 +213,17 @@ function Set-CodebaseRagCurrentRelease {
         [Parameter(Mandatory = $true)][string]$ReleaseDir
     )
     $currentDir = Get-CodebaseRagCurrentDir $ProgramDir
-    if (Test-Path $currentDir) {
-        Remove-Item -Path $currentDir -Force
+    if (Test-Path -LiteralPath $currentDir) {
+        $currentItem = Get-Item -LiteralPath $currentDir -Force
+        if (($currentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            & cmd.exe /c rmdir "`"$currentDir`""
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to remove current junction: $currentDir"
+            }
+        }
+        else {
+            Remove-Item -LiteralPath $currentDir -Recurse -Force
+        }
     }
     New-Item -ItemType Junction -Path $currentDir -Target $ReleaseDir | Out-Null
 }
