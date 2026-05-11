@@ -5,9 +5,18 @@ Single Source of Truth — all services read config from these models.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+
+def _default_data_dir() -> str:
+    return os.environ.get("CODEBASE_RAG_DATA_DIR", "data")
+
+
+def _join_config_path(base: str, *parts: str) -> str:
+    return "/".join([base.rstrip("/\\"), *parts])
 
 
 # =============================================================================
@@ -46,7 +55,7 @@ class LogConfig(BaseModel):
 
 
 class SystemConfig(BaseModel):
-    data_dir: str = "G:/App/code base rag"
+    data_dir: str = Field(default_factory=_default_data_dir)
     log: LogConfig = Field(default_factory=LogConfig)
 
 
@@ -229,7 +238,7 @@ class LLMConfig(BaseModel):
 class AgentExecutionConfig(BaseModel):
     default_timeout: int = 3600  # agent task execution timeout in seconds (1h)
     default_temperature: float = 0.0
-    trace_log_dir: Optional[str] = "G:/App/code base rag/agent_traces"  # None = disabled
+    trace_log_dir: Optional[str] = None  # None = disabled
 
 
 class ContextCompressionConfig(BaseModel):
@@ -310,7 +319,7 @@ class AuthConfig(BaseModel):
 class ManagementApiConfig(BaseModel):
     server: ApiServerConfig = Field(default_factory=ApiServerConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
-    registry_path: str = "G:/App/code base rag/project_registry.json"
+    registry_path: str = ""
 
 
 # =============================================================================
@@ -322,7 +331,7 @@ class UncertainFilterConfig(BaseModel):
     enabled: bool = True
     binary_detection: bool = True
     classify_batch_size: int = 50
-    store_path: str = "G:/App/code base rag/gray_area_classifications.json"
+    store_path: str = ""
 
 
 class FileFilterConfig(BaseModel):
@@ -392,7 +401,7 @@ class CompensationConfig(BaseModel):
 
 
 class WorkflowConfig(BaseModel):
-    data_dir: str = "G:/App/code base rag"
+    data_dir: str = ""
     content_commit: ContentCommitConfig = Field(default_factory=ContentCommitConfig)
     branch_switch: BranchSwitchConfig = Field(default_factory=BranchSwitchConfig)
     initialization: InitializationConfig = Field(default_factory=InitializationConfig)
@@ -532,3 +541,44 @@ class AppConfig(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     context_engine: ContextEngineConfig = Field(default_factory=ContextEngineConfig)
     mcp_client: McpClientConfig = Field(default_factory=McpClientConfig)
+
+    @model_validator(mode="after")
+    def _derive_data_dir_paths(self) -> "AppConfig":
+        data_dir = self.system.data_dir
+        if not data_dir:
+            data_dir = _default_data_dir()
+            self.system.data_dir = data_dir
+
+        runtime_data_dir = _join_config_path(data_dir, "data")
+
+        trace_fields = self.agent.execution.model_fields_set
+        trace_log_dir = self.agent.execution.trace_log_dir
+        if (
+            "trace_log_dir" not in trace_fields
+            or trace_log_dir == ""
+        ):
+            self.agent.execution.trace_log_dir = _join_config_path(runtime_data_dir, "agent_traces")
+
+        registry_fields = self.management_api.model_fields_set
+        if (
+            "registry_path" not in registry_fields
+            or not self.management_api.registry_path
+        ):
+            self.management_api.registry_path = _join_config_path(runtime_data_dir, "project_registry.json")
+
+        uncertain = self.git_operations.file_filter.uncertain
+        uncertain_fields = uncertain.model_fields_set
+        if (
+            "store_path" not in uncertain_fields
+            or not uncertain.store_path
+        ):
+            uncertain.store_path = _join_config_path(runtime_data_dir, "gray_area_classifications.json")
+
+        workflow_fields = self.workflow.model_fields_set
+        if (
+            "data_dir" not in workflow_fields
+            or not self.workflow.data_dir
+        ):
+            self.workflow.data_dir = runtime_data_dir
+
+        return self

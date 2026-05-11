@@ -91,6 +91,10 @@ memory_qdrant:
 # api_format: "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu"
 # 第三方 OpenAI 兼容服务：新增 provider 条目，api_format 设为 "openai_chat"，修改 api_base_url 即可
 agent:
+  execution:
+    default_timeout: 3600
+    default_temperature: 0.0
+    trace_log_dir: "${CODEBASE_RAG_DATA_DIR}/data/agent_traces"
   llm:
     models:
       gemini-3.1-pro:
