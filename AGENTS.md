@@ -81,6 +81,7 @@ unregister-local-service.ps1  # 卸载 Windows Service
 start-local-service.ps1       # 启动正式服务并执行健康检查
 stop-local-service.ps1        # 停止正式服务
 restart-local-service.ps1     # 重启正式服务并执行健康检查
+refresh-local-service-config.ps1 # 使用最新 config.example.yaml 刷新正式 config.yaml，默认热 reload，可选重启服务
 doctor-local-service.ps1      # 本地诊断 Python/Git/目录/端口/健康检查
 start-source-takeover.ps1     # 停正式服务，用本地最新源码接管正式配置启动测试
 push-source-to-remote.ps1     # 提交并推送源码到远程 Git 仓库
@@ -119,12 +120,20 @@ CODEBASE_RAG_GIT_REMOTE
 CODEBASE_RAG_GIT_BRANCH
 ```
 
-脚本读取 `.env` 的顺序：
+通用脚本读取 `.env` 的顺序：
 
 1. 显式传入 `-EnvFile <path>`。
 2. 环境变量 `CODEBASE_RAG_ENV_FILE`。
 3. 当前执行目录下的 `.env`。
 4. 源码根目录或本地安装包根目录下的 `.env`。
+
+`install-local-service.ps1` 和 `refresh-local-service-config.ps1` 用于落地正式配置，要求使用真实 `.env`：
+
+1. 显式传入 `-EnvFile <path>`。
+2. 如果未传 `-EnvFile`，只读取源码根目录或本地安装包根目录下的 `.env`。
+3. 如果仍然找不到真实 `.env`，脚本直接失败，提示用户提供。
+
+安装和配置刷新脚本不得使用 `.env.example` 作为真实运行配置。
 
 缺少必填资源变量时，脚本直接失败并提示缺少的变量名。
 
@@ -388,17 +397,21 @@ Expand-Archive -Path .\dist\packages\CodebaseRAG-0.2.0-windows-x64.zip -Destinat
 .\scripts\start-local-service.ps1 -EnvFile D:\project\codebase-rag\.env
 ```
 
-首次安装会复制 `.env` 到正式配置目录：
+每次安装都会从安装包或源码目录的 `config.example.yaml` 重新生成正式配置文件：
+
+```text
+${CODEBASE_RAG_DATA_DIR}\config\config.yaml
+```
+
+每次安装都会复制用户提供的真实 `.env` 到正式配置目录：
 
 ```text
 ${CODEBASE_RAG_DATA_DIR}\config\.env
 ```
 
-用户只维护真实 `.env` 资源文件；默认不需要修改脚本。只有需要调整服务内部参数时，才编辑：
+用户只维护真实 `.env` 资源文件；默认不需要修改脚本。安装脚本会根据 `.env` 中的 `CODEBASE_RAG_DATA_DIR` 覆盖正式 `.env` 内的同名变量，保证服务进程读取的数据目录与安装目录一致。
 
-```text
-${CODEBASE_RAG_DATA_DIR}\config\config.yaml
-```
+如果需要调整服务内部参数，优先修改源码中的 `config.example.yaml`，重新构建安装包并安装；或使用配置刷新脚本把最新模板同步到正式 `config.yaml` 并触发配置热 reload。
 
 诊断：
 
@@ -427,11 +440,56 @@ git pull --ff-only
 2. 解压本地构建 zip。
 3. 备份 `${CODEBASE_RAG_DATA_DIR}\config`、`data`、`runtime`。
 4. 停止正式服务。
-5. 安装新版本到 `${CODEBASE_RAG_PROGRAM_DIR}\releases\<new-version>`。
+5. 安装新版本到 `${CODEBASE_RAG_PROGRAM_DIR}\releases\<new-version>`，并使用安装包内的 `config.example.yaml` 重新生成正式 `config.yaml`。
 6. 切换 `current`。
 7. 启动服务。
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
+
+### 9.1 仅配置模板变更时刷新并热 reload
+
+如果本次只修改了 `config.example.yaml`，没有修改 Python 源码、依赖、运维脚本或入口逻辑，可以不重新构建 wheel、不重新安装程序目录，只刷新正式配置并触发配置热 reload。
+
+服务不会自动监听 `config.yaml` 文件变化；配置热更新需要显式调用 Management API：
+
+```text
+POST http://127.0.0.1:18080/api/v1/config/reload
+```
+
+配置热 reload 会重新读取并校验正式 `config.yaml`，替换内存中的 `AppConfig`，并重新协调 Git watcher。大部分通过 `ConfigManager` 动态读取的业务参数无需重启即可生效。
+
+在源码仓库根目录执行：
+
+```powershell
+git pull --ff-only
+.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env
+```
+
+如果只想刷新正式 `config.yaml`，暂时不触发热 reload：
+
+```powershell
+.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -SkipReload
+```
+
+在解压后的本地安装包目录执行：
+
+```powershell
+.\scripts\refresh-local-service-config.ps1 -EnvFile <path-to-real-env>
+```
+
+如果变更涉及服务启动期配置（如 Management API 端口、MCP 监听端口、日志初始化参数、已初始化客户端连接参数等），应强制重启服务：
+
+```powershell
+.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart
+```
+
+脚本会执行：
+
+1. 读取用户提供的真实 `.env`。
+2. 定位 `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`。
+3. 使用当前源码或安装包内的 `config.example.yaml` 覆盖正式 `config.yaml`。
+4. 默认调用 `/api/v1/config/reload` 触发热 reload 并执行健康检查。
+5. 如果传入 `-Restart`，重启 Windows Service 并执行健康检查。
 
 ## 10. 日常运维命令
 
@@ -457,6 +515,12 @@ Get-Service CodebaseRAG
 
 ```powershell
 .\ops\windows\restart-local-service.ps1 -EnvFile .\.env
+```
+
+刷新正式配置并热 reload：
+
+```powershell
+.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env
 ```
 
 诊断服务：
@@ -495,7 +559,7 @@ Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 
 - 正式服务默认监听 `127.0.0.1`，不要默认暴露到局域网。
 - 用户真实 `.env`、真实配置、密钥、日志、数据不得提交到 Git。
-- 更新不得覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env` 和 `config.yaml`。
+- 安装和更新会使用用户提供的真实 `.env` 覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env`，并使用安装包内 `config.example.yaml` 重新生成 `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`。
 - 正式安装和更新必须使用用户本机从源码构建出的本地安装 zip。
 - 不再通过 Gitee Release 发布或命令行下载安装包。
 - 本地安装 zip 只交付运行所需 wheel、依赖 wheel、配置模板和运维脚本。

@@ -8,7 +8,17 @@ param(
 
 . "$PSScriptRoot\common.ps1"
 
-$resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile -BaseDir $PackageRoot
+$resolvedEnvFile = $null
+if ($EnvFile) {
+    $resolvedEnvFile = Resolve-CodebaseRagEnvFile -EnvFile $EnvFile
+}
+else {
+    $defaultEnvFile = Join-Path $PackageRoot ".env"
+    if (-not (Test-Path $defaultEnvFile)) {
+        throw "Environment file is required. Pass -EnvFile <path> or place a real .env file in the package/project root: $PackageRoot"
+    }
+    $resolvedEnvFile = (Resolve-Path $defaultEnvFile).Path
+}
 Import-CodebaseRagEnvFile $resolvedEnvFile | Out-Null
 
 Assert-Administrator
@@ -82,26 +92,21 @@ else {
 
 $configPath = Join-Path $configDir "config.yaml"
 $envPath = Join-Path $configDir ".env"
-if (-not (Test-Path $configPath)) {
-    Copy-Item -Path (Join-Path $PackageRoot "config.example.yaml") -Destination $configPath
+$configTemplatePath = Join-Path $PackageRoot "config.example.yaml"
+if (-not (Test-Path $configTemplatePath)) {
+    throw "Config template does not exist: $configTemplatePath"
 }
-if (-not (Test-Path $envPath)) {
-    if ($resolvedEnvFile) {
-        Copy-Item -Path $resolvedEnvFile -Destination $envPath
-    }
-    else {
-        Copy-Item -Path (Join-Path $PackageRoot ".env.example") -Destination $envPath
-    }
-    $envDataDir = $resolvedDataDir -replace "\\", "/"
-    $envContent = Get-Content -Path $envPath -Raw
-    if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {
-        $envContent = $envContent -replace "(?m)^CODEBASE_RAG_DATA_DIR=.*$", "CODEBASE_RAG_DATA_DIR=$envDataDir"
-    }
-    else {
-        $envContent = "CODEBASE_RAG_DATA_DIR=$envDataDir`r`n" + $envContent
-    }
-    Set-Content -Path $envPath -Value $envContent -Encoding UTF8
+Copy-Item -Path $configTemplatePath -Destination $configPath -Force
+Copy-Item -Path $resolvedEnvFile -Destination $envPath -Force
+$envDataDir = $resolvedDataDir -replace "\\", "/"
+$envContent = Get-Content -Path $envPath -Raw
+if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {
+    $envContent = $envContent -replace "(?m)^CODEBASE_RAG_DATA_DIR=.*$", "CODEBASE_RAG_DATA_DIR=$envDataDir"
 }
+else {
+    $envContent = "CODEBASE_RAG_DATA_DIR=$envDataDir`r`n" + $envContent
+}
+Set-Content -Path $envPath -Value $envContent -Encoding UTF8
 
 Set-CodebaseRagCurrentRelease -ProgramDir $resolvedProgramDir -ReleaseDir $releaseDir
 Set-Content -Path (Join-Path $dataRuntimeDir "current-version.txt") -Value $Version -Encoding UTF8
