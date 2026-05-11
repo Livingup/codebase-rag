@@ -33,7 +33,7 @@ else {
     Invoke-NativeCommand $NssmExe "install" $ServiceName "powershell.exe"
 }
 
-Invoke-NativeCommand $NssmExe "set" $ServiceName "AppParameters" "-NoProfile -ExecutionPolicy Bypass -File `"$runServicePath`""
+Invoke-NativeCommand $NssmExe "set" $ServiceName "AppParameters" "-NoProfile -ExecutionPolicy Bypass -File .\run-service.ps1"
 Invoke-NativeCommand $NssmExe "set" $ServiceName "AppDirectory" (Join-Path $resolvedProgramDir "service")
 Invoke-NativeCommand $NssmExe "set" $ServiceName "DisplayName" "Codebase RAG"
 Invoke-NativeCommand $NssmExe "set" $ServiceName "Description" "Codebase RAG local Windows service"
