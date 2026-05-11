@@ -70,14 +70,14 @@ $wheelsDir = Join-Path $PackageRoot "wheels"
 $wheel = Get-ChildItem -Path $packagesDir -Filter "codebase_rag-*.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($wheel) {
     if (Test-Path $wheelsDir) {
-        Invoke-NativeCommand $pipExe "install" "--no-index" "--find-links" $wheelsDir $wheel.FullName
+        Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" "--no-index" "--find-links" $wheelsDir $wheel.FullName
     }
     else {
-        Invoke-NativeCommand $pipExe "install" $wheel.FullName
+        Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" $wheel.FullName
     }
 }
 else {
-    Invoke-NativeCommand $pipExe "install" $PackageRoot
+    Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" $PackageRoot
 }
 
 $configPath = Join-Path $configDir "config.yaml"
