@@ -34,3 +34,5 @@ htmlcov/
 
 # Local log viewer script (git excluded, per-user customization)
 view-logs.ps1
+/CodebaseRAG-LiveLog.ps1
+*.lnk
