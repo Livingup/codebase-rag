@@ -31,3 +31,6 @@ htmlcov/
 .workflowagent/
 /.venv/
 /.venv-build/
+
+# Local log viewer script (git excluded, per-user customization)
+view-logs.ps1
