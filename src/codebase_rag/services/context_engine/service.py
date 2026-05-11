@@ -60,6 +60,7 @@ class ContextEngineService:
         self._agent = agent
         self._mcp_client = mcp_client
         self._ripgrep_available = False
+        self._agent_names: List[str] = []
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -171,27 +172,41 @@ class ContextEngineService:
             f"任务描述：{task_description}"
         )
 
-        try:
-            await self._agent.run_agent(
-                agent_name=_AGENT_NAME,
-                input_variables={},
-                tool_handlers=tool_handlers,
-                user_message=user_msg,
-            )
-        except AgentTaskComplete:
-            pass  # Normal exit via submit_report
-        except Exception as e:
+        last_error: Exception | None = None
+        for agent_name in self._agent_names:
+            state.final_report = ""
+            try:
+                await self._agent.run_agent(
+                    agent_name=agent_name,
+                    input_variables={},
+                    tool_handlers=tool_handlers,
+                    user_message=user_msg,
+                )
+                last_error = None
+                break
+            except AgentTaskComplete:
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "context_analysis_agent_error",
+                    agent_name=agent_name,
+                    error=str(e)[:300],
+                    visited_files=len(state.visited_files),
+                )
+                continue
+
+        if last_error is not None:
             elapsed = time.monotonic() - start
             logger.warning(
-                "context_analysis_agent_error",
-                error=str(e)[:300],
+                "context_analysis_all_agents_failed",
+                error=str(last_error)[:300],
                 elapsed_s=round(elapsed, 1),
                 visited_files=len(state.visited_files),
             )
-            if state.final_report:
-                return state.final_report
             return (
-                f"⚠️ 分析过程异常：{e}\n"
+                f"⚠️ 分析过程异常：{last_error}\n"
                 f"已分析 {len(state.visited_files)} 个文件。"
             )
 
@@ -228,21 +243,34 @@ class ContextEngineService:
             if self._initialized:
                 return
             logger.info("context_engine_lazy_initializing")
-            agent_def = AgentDefinition(
-                name=_AGENT_NAME,
-                description="Codebase context analysis agent — autonomous code exploration",
-                system_prompt=CONTEXT_ENGINE_PROMPT,
-                provider=self._config.provider,
-                model=self._config.model,
-                tools=ALL_LOCAL_TOOL_SCHEMAS,
-                mcp_servers={
-                    name: binding.include_tools
-                    for name, binding in self._config.mcp_servers.items()
-                } if self._config.mcp_servers else None,
-                temperature=0.0,
-                max_rate_limit_retries=self._config.max_rate_limit_retries,
+            candidates = (
+                [
+                    (entry.provider, entry.model)
+                    for entry in sorted(self._config.providers, key=lambda e: e.priority)
+                ]
+                if self._config.providers else [
+                    (self._config.provider, self._config.model)
+                ]
             )
-            await self._agent.register_agent(agent_def)
+            self._agent_names = []
+            for idx, (provider, model) in enumerate(candidates):
+                agent_name = _AGENT_NAME if idx == 0 else f"{_AGENT_NAME}_{idx}"
+                agent_def = AgentDefinition(
+                    name=agent_name,
+                    description="Codebase context analysis agent — autonomous code exploration",
+                    system_prompt=CONTEXT_ENGINE_PROMPT,
+                    provider=provider,
+                    model=model,
+                    tools=ALL_LOCAL_TOOL_SCHEMAS,
+                    mcp_servers={
+                        name: binding.include_tools
+                        for name, binding in self._config.mcp_servers.items()
+                    } if self._config.mcp_servers else None,
+                    temperature=0.0,
+                    max_rate_limit_retries=self._config.max_rate_limit_retries,
+                )
+                await self._agent.register_agent(agent_def)
+                self._agent_names.append(agent_name)
             self._ripgrep_available = await check_ripgrep_available()
             if not self._ripgrep_available:
                 logger.warning("context_engine_ripgrep_not_found")

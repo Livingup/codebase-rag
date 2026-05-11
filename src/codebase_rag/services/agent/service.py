@@ -55,7 +55,7 @@ logger = get_logger(__name__)
 # Provider factory — lazy imports to avoid loading heavy SDK deps at startup
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_FORMATS = ("gemini", "openai_chat", "openai_responses", "anthropic", "zhipu")
+_SUPPORTED_FORMATS = ("gemini", "openai_chat", "openai_responses", "anthropic", "zhipu", "deepseek")
 
 # Mutable dict for test monkey-patching (e.g. registering a mock format)
 _FORMAT_FACTORIES: Dict[str, type] = {}
@@ -78,6 +78,9 @@ def _resolve_provider_class(api_format: str) -> type:
     if api_format == "zhipu":
         from codebase_rag.services.agent.providers.zhipu import ZhipuProvider
         return ZhipuProvider
+    if api_format == "deepseek":
+        from codebase_rag.services.agent.providers.deepseek import DeepSeekProvider
+        return DeepSeekProvider
     raise ValueError(f"Unknown api_format: '{api_format}'. Supported: {_SUPPORTED_FORMATS}")
 
 
@@ -670,125 +673,161 @@ class AgentService:
 
         # Build compression agent messages:
         # [compression system prompt] + original messages[1:last_asst_idx]
-        compression_messages: List[Message] = [
+        base_compression_messages: List[Message] = [
             Message(role="system", content=COMPRESSION_SYSTEM_PROMPT),
         ] + list(messages[1:last_asst_idx])
 
         # Resolve compression agent LLM config
         comp_cfg = self._config.context_compression
-        comp_provider = comp_cfg.provider or self._config.llm.default_provider
-        comp_model = comp_cfg.model or self._config.llm.default_model
-
-        logger.info(
-            "context_compression_started",
-            agent=agent_name,
-            provider=comp_provider,
-            model=comp_model,
-            messages_to_compress=last_asst_idx - 1,
-            messages_to_keep=len(messages) - last_asst_idx,
+        compression_candidates = (
+            [
+                (entry.provider, entry.model)
+                for entry in sorted(comp_cfg.providers, key=lambda e: e.priority)
+            ]
+            if comp_cfg.providers else [
+                (
+                    comp_cfg.provider or self._config.llm.default_provider,
+                    comp_cfg.model or self._config.llm.default_model,
+                )
+            ]
         )
 
         # Simplified execution loop for compression agent (max 3 rounds)
         max_comp_rounds = 3
-        for comp_round in range(max_comp_rounds):
-            try:
-                llm_resp = await self._llm_call_with_retry(
-                    comp_provider,
-                    comp_model,
-                    compression_messages,
-                    tools=[COMPRESSION_TOOL],
-                    temperature=comp_cfg.temperature,
-                    agent_name=f"{agent_name}__context_compression",
-                )
-            except Exception as e:
-                logger.error(
-                    "context_compression_llm_error",
-                    agent=agent_name,
-                    round=comp_round,
-                    error=str(e)[:200],
-                )
-                return False
+        last_error: Optional[Exception] = None
+        for provider_idx, (comp_provider, comp_model) in enumerate(compression_candidates):
+            compression_messages = list(base_compression_messages)
+            logger.info(
+                "context_compression_started",
+                agent=agent_name,
+                provider=comp_provider,
+                model=comp_model,
+                provider_index=provider_idx,
+                messages_to_compress=last_asst_idx - 1,
+                messages_to_keep=len(messages) - last_asst_idx,
+            )
+            for comp_round in range(max_comp_rounds):
+                try:
+                    llm_resp = await self._llm_call_with_retry(
+                        comp_provider,
+                        comp_model,
+                        compression_messages,
+                        tools=[COMPRESSION_TOOL],
+                        temperature=comp_cfg.temperature,
+                        agent_name=f"{agent_name}__context_compression",
+                    )
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "context_compression_provider_failed",
+                        agent=agent_name,
+                        provider=comp_provider,
+                        model=comp_model,
+                        round=comp_round,
+                        error=str(e)[:200],
+                    )
+                    break
 
-            # Case 1: LLM called the compression tool — extract result
-            if llm_resp.finish_reason == "tool_calls" and llm_resp.tool_calls:
-                for tc in llm_resp.tool_calls:
-                    if tc.name == "compress_and_replace_history":
-                        compressed = tc.arguments.get("compressed_context", "")
-                        if compressed:
-                            # Rebuild messages in-place
-                            system_msg = messages[0]
-                            remaining = list(messages[last_asst_idx:])
-                            messages.clear()
-                            messages.append(system_msg)
-                            messages.append(Message(role="user", content=compressed))
-                            messages.extend(remaining)
+                # Case 1: LLM called the compression tool — extract result
+                if llm_resp.finish_reason == "tool_calls" and llm_resp.tool_calls:
+                    for tc in llm_resp.tool_calls:
+                        if tc.name == "compress_and_replace_history":
+                            compressed = tc.arguments.get("compressed_context", "")
+                            if compressed:
+                                # Rebuild messages in-place
+                                system_msg = messages[0]
+                                remaining = list(messages[last_asst_idx:])
+                                messages.clear()
+                                messages.append(system_msg)
+                                messages.append(Message(role="user", content=compressed))
+                                messages.extend(remaining)
 
-                            if trace:
-                                trace.log_message(
-                                    Message(
-                                        role="system",
-                                        content=f"[context_compressed] compressed_len={len(compressed)}, new_message_count={len(messages)}",
-                                    ),
-                                    round_num,
+                                if trace:
+                                    trace.log_message(
+                                        Message(
+                                            role="system",
+                                            content=f"[context_compressed] compressed_len={len(compressed)}, new_message_count={len(messages)}",
+                                        ),
+                                        round_num,
+                                    )
+
+                                logger.info(
+                                    "context_compression_completed",
+                                    agent=agent_name,
+                                    provider=comp_provider,
+                                    model=comp_model,
+                                    compressed_len=len(compressed),
+                                    new_message_count=len(messages),
                                 )
+                                return True
 
-                            logger.info(
-                                "context_compression_completed",
-                                agent=agent_name,
-                                compressed_len=len(compressed),
-                                new_message_count=len(messages),
-                            )
-                            return True
-
-                # Tool called but wrong name or empty result — prompt retry
-                compression_messages.append(Message(
-                    role="assistant",
-                    content=llm_resp.content,
-                    thinking_content=llm_resp.thinking_content,
-                    tool_calls=llm_resp.tool_calls,
-                ))
-                for tc in llm_resp.tool_calls:
+                    # Tool called but wrong name or empty result — prompt retry
                     compression_messages.append(Message(
-                        role="tool",
-                        content="请使用 compress_and_replace_history 工具提交压缩结果。",
-                        tool_call_id=tc.id,
-                        name=tc.name,
+                        role="assistant",
+                        content=llm_resp.content,
+                        thinking_content=llm_resp.thinking_content,
+                        tool_calls=llm_resp.tool_calls,
                     ))
+                    compression_messages.append(Message(
+                        role="user",
+                        content=(
+                            "请调用 compress_and_replace_history 工具，"
+                            "并在 compressed_context 中给出压缩后的上下文。"
+                        ),
+                    ))
+                    continue
 
-            # Case 2: LLM responded with text (no tool call)
-            elif llm_resp.finish_reason == "stop" and llm_resp.content:
-                # Some models may put the compressed content in text instead of tool call.
-                # If content is substantial, use it as fallback.
-                if len(llm_resp.content) > 200:
-                    system_msg = messages[0]
-                    remaining = list(messages[last_asst_idx:])
-                    messages.clear()
-                    messages.append(system_msg)
-                    messages.append(Message(role="user", content=llm_resp.content))
-                    messages.extend(remaining)
+                # Case 2: LLM responded with text (no tool call)
+                elif llm_resp.finish_reason == "stop" and llm_resp.content:
+                    # Some models may put the compressed content in text instead of tool call.
+                    # If content is substantial, use it as fallback.
+                    if len(llm_resp.content) > 200:
+                        system_msg = messages[0]
+                        remaining = list(messages[last_asst_idx:])
+                        messages.clear()
+                        messages.append(system_msg)
+                        messages.append(Message(role="user", content=llm_resp.content))
+                        messages.extend(remaining)
+
+                        logger.warning(
+                            "context_compression_fallback_text",
+                            agent=agent_name,
+                            provider=comp_provider,
+                            model=comp_model,
+                            compressed_len=len(llm_resp.content),
+                        )
+                        return True
 
                     logger.warning(
-                        "context_compression_fallback_text",
+                        "context_compression_no_tool_call",
                         agent=agent_name,
-                        compressed_len=len(llm_resp.content),
+                        provider=comp_provider,
+                        model=comp_model,
+                        content_len=len(llm_resp.content),
                     )
-                    return True
+                    break
+                else:
+                    logger.warning(
+                        "context_compression_unexpected_finish",
+                        agent=agent_name,
+                        provider=comp_provider,
+                        model=comp_model,
+                        finish_reason=llm_resp.finish_reason,
+                    )
+                    break
 
-                logger.warning(
-                    "context_compression_no_tool_call",
-                    agent=agent_name,
-                    content_len=len(llm_resp.content),
-                )
-                return False
-            else:
-                logger.warning(
-                    "context_compression_unexpected_finish",
-                    agent=agent_name,
-                    finish_reason=llm_resp.finish_reason,
-                )
-                return False
+            logger.warning(
+                "context_compression_provider_exhausted",
+                agent=agent_name,
+                provider=comp_provider,
+                model=comp_model,
+            )
 
-        logger.error("context_compression_max_rounds_exceeded", agent=agent_name)
+        logger.error(
+            "context_compression_all_providers_exhausted",
+            agent=agent_name,
+            last_error=str(last_error)[:200] if last_error else None,
+        )
         return False
 
     def _check_initialized(self) -> None:

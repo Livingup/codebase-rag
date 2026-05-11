@@ -219,7 +219,7 @@ class ProviderModelRef(BaseModel):
 
 
 class LLMProviderConfig(BaseModel):
-    api_format: str  # "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu"
+    api_format: str  # "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu" | "deepseek"
     api_base_url: str
     models: List[ProviderModelRef] = Field(default_factory=list)
     api_keys: List[ApiKeyConfig] = Field(default_factory=list)
@@ -241,10 +241,17 @@ class AgentExecutionConfig(BaseModel):
     trace_log_dir: Optional[str] = None  # None = disabled
 
 
+class AgentProviderEntry(BaseModel):
+    provider: str
+    model: str
+    priority: int = 0
+
+
 class ContextCompressionConfig(BaseModel):
     """LLM config for the context compression agent."""
     provider: Optional[str] = None   # None → default_provider
     model: Optional[str] = None      # None → default_model
+    providers: List[AgentProviderEntry] = Field(default_factory=list)
     temperature: float = 0.0
     timeout: int = 300               # compression agent timeout in seconds (5min)
 
@@ -424,6 +431,7 @@ class McpServerBinding(BaseModel):
 class ContextEngineConfig(BaseModel):
     provider: Optional[str] = None      # LLM provider; None → agent default_provider
     model: Optional[str] = None         # LLM model; None → agent default_model
+    providers: List[AgentProviderEntry] = Field(default_factory=list)
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
     # 需要接入的 MCP 服务（key 对应 mcp_client.servers 的 key，value 为绑定配置）
     mcp_servers: Dict[str, McpServerBinding] = Field(

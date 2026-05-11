@@ -88,8 +88,9 @@ memory_qdrant:
       name: "sparse_vectors"               # 必须与上方一致
 
 # --- 03-Agent 服务 ---
-# api_format: "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu"
+# api_format: "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu" | "deepseek"
 # 第三方 OpenAI 兼容服务：新增 provider 条目，api_format 设为 "openai_chat"，修改 api_base_url 即可
+# DeepSeek 使用独立 api_format "deepseek"，用于适配 thinking/reasoning_content/json_object 等协议差异
 agent:
   execution:
     default_timeout: 3600
@@ -174,6 +175,20 @@ agent:
         compression_threshold: 180000
         supports_tool_calling: true
         supports_structured_output: true
+      deepseek-v4-flash:
+        name: "deepseek-v4-flash"
+        context_window: 1048576
+        max_output_tokens: 393216
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
+      deepseek-v4-pro:
+        name: "deepseek-v4-pro"
+        context_window: 1048576
+        max_output_tokens: 393216
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
     providers:
       # gemini:
       #   api_format: "gemini"
@@ -232,6 +247,24 @@ agent:
       #     retry_backoff_multiplier: 2.0
       #     key_cooldown_seconds: 60
       #   max_concurrency: 5                  # 该服务商最大并发请求数
+      deepseek:
+        api_format: "deepseek"
+        api_base_url: "https://api.deepseek.com"
+        models:
+          - id: "deepseek-v4-flash"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
+          - id: "deepseek-v4-pro"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
+        api_keys:
+          - key: "${DEEPSEEK_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 5                  # 该服务商最大并发请求数
       # anthropic:
       #   api_format: "anthropic"
       #   api_base_url: "https://api.anthropic.com"
@@ -386,8 +419,13 @@ agent:
     default_provider: "openai_compatible_primary"
     default_model: "gpt-5.5"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
-    provider: "openai_compatible_primary"                      # 用哪个 provider 驱动压缩（null = default_provider）
-    model: "gpt-5.5"                       # 用哪个模型（null = default_model）
+    providers:
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 10
+      - provider: "openai_compatible_primary"
+        model: "gpt-5.5"
+        priority: 20
     temperature: 0.0
     timeout: 600                            # 压缩 agent 超时（秒）
 
@@ -594,67 +632,52 @@ workflow:
     max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "zhipu"               # 引用 agent.llm.providers 中的 key
-        model: "glm-5.1"          # 引用该 provider 下 models[].id
-        priority: 40
-
       - provider: "openai_compatible_secondary"
         model: "gemini-3-flash"
-        priority: 31
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 33
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-pro"
-        priority: 32
+        priority: 10
       - provider: "openai_compatible_secondary"
         model: "gemini-3.1-pro"
+        priority: 20
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-pro"
         priority: 30
-
-#      - provider: "custom_openai_compatible"
-#        model: "gpt-5.4"
-#        priority: 20
-
+      - provider: "openai_compatible_secondary"
+        model: "gemini-2.5-flash"
+        priority: 40
+      - provider: "deepseek"
+        model: "deepseek-v4-flash"
+        priority: 50
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 60
       - provider: "openai_compatible_primary"
         model: "gpt-5.5"
-        priority: 10
-
-      # - provider: "custom_openai_compatible"
-      #   model: "gpt-5.4"
-      #   priority: 10
+        priority: 70
   gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
     timeout: 30                         # agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "zhipu"
-        model: "glm-4.7-flash"
-        priority: 30
-      - provider: "zhipu"
-        model: "glm-4.7"
-        priority: 31
-      - provider: "zhipu"
-        model: "glm-5.1"
-        priority: 32
-
       - provider: "openai_compatible_secondary"
         model: "gemini-3-flash"
         priority: 10
       - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 11
+        model: "gemini-3.1-pro"
+        priority: 20
       - provider: "openai_compatible_secondary"
         model: "gemini-2.5-pro"
-        priority: 12
+        priority: 30
       - provider: "openai_compatible_secondary"
-        model: "gemini-3.1-pro"
-        priority: 13
-
-      # - provider: "custom_openai_compatible"
-      #   model: "gpt-5.4"
-      #   priority: 20
-      # - provider: "custom_openai_compatible"
-      #   model: "gpt-5.4"
-      #   priority: 15
+        model: "gemini-2.5-flash"
+        priority: 40
+      - provider: "deepseek"
+        model: "deepseek-v4-flash"
+        priority: 50
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 60
+      - provider: "openai_compatible_primary"
+        model: "gpt-5.5"
+        priority: 70
   compensation:                           # 失败文件补偿任务配置
     enabled: true                         # 是否启用后台补偿
     scan_interval: 60                     # 扫描间隔基准（秒）
@@ -665,15 +688,14 @@ workflow:
 
 # --- 11-Context Engine 服务 ---
 context_engine:
-  provider: "openai_compatible_primary"
-  model: "gpt-5.5"
+  providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
+    - provider: "deepseek"
+      model: "deepseek-v4-pro"
+      priority: 10
+    - provider: "openai_compatible_primary"
+      model: "gpt-5.5"
+      priority: 20
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
-  # provider: "custom_openai_compatible"
-  # model: "gpt-5.4"
-  # provider: "openai_compatible_secondary"
-  # model: "gemini-3-flash"
-  # provider: "openai_compatible_secondary"
-  # model: "gemini-3.1-pro"
   mcp_servers:                         # 需要接入的 MCP 服务（key 对应 mcp_client.servers）
     codebase_rag:
       include_tools:                   # 工具白名单（不配置或为空 → 引入该服务所有工具）
@@ -724,35 +746,27 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "zhipu"                 # 引用 agent.llm.providers 中的 key
-        model: "glm-4.7-flash"            # 引用该 provider 下 models[].id
-        priority: 30
-      - provider: "zhipu"
-        model: "glm-4.7"
-        priority: 31
-      - provider: "zhipu"
-        model: "glm-5.1"
-        priority: 32
-
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3-flash"
+      - provider: "openai_compatible_secondary"             # 引用 agent.llm.providers 中的 key
+        model: "gemini-3-flash"           # 引用该 provider 下 models[].id
         priority: 10
       - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 11
+        model: "gemini-3.1-pro"
+        priority: 20
       - provider: "openai_compatible_secondary"
         model: "gemini-2.5-pro"
-        priority: 12
+        priority: 30
       - provider: "openai_compatible_secondary"
-        model: "gemini-3.1-pro"
-        priority: 13
+        model: "gemini-2.5-flash"
+        priority: 40
+      - provider: "deepseek"
+        model: "deepseek-v4-flash"
+        priority: 50
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 60
       - provider: "openai_compatible_primary"
         model: "gpt-5.5"
-        priority: 15  
-
-#      - provider: "custom_openai_compatible"
-#        model: "gpt-5.4"
-#        priority: 20
+        priority: 70
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 3600                         # 重排序 agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
