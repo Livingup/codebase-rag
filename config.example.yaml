@@ -252,10 +252,10 @@ agent:
         api_base_url: "https://api.deepseek.com"
         models:
           - id: "deepseek-v4-flash"
-            tool_choice: "auto"
+            tool_choice: "required"
             thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
           - id: "deepseek-v4-pro"
-            tool_choice: "auto"
+            tool_choice: "required"
             thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
         api_keys:
           - key: "${DEEPSEEK_API_KEY}"
