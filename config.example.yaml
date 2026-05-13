@@ -252,10 +252,10 @@ agent:
         api_base_url: "https://api.deepseek.com"
         models:
           - id: "deepseek-v4-flash"
-            tool_choice: "required"
+            tool_choice: "auto"
             thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
           - id: "deepseek-v4-pro"
-            tool_choice: "required"
+            tool_choice: "auto"
             thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
         api_keys:
           - key: "${DEEPSEEK_API_KEY}"
@@ -417,14 +417,14 @@ agent:
           key_cooldown_seconds: 60
         max_concurrency: 5                    # 该服务商最大并发请求数                
     default_provider: "openai_compatible_primary"
-    default_model: "gpt-5.5"
+    default_model: "gpt-5.4"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
     providers:
       - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 10
       - provider: "openai_compatible_primary"
-        model: "gpt-5.5"
+        model: "gpt-5.4"
         priority: 20
     temperature: 0.0
     timeout: 600                            # 压缩 agent 超时（秒）
@@ -656,7 +656,7 @@ workflow:
         model: "deepseek-v4-pro"
         priority: 60
       - provider: "openai_compatible_primary"
-        model: "gpt-5.5"
+        model: "gpt-5.4"
         priority: 70
   gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
     timeout: 30                         # agent 超时（秒）
@@ -681,7 +681,7 @@ workflow:
         model: "deepseek-v4-pro"
         priority: 60
       - provider: "openai_compatible_primary"
-        model: "gpt-5.5"
+        model: "gpt-5.4"
         priority: 70
   compensation:                           # 失败文件补偿任务配置
     enabled: true                         # 是否启用后台补偿
@@ -698,7 +698,7 @@ context_engine:
       model: "deepseek-v4-pro"
       priority: 10
     - provider: "openai_compatible_primary"
-      model: "gpt-5.5"
+      model: "gpt-5.4"
       priority: 20
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   mcp_servers:                         # 需要接入的 MCP 服务（key 对应 mcp_client.servers）
@@ -770,7 +770,7 @@ mcp:
         model: "deepseek-v4-pro"
         priority: 60
       - provider: "openai_compatible_primary"
-        model: "gpt-5.5"
+        model: "gpt-5.4"
         priority: 70
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 3600                         # 重排序 agent 超时（秒）

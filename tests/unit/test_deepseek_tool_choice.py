@@ -17,7 +17,7 @@ class _EmptyAsyncStream:
 
 
 class DeepSeekToolChoiceTest(unittest.IsolatedAsyncioTestCase):
-    def test_config_example_sets_deepseek_tool_choice_required(self):
+    def test_config_example_sets_deepseek_tool_choice_auto(self):
         config_path = Path(__file__).resolve().parents[2] / "config.example.yaml"
         with config_path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
@@ -25,10 +25,10 @@ class DeepSeekToolChoiceTest(unittest.IsolatedAsyncioTestCase):
         deepseek = raw["agent"]["llm"]["providers"]["deepseek"]
         tool_choices = {model["id"]: model["tool_choice"] for model in deepseek["models"]}
 
-        self.assertEqual(tool_choices["deepseek-v4-flash"], "required")
-        self.assertEqual(tool_choices["deepseek-v4-pro"], "required")
+        self.assertEqual(tool_choices["deepseek-v4-flash"], "auto")
+        self.assertEqual(tool_choices["deepseek-v4-pro"], "auto")
 
-    async def test_deepseek_provider_sends_required_tool_choice(self):
+    async def test_deepseek_provider_sends_auto_tool_choice(self):
         captured = {}
 
         async def create(**kwargs):
@@ -51,11 +51,11 @@ class DeepSeekToolChoiceTest(unittest.IsolatedAsyncioTestCase):
                     parameters={"type": "object", "properties": {}},
                 ),
             ],
-            tool_choice="required",
+            tool_choice="auto",
             thinking_config={"thinking": {"type": "disabled"}},
         )
 
-        self.assertEqual(captured["tool_choice"], "required")
+        self.assertEqual(captured["tool_choice"], "auto")
         self.assertEqual(captured["tools"][0]["function"]["name"], "end_task")
 
 
