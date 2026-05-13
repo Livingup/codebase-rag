@@ -110,6 +110,17 @@ class QdrantStorageService:
         conn = self._config.connection
         collection = self._config.collection
         available = self.is_healthy()
+        api_key = conn.api_key or ""
+        api_key_configured = bool(api_key)
+        key_status = [
+            {
+                "label": "Qdrant API Key",
+                "key_suffix": api_key[-6:] if api_key_configured else None,
+                "configured": api_key_configured,
+                "healthy": available if api_key_configured else False,
+                "status_label": "已配置" if api_key_configured else "未配置",
+            }
+        ]
         return {
             "status": "available" if available else "unavailable",
             "initialized": self._initialized,
@@ -124,6 +135,8 @@ class QdrantStorageService:
             "collection": collection.name,
             "dense_vector": collection.dense_vector.name,
             "sparse_vector": collection.sparse_vector.name,
+            "api_key_configured": api_key_configured,
+            "key_status": key_status,
         }
 
     async def probe_client(self, timeout: float) -> dict:

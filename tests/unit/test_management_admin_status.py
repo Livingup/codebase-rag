@@ -79,6 +79,16 @@ class _Qdrant:
             "collection": "codebase",
             "dense_vector": "dense_vectors",
             "sparse_vector": "sparse_vectors",
+            "api_key_configured": True,
+            "key_status": [
+                {
+                    "label": "Qdrant API Key",
+                    "key_suffix": "DRANT1",
+                    "configured": True,
+                    "healthy": True,
+                    "status_label": "已配置",
+                }
+            ],
         }
 
     async def probe_client(self, timeout: float):
@@ -111,6 +121,10 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertTrue(all(client.live_probe is None for client in response.clients))
         self.assertFalse(response.proxy_environment["required"])
+        qdrant = next(client for client in response.clients if client.id == "qdrant")
+        self.assertTrue(qdrant.details["api_key_configured"])
+        self.assertEqual(qdrant.key_status[0]["key_suffix"], "DRANT1")
+        self.assertEqual(qdrant.key_status[0]["status_label"], "已配置")
 
     async def test_client_status_live_probe_attaches_probe_results(self):
         service = self._service()

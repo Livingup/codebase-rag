@@ -217,8 +217,8 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
       box.style.display = message ? 'block' : 'none';
     }
     function detailRows(details) {
-      const keys = ['provider', 'model', 'endpoint', 'collection', 'healthy_keys', 'total_keys', 'initialized', 'proxy_policy'];
-      const labels = { provider: 'Provider', model: '模型', endpoint: '端点', collection: 'Collection', healthy_keys: '健康 Key', total_keys: '总 Key', initialized: '已初始化', proxy_policy: '环境代理' };
+      const keys = ['provider', 'model', 'endpoint', 'collection', 'healthy_keys', 'total_keys', 'initialized', 'api_key_configured', 'proxy_policy'];
+      const labels = { provider: 'Provider', model: '模型', endpoint: '端点', collection: 'Collection', healthy_keys: '健康 Key', total_keys: '总 Key', initialized: '已初始化', api_key_configured: 'API Key 已配置', proxy_policy: '环境代理' };
       return keys.filter(k => details[k] !== undefined && details[k] !== null).map(k => `<dt>${labels[k] || k}</dt><dd>${escapeHtml(details[k])}</dd>`).join('');
     }
     function render(data) {
@@ -239,7 +239,11 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
           <dl>${detailRows({...details, provider: client.provider, endpoint: client.endpoint})}</dl>
           <div class="keys">
             <div class="keys-title">Key 状态</div>
-            ${keys.length ? keys.map(k => `<div class="key-row"><span>***${escapeHtml(k.key_suffix || '')}</span><span>${k.healthy ? '健康' : '不可用'}${k.cooldown_remaining ? ' · 冷却 ' + Math.ceil(k.cooldown_remaining) + 's' : ''}</span></div>`).join('') : '<div class="meta">无 Key 明细</div>'}
+            ${keys.length ? keys.map(k => {
+              const keyLabel = k.key_suffix ? `***${escapeHtml(k.key_suffix)}` : escapeHtml(k.label || 'API Key');
+              const statusText = k.status_label || (k.healthy ? '健康' : '不可用');
+              return `<div class="key-row"><span>${keyLabel}</span><span>${escapeHtml(statusText)}${k.cooldown_remaining ? ' · 冷却 ' + Math.ceil(k.cooldown_remaining) + 's' : ''}</span></div>`;
+            }).join('') : '<div class="meta">无 Key 明细</div>'}
           </div>
           <div class="probe">${live ? `实时检测：${escapeHtml(live.message || live.status)}${live.latency_ms ? ' · ' + escapeHtml(live.latency_ms) + 'ms' : ''}` : '实时检测：未执行'}</div>
         </article>`;

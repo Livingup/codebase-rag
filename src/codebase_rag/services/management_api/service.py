@@ -737,6 +737,7 @@ class ManagementApiService:
             "timeout": data.get("timeout"),
             "dense_vector": data.get("dense_vector"),
             "sparse_vector": data.get("sparse_vector"),
+            "api_key_configured": data.get("api_key_configured", False),
             "proxy_policy": "未配置项目级代理；不需要 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY",
         }
         return ClientStatusItem(
@@ -747,6 +748,7 @@ class ManagementApiService:
             endpoint=data.get("endpoint"),
             status=status,
             details={k: v for k, v in details.items() if v is not None},
+            key_status=data.get("key_status", []),
             live_probe=live_probe,
         )
 
