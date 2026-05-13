@@ -57,7 +57,7 @@ class DashScopeSparseProvider(SparseEmbeddingProvider):
         self._dimension = dimension
         self._batch_size = batch_size
         self._timeout = request_timeout
-        self._client = httpx.AsyncClient(timeout=request_timeout)
+        self._client = httpx.AsyncClient(timeout=request_timeout, trust_env=False)
 
     @property
     def batch_size(self) -> int:
