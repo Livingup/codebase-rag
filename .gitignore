@@ -29,6 +29,7 @@ htmlcov/
 
 # AICode 工作目录
 .workflowagent/
+.spread-ai/
 /.venv/
 /.venv-build/
 
