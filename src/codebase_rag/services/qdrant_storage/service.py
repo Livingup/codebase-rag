@@ -105,6 +105,58 @@ class QdrantStorageService:
     def is_healthy(self) -> bool:
         return self._initialized and self._client is not None
 
+    def get_client_status_snapshot(self) -> dict:
+        """Return current Qdrant client availability without a network call."""
+        conn = self._config.connection
+        collection = self._config.collection
+        available = self.is_healthy()
+        return {
+            "status": "available" if available else "unavailable",
+            "initialized": self._initialized,
+            "client_created": self._client is not None,
+            "endpoint": f"{'https' if conn.https else 'http'}://{conn.host}:{conn.port}",
+            "host": conn.host,
+            "port": conn.port,
+            "grpc_port": conn.grpc_port,
+            "https": conn.https,
+            "prefer_grpc": conn.prefer_grpc,
+            "timeout": conn.timeout,
+            "collection": collection.name,
+            "dense_vector": collection.dense_vector.name,
+            "sparse_vector": collection.sparse_vector.name,
+        }
+
+    async def probe_client(self, timeout: float) -> dict:
+        """Run a real Qdrant heartbeat against the configured server."""
+        if not self._initialized or self._client is None:
+            return {"ok": False, "status": "unavailable", "message": "client is not initialized"}
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(self._client.get_collections(), timeout=timeout)
+        except TimeoutError:
+            elapsed = asyncio.get_running_loop().time() - started
+            return {
+                "ok": False,
+                "status": "timeout",
+                "message": f"heartbeat timed out after {timeout:g}s",
+                "latency_ms": round(elapsed * 1000, 1),
+            }
+        except Exception as e:
+            elapsed = asyncio.get_running_loop().time() - started
+            return {
+                "ok": False,
+                "status": "error",
+                "message": str(e),
+                "latency_ms": round(elapsed * 1000, 1),
+            }
+        elapsed = asyncio.get_running_loop().time() - started
+        return {
+            "ok": True,
+            "status": "available",
+            "message": "heartbeat passed",
+            "latency_ms": round(elapsed * 1000, 1),
+        }
+
     # =========================================================================
     # 2.1 Upsert file points (single file_version_id)
     # =========================================================================

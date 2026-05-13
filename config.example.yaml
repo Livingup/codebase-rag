@@ -456,6 +456,11 @@ management_api:
   server:
     host: "127.0.0.1"
     port: 18080
+  admin_ui:
+    enabled: true                         # 本机免密管理后台，页面入口：http://127.0.0.1:18080/ 或 /admin
+  client_status:
+    live_probe_enabled: false             # 默认只读当前健康快照；实时检测需用户手动触发，避免自动消耗外部 API 额度
+    live_probe_timeout: 10                # 单个客户端实时心跳超时（秒）
   registry_path: "${CODEBASE_RAG_DATA_DIR}/data/project_registry.json"  # 项目注册表持久化路径，重启自动恢复
 
 # --- 07-Git 操作服务 ---

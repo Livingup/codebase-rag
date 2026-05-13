@@ -323,9 +323,24 @@ class AuthConfig(BaseModel):
     api_key: Optional[str] = None
 
 
+class AdminUiConfig(BaseModel):
+    """Local-only management dashboard configuration."""
+
+    enabled: bool = True
+
+
+class ClientStatusConfig(BaseModel):
+    """Client availability dashboard and live probe configuration."""
+
+    live_probe_enabled: bool = False
+    live_probe_timeout: float = 10.0
+
+
 class ManagementApiConfig(BaseModel):
     server: ApiServerConfig = Field(default_factory=ApiServerConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    admin_ui: AdminUiConfig = Field(default_factory=AdminUiConfig)
+    client_status: ClientStatusConfig = Field(default_factory=ClientStatusConfig)
     registry_path: str = ""
 
 

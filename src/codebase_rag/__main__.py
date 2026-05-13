@@ -36,6 +36,7 @@ from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.event_detection.service import EventDetectionService
 from codebase_rag.services.git_operations.service import GitOperationsService
+from codebase_rag.services.management_api.admin_ui import create_admin_router
 from codebase_rag.services.management_api.routes import create_router as create_api_router
 from codebase_rag.services.management_api.service import ManagementApiService
 from codebase_rag.services.context_engine.service import ContextEngineService
@@ -190,6 +191,9 @@ def create_api_app(config: AppConfig, container: ServiceContainer) -> FastAPI:
         title="Codebase RAG — Management API",
         version="0.1.0",
     )
+
+    admin_router = create_admin_router(container.management_api)
+    app.include_router(admin_router)
 
     api_router = create_api_router(container.management_api)
     app.include_router(api_router, prefix="/api/v1")

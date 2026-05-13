@@ -189,6 +189,41 @@ class EmbeddingService:
             return False
         return True
 
+    def get_client_status_snapshot(self) -> dict:
+        """Return current dense/sparse provider availability without external calls."""
+        return {
+            "dense": self._build_provider_status(
+                kind="dense",
+                active_provider=self._config.dense.active_provider,
+                cfg=self._dense_cfg,
+                keypool=self._dense_keypool,
+                initialized=self._initialized and self._dense_provider is not None,
+            ),
+            "sparse": self._build_provider_status(
+                kind="sparse",
+                active_provider=self._config.sparse.active_provider,
+                cfg=self._sparse_cfg,
+                keypool=self._sparse_keypool,
+                initialized=self._initialized and self._sparse_provider is not None,
+            ),
+        }
+
+    async def probe_dense_provider(self, timeout: float) -> dict:
+        """Run a real dense embedding provider heartbeat with one available key."""
+        return await self._probe_provider(
+            provider=self._dense_provider,
+            keypool=self._dense_keypool,
+            timeout=timeout,
+        )
+
+    async def probe_sparse_provider(self, timeout: float) -> dict:
+        """Run a real sparse embedding provider heartbeat with one available key."""
+        return await self._probe_provider(
+            provider=self._sparse_provider,
+            keypool=self._sparse_keypool,
+            timeout=timeout,
+        )
+
     # =========================================================================
     # Public API
     # =========================================================================
@@ -290,6 +325,89 @@ class EmbeddingService:
     # =========================================================================
     # Internal helpers
     # =========================================================================
+
+    @staticmethod
+    def _provider_status_from_counts(initialized: bool, total_keys: int, healthy_keys: int) -> str:
+        if not initialized:
+            return "unavailable"
+        if total_keys <= 0:
+            return "not_configured"
+        if healthy_keys <= 0:
+            return "unavailable"
+        if healthy_keys < total_keys:
+            return "degraded"
+        return "available"
+
+    def _build_provider_status(
+        self,
+        kind: str,
+        active_provider: str,
+        cfg: Optional[EmbeddingProviderConfig],
+        keypool: Optional[KeyPool],
+        initialized: bool,
+    ) -> dict:
+        total_keys = keypool.total_keys if keypool else 0
+        healthy_keys = keypool.healthy_keys if keypool else 0
+        key_status = keypool.get_status() if keypool else []
+        return {
+            "kind": kind,
+            "provider": active_provider,
+            "initialized": initialized,
+            "status": self._provider_status_from_counts(
+                initialized=initialized,
+                total_keys=total_keys,
+                healthy_keys=healthy_keys,
+            ),
+            "endpoint": cfg.api_base_url if cfg else None,
+            "model": cfg.model_name if cfg else None,
+            "dimension": cfg.dimension if cfg else None,
+            "batch_size": cfg.batch_size if cfg else None,
+            "request_timeout": cfg.request_timeout if cfg else None,
+            "total_keys": total_keys,
+            "healthy_keys": healthy_keys,
+            "key_status": key_status,
+        }
+
+    async def _probe_provider(
+        self,
+        provider: DenseEmbeddingProvider | SparseEmbeddingProvider | None,
+        keypool: KeyPool | None,
+        timeout: float,
+    ) -> dict:
+        if not self._initialized or provider is None or keypool is None:
+            return {"ok": False, "status": "unavailable", "message": "client is not initialized"}
+        api_key = keypool.peek()
+        if not api_key:
+            return {"ok": False, "status": "not_configured", "message": "no api key configured"}
+        started = asyncio.get_running_loop().time()
+        try:
+            ok = await asyncio.wait_for(provider.health_check(api_key), timeout=timeout)
+        except TimeoutError:
+            elapsed = asyncio.get_running_loop().time() - started
+            return {
+                "ok": False,
+                "status": "timeout",
+                "message": f"heartbeat timed out after {timeout:g}s",
+                "latency_ms": round(elapsed * 1000, 1),
+                "key_suffix": api_key[-6:],
+            }
+        except Exception as e:
+            elapsed = asyncio.get_running_loop().time() - started
+            return {
+                "ok": False,
+                "status": "error",
+                "message": str(e),
+                "latency_ms": round(elapsed * 1000, 1),
+                "key_suffix": api_key[-6:],
+            }
+        elapsed = asyncio.get_running_loop().time() - started
+        return {
+            "ok": bool(ok),
+            "status": "available" if ok else "unavailable",
+            "message": "heartbeat passed" if ok else "heartbeat failed",
+            "latency_ms": round(elapsed * 1000, 1),
+            "key_suffix": api_key[-6:],
+        }
 
     def _check_initialized(self) -> None:
         if not self._initialized:

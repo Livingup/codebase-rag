@@ -184,6 +184,30 @@ class HealthResponse(BaseModel):
     uptime_seconds: float = 0.0
 
 
+class ClientStatusItem(BaseModel):
+    """Single external client availability item for the admin dashboard."""
+
+    id: str
+    name: str
+    kind: str
+    status: str
+    provider: Optional[str] = None
+    endpoint: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+    key_status: List[Dict[str, Any]] = Field(default_factory=list)
+    live_probe: Optional[Dict[str, Any]] = None
+
+
+class ClientStatusResponse(BaseModel):
+    """GET /status/clients response used by the local admin dashboard."""
+
+    status: str
+    generated_at: str
+    live_probe: bool = False
+    proxy_environment: Dict[str, Any] = Field(default_factory=dict)
+    clients: List[ClientStatusItem] = Field(default_factory=list)
+
+
 class ConfigResponse(BaseModel):
     """GET /config response (sanitized)."""
 

@@ -14,13 +14,14 @@ Internal dependencies:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.config.loader import ConfigManager
@@ -31,6 +32,8 @@ from codebase_rag.services.git_operations.service import GitOperationsService
 from codebase_rag.services.management_api.models import (
     BatchRegisterProjectResponse,
     BatchRegisterResultItem,
+    ClientStatusItem,
+    ClientStatusResponse,
     DeleteProjectResponse,
     HealthResponse,
     ManagementApiError,
@@ -594,6 +597,65 @@ class ManagementApiService:
             uptime_seconds=round(uptime, 1),
         )
 
+    def is_admin_ui_enabled(self) -> bool:
+        """Return whether the local passwordless admin dashboard is enabled."""
+        return self._config.admin_ui.enabled
+
+    async def get_client_status(self, live: bool = False) -> ClientStatusResponse:
+        """Return DashScope, Gemini embedding and Qdrant availability for the dashboard."""
+        live_probe = live or self._config.client_status.live_probe_enabled
+        timeout = self._config.client_status.live_probe_timeout
+        embedding_status = self._embedding.get_client_status_snapshot()
+        qdrant_status = self._qdrant.get_client_status_snapshot()
+
+        probe_results: Dict[str, Optional[Dict[str, Any]]] = {
+            "dashscope_embedding": None,
+            "gemini_embedding": None,
+            "qdrant": None,
+        }
+        if live_probe:
+            dashscope_probe, gemini_probe, qdrant_probe = await asyncio.gather(
+                self._embedding.probe_sparse_provider(timeout),
+                self._embedding.probe_dense_provider(timeout),
+                self._qdrant.probe_client(timeout),
+            )
+            probe_results = {
+                "dashscope_embedding": dashscope_probe,
+                "gemini_embedding": gemini_probe,
+                "qdrant": qdrant_probe,
+            }
+
+        clients = [
+            self._build_embedding_client_item(
+                data=embedding_status["sparse"],
+                client_id="dashscope_embedding",
+                name="DashScope embedding",
+                expected_provider="dashscope",
+                proxy_policy="不读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY（trust_env=False）",
+                live_probe=probe_results["dashscope_embedding"],
+            ),
+            self._build_embedding_client_item(
+                data=embedding_status["dense"],
+                client_id="gemini_embedding",
+                name="Gemini dense embedding",
+                expected_provider="gemini",
+                proxy_policy="HTTPX 默认可能读取环境代理；未配置代理变量时直连",
+                live_probe=probe_results["gemini_embedding"],
+            ),
+            self._build_qdrant_client_item(
+                data=qdrant_status,
+                live_probe=probe_results["qdrant"],
+            ),
+        ]
+
+        return ClientStatusResponse(
+            status=self._aggregate_client_status([client.status for client in clients]),
+            generated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            live_probe=live_probe,
+            proxy_environment=self._get_proxy_environment_snapshot(),
+            clients=clients,
+        )
+
     async def reload_config(self) -> None:
         """Trigger configuration hot reload via ConfigManager.
 
@@ -612,6 +674,117 @@ class ManagementApiService:
     # =========================================================================
     # Internal helpers
     # =========================================================================
+
+    def _build_embedding_client_item(
+        self,
+        data: Dict[str, Any],
+        client_id: str,
+        name: str,
+        expected_provider: str,
+        proxy_policy: str,
+        live_probe: Optional[Dict[str, Any]],
+    ) -> ClientStatusItem:
+        status = data.get("status", "unknown")
+        provider = data.get("provider")
+        if provider != expected_provider:
+            status = "not_configured"
+        if live_probe is not None:
+            status = live_probe.get("status", "unknown")
+
+        details = {
+            "initialized": data.get("initialized", False),
+            "model": data.get("model"),
+            "dimension": data.get("dimension"),
+            "batch_size": data.get("batch_size"),
+            "healthy_keys": data.get("healthy_keys", 0),
+            "total_keys": data.get("total_keys", 0),
+            "request_timeout": data.get("request_timeout"),
+            "proxy_policy": proxy_policy,
+        }
+        if provider != expected_provider:
+            details["expected_provider"] = expected_provider
+            details["configured_provider"] = provider
+
+        return ClientStatusItem(
+            id=client_id,
+            name=name,
+            kind="embedding",
+            provider=provider,
+            endpoint=data.get("endpoint"),
+            status=status,
+            details={k: v for k, v in details.items() if v is not None},
+            key_status=data.get("key_status", []),
+            live_probe=live_probe,
+        )
+
+    @staticmethod
+    def _build_qdrant_client_item(
+        data: Dict[str, Any],
+        live_probe: Optional[Dict[str, Any]],
+    ) -> ClientStatusItem:
+        status = data.get("status", "unknown")
+        if live_probe is not None:
+            status = live_probe.get("status", "unknown")
+        details = {
+            "initialized": data.get("initialized", False),
+            "client_created": data.get("client_created", False),
+            "collection": data.get("collection"),
+            "host": data.get("host"),
+            "port": data.get("port"),
+            "grpc_port": data.get("grpc_port"),
+            "https": data.get("https"),
+            "prefer_grpc": data.get("prefer_grpc"),
+            "timeout": data.get("timeout"),
+            "dense_vector": data.get("dense_vector"),
+            "sparse_vector": data.get("sparse_vector"),
+            "proxy_policy": "未配置项目级代理；不需要 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY",
+        }
+        return ClientStatusItem(
+            id="qdrant",
+            name="Qdrant",
+            kind="vector_storage",
+            provider="qdrant",
+            endpoint=data.get("endpoint"),
+            status=status,
+            details={k: v for k, v in details.items() if v is not None},
+            live_probe=live_probe,
+        )
+
+    @staticmethod
+    def _aggregate_client_status(statuses: List[str]) -> str:
+        if not statuses:
+            return "unknown"
+        if any(status in {"unavailable", "error", "timeout", "not_configured"} for status in statuses):
+            return "unavailable"
+        if any(status == "degraded" for status in statuses):
+            return "degraded"
+        if all(status == "available" for status in statuses):
+            return "available"
+        return "unknown"
+
+    @staticmethod
+    def _get_proxy_environment_snapshot() -> Dict[str, Any]:
+        proxy_names = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        )
+        detected = [name for name in proxy_names if os.environ.get(name)]
+        return {
+            "required": False,
+            "detected": bool(detected),
+            "detected_variables": detected,
+            "message": (
+                "检测到代理环境变量，未显式禁用 trust_env 的 HTTP 客户端可能读取"
+                if detected
+                else "未检测到代理环境变量；HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 不是必填项"
+            ),
+        }
 
     async def _resolve_project_id_with_migration(
         self, git_repo_path: str,

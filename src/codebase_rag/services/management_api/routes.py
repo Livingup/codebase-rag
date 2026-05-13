@@ -5,11 +5,12 @@ All endpoints are async. Error handling uses HTTPException with standard error f
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from codebase_rag.services.management_api.models import (
     BatchRegisterProjectRequest,
     BatchRegisterProjectResponse,
+    ClientStatusResponse,
     DeleteProjectResponse,
     ErrorDetail,
     ErrorResponse,
@@ -24,6 +25,7 @@ from codebase_rag.services.management_api.models import (
     SearchResponse,
     TaskResponse,
 )
+from codebase_rag.services.management_api.admin_ui import require_local_request
 from codebase_rag.services.management_api.service import ManagementApiService
 from codebase_rag.services.management_api.models import (
     ManagementApiError,
@@ -161,6 +163,11 @@ def create_router(service: ManagementApiService) -> APIRouter:
     @router.get("/health", response_model=HealthResponse)
     async def health():
         return service.get_health()
+
+    @router.get("/status/clients", response_model=ClientStatusResponse)
+    async def client_status(request: Request, live: bool = False):
+        require_local_request(request)
+        return await service.get_client_status(live=live)
 
     @router.post("/config/reload", response_model=ReloadConfigResponse)
     async def reload_config():
