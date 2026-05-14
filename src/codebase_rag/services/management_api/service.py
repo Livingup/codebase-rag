@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from codebase_rag.common.logging import get_logger
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import ManagementApiConfig
+from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.event_detection.service import EventDetectionService
 from codebase_rag.services.git_operations.service import GitOperationsService
@@ -106,6 +107,7 @@ class ManagementApiService:
         memory_qdrant: MemoryQdrantService,
         qdrant_storage: QdrantStorageService,
         embedding: EmbeddingService,
+        agent: AgentService,
         knowledge_sync: KnowledgeSyncService,
     ) -> None:
         self._config_manager = config_manager
@@ -115,6 +117,7 @@ class ManagementApiService:
         self._memory = memory_qdrant
         self._qdrant = qdrant_storage
         self._embedding = embedding
+        self._agent = agent
         self._knowledge_sync = knowledge_sync
 
         # In-memory project registry: project_id → ProjectRecord
@@ -602,22 +605,27 @@ class ManagementApiService:
         return self._config.admin_ui.enabled
 
     async def get_client_status(self, live: bool = False) -> ClientStatusResponse:
-        """Return DashScope, Gemini embedding and Qdrant availability for the dashboard."""
+        """Return external client and model provider availability for the dashboard."""
         live_probe = live or self._config.client_status.live_probe_enabled
         timeout = self._config.client_status.live_probe_timeout
         embedding_status = self._embedding.get_client_status_snapshot()
         qdrant_status = self._qdrant.get_client_status_snapshot()
+        llm_status = self._agent.get_llm_provider_status_snapshot()
 
         probe_results: Dict[str, Optional[Dict[str, Any]]] = {
             "dashscope_embedding": None,
             "gemini_embedding": None,
             "qdrant": None,
         }
+        llm_probe_results: Dict[str, Optional[Dict[str, Any]]] = {
+            str(item["id"]): None for item in llm_status
+        }
         if live_probe:
-            dashscope_probe, gemini_probe, qdrant_probe = await asyncio.gather(
+            dashscope_probe, gemini_probe, qdrant_probe, llm_probe_results = await asyncio.gather(
                 self._embedding.probe_sparse_provider(timeout),
                 self._embedding.probe_dense_provider(timeout),
                 self._qdrant.probe_client(timeout),
+                self._agent.probe_llm_providers(timeout),
             )
             probe_results = {
                 "dashscope_embedding": dashscope_probe,
@@ -647,6 +655,13 @@ class ManagementApiService:
                 live_probe=probe_results["qdrant"],
             ),
         ]
+        clients.extend(
+            self._build_llm_provider_client_item(
+                data=item,
+                live_probe=llm_probe_results.get(str(item["id"])),
+            )
+            for item in llm_status
+        )
 
         return ClientStatusResponse(
             status=self._aggregate_client_status([client.status for client in clients]),
@@ -745,6 +760,45 @@ class ManagementApiService:
             name="Qdrant",
             kind="vector_storage",
             provider="qdrant",
+            endpoint=data.get("endpoint"),
+            status=status,
+            details={k: v for k, v in details.items() if v is not None},
+            key_status=data.get("key_status", []),
+            live_probe=live_probe,
+        )
+
+    @staticmethod
+    def _build_llm_provider_client_item(
+        data: Dict[str, Any],
+        live_probe: Optional[Dict[str, Any]],
+    ) -> ClientStatusItem:
+        status = data.get("status", "unknown")
+        if live_probe is not None:
+            status = live_probe.get("status", "unknown")
+        models = data.get("models", [])
+        details = {
+            "initialized": data.get("initialized", False),
+            "provider_loaded": data.get("provider_loaded", False),
+            "api_format": data.get("api_format"),
+            "models": ", ".join(
+                model.get("api_model") or model.get("id")
+                for model in models
+                if isinstance(model, dict)
+            ),
+            "model_count": len(models) if isinstance(models, list) else 0,
+            "healthy_keys": data.get("healthy_keys", 0),
+            "total_keys": data.get("total_keys", 0),
+            "request_timeout": data.get("request_timeout"),
+            "max_concurrency": data.get("max_concurrency"),
+            "is_default_provider": data.get("is_default_provider", False),
+            "default_model": data.get("default_model"),
+            "probe_policy": "仅点击实时检测时发送一次最小 LLM 消息请求",
+        }
+        return ClientStatusItem(
+            id=f"llm_provider:{data.get('id')}",
+            name=f"LLM · {data.get('name')}",
+            kind="model_provider",
+            provider=str(data.get("id")),
             endpoint=data.get("endpoint"),
             status=status,
             details={k: v for k, v in details.items() if v is not None},

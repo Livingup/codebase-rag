@@ -61,6 +61,54 @@ class _Embedding:
         return {"ok": True, "status": "available", "message": "sparse ok", "latency_ms": 1.0}
 
 
+class _Agent:
+    def get_llm_provider_status_snapshot(self):
+        return [
+            {
+                "id": "zhipu",
+                "name": "zhipu",
+                "status": "available",
+                "api_format": "zhipu",
+                "endpoint": "https://open.bigmodel.cn",
+                "models": [
+                    {
+                        "id": "glm-5.1",
+                        "alias": None,
+                        "api_model": "glm-5.1",
+                        "tool_choice": "auto",
+                        "thinking_configured": False,
+                        "custom_headers_configured": False,
+                        "is_default": True,
+                    }
+                ],
+                "default_provider": "zhipu",
+                "default_model": "glm-5.1",
+                "is_default_provider": True,
+                "total_keys": 1,
+                "healthy_keys": 1,
+                "key_status": [{"key_suffix": "ZHIPU1", "healthy": True}],
+                "request_timeout": 600,
+                "max_concurrency": 3,
+                "initialized": True,
+                "provider_loaded": True,
+            }
+        ]
+
+    async def probe_llm_providers(self, timeout: float):
+        return {
+            "zhipu": {
+                "ok": True,
+                "status": "available",
+                "message": "Minimal LLM chat request succeeded",
+                "latency_ms": 1.0,
+                "model": "glm-5.1",
+                "api_model": "glm-5.1",
+                "finish_reason": "stop",
+                "response_received": True,
+            }
+        }
+
+
 class _Qdrant:
     _initialized = True
 
@@ -105,6 +153,7 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
             memory_qdrant=SimpleNamespace(_initialized=True),
             qdrant_storage=_Qdrant(),
             embedding=_Embedding(),
+            agent=_Agent(),
             knowledge_sync=SimpleNamespace(),
         )
 
@@ -118,6 +167,7 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
             "dashscope_embedding",
             "gemini_embedding",
             "qdrant",
+            "llm_provider:zhipu",
         ])
         self.assertTrue(all(client.live_probe is None for client in response.clients))
         self.assertFalse(response.proxy_environment["required"])
@@ -125,6 +175,11 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(qdrant.details["api_key_configured"])
         self.assertEqual(qdrant.key_status[0]["key_suffix"], "DRANT1")
         self.assertEqual(qdrant.key_status[0]["status_label"], "已配置")
+        provider = next(client for client in response.clients if client.id == "llm_provider:zhipu")
+        self.assertEqual(provider.kind, "model_provider")
+        self.assertEqual(provider.details["api_format"], "zhipu")
+        self.assertEqual(provider.details["models"], "glm-5.1")
+        self.assertEqual(provider.key_status[0]["key_suffix"], "ZHIPU1")
 
     async def test_client_status_live_probe_attaches_probe_results(self):
         service = self._service()
@@ -133,6 +188,10 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.live_probe)
         self.assertEqual(response.status, "available")
         self.assertTrue(all(client.live_probe for client in response.clients))
+        provider = next(client for client in response.clients if client.id == "llm_provider:zhipu")
+        self.assertEqual(provider.live_probe["message"], "Minimal LLM chat request succeeded")
+        self.assertEqual(provider.live_probe["api_model"], "glm-5.1")
+        self.assertTrue(provider.live_probe["response_received"])
 
     def test_admin_ui_requires_local_request(self):
         require_local_request(SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))

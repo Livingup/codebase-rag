@@ -175,7 +175,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
     <main>
       <section class="toolbar">
         <div>
-          <h2 style="margin:0 0 6px;font-size:22px;">客户端可用情况</h2>
+          <h2 style="margin:0 0 6px;font-size:22px;">客户端与模型服务商可用情况</h2>
           <div class="meta" id="refresh-meta">等待刷新</div>
         </div>
         <div class="actions">
@@ -186,7 +186,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
       <div class="error-box" id="error-box"></div>
       <section class="summary">
         <div class="summary-card"><div class="label">整体状态</div><div class="value" id="overall-status">-</div></div>
-        <div class="summary-card"><div class="label">可用客户端</div><div class="value" id="available-count">-</div></div>
+        <div class="summary-card"><div class="label">可用状态项</div><div class="value" id="available-count">-</div></div>
         <div class="summary-card"><div class="label">检测模式</div><div class="value" id="probe-mode">快照</div></div>
       </section>
       <section class="cards" id="client-cards"></section>
@@ -217,12 +217,23 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
       box.style.display = message ? 'block' : 'none';
     }
     function detailRows(details) {
-      const keys = ['provider', 'model', 'endpoint', 'collection', 'healthy_keys', 'total_keys', 'initialized', 'api_key_configured', 'proxy_policy'];
-      const labels = { provider: 'Provider', model: '模型', endpoint: '端点', collection: 'Collection', healthy_keys: '健康 Key', total_keys: '总 Key', initialized: '已初始化', api_key_configured: 'API Key 已配置', proxy_policy: '环境代理' };
-      return keys.filter(k => details[k] !== undefined && details[k] !== null).map(k => `<dt>${labels[k] || k}</dt><dd>${escapeHtml(details[k])}</dd>`).join('');
+      const keys = [
+        'provider', 'api_format', 'model', 'models', 'model_count', 'endpoint', 'collection', 'dimension',
+        'batch_size', 'healthy_keys', 'total_keys', 'initialized', 'provider_loaded', 'api_key_configured',
+        'request_timeout', 'max_concurrency', 'is_default_provider', 'default_model', 'proxy_policy', 'probe_policy'
+      ];
+      const labels = {
+        provider: 'Provider', api_format: 'API 格式', model: '模型', models: '模型列表', model_count: '模型数',
+        endpoint: '端点', collection: 'Collection', dimension: '维度', batch_size: '批量', healthy_keys: '健康 Key',
+        total_keys: '总 Key', initialized: '已初始化', provider_loaded: 'Provider 已加载',
+        api_key_configured: 'API Key 已配置', request_timeout: '请求超时', max_concurrency: '最大并发',
+        is_default_provider: '默认服务商', default_model: '默认模型', proxy_policy: '环境代理', probe_policy: '检测策略'
+      };
+      return keys.filter(k => details[k] !== undefined && details[k] !== null && details[k] !== '').map(k => `<dt>${labels[k] || k}</dt><dd>${escapeHtml(details[k])}</dd>`).join('');
     }
     function render(data) {
       const clients = data.clients || [];
+      const kindLabel = { embedding: 'Embedding', vector_storage: '向量存储', model_provider: '模型服务商' };
       document.getElementById('overall-status').textContent = statusLabel[data.status] || data.status || '-';
       document.getElementById('available-count').textContent = `${clients.filter(c => c.status === 'available').length}/${clients.length}`;
       document.getElementById('probe-mode').textContent = data.live_probe ? '实时' : '快照';
@@ -233,7 +244,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
         const live = client.live_probe;
         return `<article class="client-card">
           <div class="client-head">
-            <div><div class="client-title">${escapeHtml(client.name)}</div><div class="client-sub">${escapeHtml(client.kind)} ${client.provider ? '· ' + escapeHtml(client.provider) : ''}</div></div>
+            <div><div class="client-title">${escapeHtml(client.name)}</div><div class="client-sub">${escapeHtml(kindLabel[client.kind] || client.kind)} ${client.provider ? '· ' + escapeHtml(client.provider) : ''}</div></div>
             ${badge(client.status)}
           </div>
           <dl>${detailRows({...details, provider: client.provider, endpoint: client.endpoint})}</dl>
@@ -245,7 +256,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
               return `<div class="key-row"><span>${keyLabel}</span><span>${escapeHtml(statusText)}${k.cooldown_remaining ? ' · 冷却 ' + Math.ceil(k.cooldown_remaining) + 's' : ''}</span></div>`;
             }).join('') : '<div class="meta">无 Key 明细</div>'}
           </div>
-          <div class="probe">${live ? `实时检测：${escapeHtml(live.message || live.status)}${live.latency_ms ? ' · ' + escapeHtml(live.latency_ms) + 'ms' : ''}` : '实时检测：未执行'}</div>
+          <div class="probe">${live ? `实时检测：${escapeHtml(live.message || live.status)}${live.api_model ? ' · 模型 ' + escapeHtml(live.api_model) : ''}${live.latency_ms ? ' · ' + escapeHtml(live.latency_ms) + 'ms' : ''}` : '实时检测：未执行'}</div>
         </article>`;
       }).join('');
       const proxy = data.proxy_environment || {};

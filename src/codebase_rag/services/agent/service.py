@@ -18,7 +18,7 @@ from codebase_rag.common.keypool import KeyPool
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.token_counter import TokenCounter
 from codebase_rag.config.loader import ConfigManager
-from codebase_rag.config.schema import AgentConfig, LLMProviderConfig
+from codebase_rag.config.schema import AgentConfig, LLMProviderConfig, ProviderModelRef
 from codebase_rag.services.agent.errors import (
     AgentNotFoundError,
     AgentTaskComplete,
@@ -175,6 +175,162 @@ class AgentService:
         return any(
             kp.healthy_keys > 0 for kp in self._keypools.values()
         )
+
+    def get_llm_provider_status_snapshot(self) -> List[Dict[str, object]]:
+        """Return configured LLM provider availability without external calls."""
+        llm_cfg = self._config.llm
+        items: List[Dict[str, object]] = []
+        for provider_name, provider_cfg in llm_cfg.providers.items():
+            keypool = self._keypools.get(provider_name)
+            total_keys = keypool.total_keys if keypool else len([k for k in provider_cfg.api_keys if k.key])
+            healthy_keys = keypool.healthy_keys if keypool else 0
+            provider_loaded = provider_name in self._providers
+            status = self._provider_status_from_counts(
+                initialized=self._initialized and provider_loaded,
+                total_keys=total_keys,
+                healthy_keys=healthy_keys,
+            )
+
+            model_refs = [
+                {
+                    "id": ref.id,
+                    "alias": ref.alias,
+                    "api_model": ref.alias or ref.id,
+                    "tool_choice": ref.tool_choice,
+                    "thinking_configured": bool(ref.thinking),
+                    "custom_headers_configured": bool(ref.custom_headers),
+                    "is_default": provider_name == llm_cfg.default_provider and ref.id == llm_cfg.default_model,
+                }
+                for ref in provider_cfg.models
+            ]
+            items.append(
+                {
+                    "id": provider_name,
+                    "name": provider_name,
+                    "status": status,
+                    "api_format": provider_cfg.api_format,
+                    "endpoint": provider_cfg.api_base_url,
+                    "models": model_refs,
+                    "default_provider": llm_cfg.default_provider,
+                    "default_model": llm_cfg.default_model,
+                    "is_default_provider": provider_name == llm_cfg.default_provider,
+                    "total_keys": total_keys,
+                    "healthy_keys": healthy_keys,
+                    "key_status": keypool.get_status() if keypool else [],
+                    "request_timeout": provider_cfg.request_timeout,
+                    "max_concurrency": provider_cfg.max_concurrency,
+                    "initialized": self._initialized,
+                    "provider_loaded": provider_loaded,
+                }
+            )
+        return items
+
+    async def probe_llm_provider(self, provider_name: str, timeout: float) -> Dict[str, object]:
+        """Probe one LLM provider by sending a minimal chat request to a configured model."""
+        provider = self._providers.get(provider_name)
+        provider_cfg = self._config.llm.providers.get(provider_name)
+        keypool = self._keypools.get(provider_name)
+        if not self._initialized or provider is None or provider_cfg is None or keypool is None:
+            return {"ok": False, "status": "not_configured", "message": "LLM provider is not configured or initialized"}
+        if not provider_cfg.models:
+            return {"ok": False, "status": "not_configured", "message": "LLM provider has no models configured"}
+
+        model_ref = self._select_probe_model_ref(provider_name, provider_cfg)
+        model_id = model_ref.id
+        api_model = model_ref.alias or model_ref.id
+        api_key = await keypool.get_key()
+        if not api_key:
+            return {"ok": False, "status": "unavailable", "message": "No healthy API key is currently available"}
+
+        started = time.monotonic()
+        try:
+            response = await asyncio.wait_for(
+                provider.chat_completion(
+                    api_key=api_key,
+                    messages=[Message(role="user", content="ping")],
+                    model=api_model,
+                    temperature=0.0,
+                    max_output_tokens=1,
+                    tool_choice="none",
+                    thinking_config=None,
+                    custom_headers=model_ref.custom_headers,
+                ),
+                timeout=timeout,
+            )
+            await keypool.report_success(api_key)
+            return {
+                "ok": True,
+                "status": "available",
+                "message": "Minimal LLM chat request succeeded",
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "model": model_id,
+                "api_model": api_model,
+                "finish_reason": response.finish_reason,
+                "response_received": bool(response.content or response.thinking_content or response.tool_calls),
+            }
+        except asyncio.TimeoutError:
+            await keypool.report_failure(api_key)
+            return {
+                "ok": False,
+                "status": "timeout",
+                "message": f"Minimal LLM chat request timed out after {timeout:g}s",
+                "model": model_id,
+                "api_model": api_model,
+            }
+        except LLMAuthError as exc:
+            await keypool.mark_unhealthy(api_key)
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "message": f"LLM authentication failed: {str(exc)[:160]}",
+                "model": model_id,
+                "api_model": api_model,
+            }
+        except LLMRateLimitError as exc:
+            return {
+                "ok": False,
+                "status": "degraded",
+                "message": f"LLM rate limit or quota response: {str(exc)[:160]}",
+                "model": model_id,
+                "api_model": api_model,
+            }
+        except Exception as exc:
+            await keypool.report_failure(api_key)
+            return {
+                "ok": False,
+                "status": "error",
+                "message": f"Minimal LLM chat request failed: {str(exc)[:160]}",
+                "model": model_id,
+                "api_model": api_model,
+            }
+
+    async def probe_llm_providers(self, timeout: float) -> Dict[str, Dict[str, object]]:
+        """Probe all configured LLM providers with one minimal model request each."""
+        provider_names = list(self._config.llm.providers.keys())
+        results = await asyncio.gather(
+            *(self.probe_llm_provider(provider_name, timeout) for provider_name in provider_names),
+        )
+        return dict(zip(provider_names, results))
+
+    @staticmethod
+    def _provider_status_from_counts(initialized: bool, total_keys: int, healthy_keys: int) -> str:
+        if not initialized:
+            return "unavailable"
+        if total_keys <= 0:
+            return "not_configured"
+        if healthy_keys <= 0:
+            return "unavailable"
+        if healthy_keys < total_keys:
+            return "degraded"
+        return "available"
+
+    def _select_probe_model_ref(self, provider_name: str, provider_cfg: LLMProviderConfig) -> ProviderModelRef:
+        default_model = self._config.llm.default_model
+        if provider_name == self._config.llm.default_provider:
+            for model_ref in provider_cfg.models:
+                if model_ref.id == default_model:
+                    return model_ref
+        return provider_cfg.models[0]
 
     # =========================================================================
     # Provider 并发容量选择

@@ -377,23 +377,23 @@ agent:
 #          retry_backoff_multiplier: 2.0
 #          key_cooldown_seconds: 60
 #        max_concurrency: 2                    # 该服务商最大并发请求数
-      custom_openai_compatible:
-        api_format: "openai_responses"
-        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
-        models:
-          - id: "gpt-5.4"
-            tool_choice: "auto"
-            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-            custom_headers:                    
-              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
-        api_keys:
-          - key: "${custom_openai_compatible_KEY_1}"
-        retry:
-          max_retries_per_key: 3
-          retry_base_delay: 1.0
-          retry_backoff_multiplier: 2.0
-          key_cooldown_seconds: 60
-        max_concurrency: 5                    # 该服务商最大并发请求数
+#      custom_openai_compatible:
+#        api_format: "openai_responses"
+#        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+#        models:
+#          - id: "gpt-5.4"
+#            tool_choice: "auto"
+#            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+#            custom_headers:
+#              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
+#        api_keys:
+#          - key: "${custom_openai_compatible_KEY_1}"
+#        retry:
+#          max_retries_per_key: 3
+#          retry_base_delay: 1.0
+#          retry_backoff_multiplier: 2.0
+#          key_cooldown_seconds: 60
+#        max_concurrency: 5                    # 该服务商最大并发请求数
       openai_compatible_primary:
         api_format: "openai_responses"
         api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"

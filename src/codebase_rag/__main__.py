@@ -104,6 +104,7 @@ class ServiceContainer:
             memory_qdrant=self.memory_qdrant,
             qdrant_storage=self.qdrant_storage,
             embedding=self.embedding,
+            agent=self.agent,
             knowledge_sync=self.knowledge_sync,
         )
         self.mcp_service = McpService(
