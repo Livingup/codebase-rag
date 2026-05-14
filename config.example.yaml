@@ -753,16 +753,16 @@ mcp:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
       - provider: "openai_compatible_secondary"             # 引用 agent.llm.providers 中的 key
         model: "gemini-3-flash"           # 引用该 provider 下 models[].id
-        priority: 10
+        priority: 1
       - provider: "openai_compatible_secondary"
         model: "gemini-3.1-pro"
-        priority: 20
+        priority: 2
       - provider: "openai_compatible_secondary"
         model: "gemini-2.5-pro"
-        priority: 30
+        priority: 3
       - provider: "openai_compatible_secondary"
         model: "gemini-2.5-flash"
-        priority: 40
+        priority: 4
       - provider: "deepseek"
         model: "deepseek-v4-flash"
         priority: 50
