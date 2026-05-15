@@ -185,6 +185,9 @@ class AgentService:
             total_keys = keypool.total_keys if keypool else len([k for k in provider_cfg.api_keys if k.key])
             healthy_keys = keypool.healthy_keys if keypool else 0
             provider_loaded = provider_name in self._providers
+            default_model_ref = self._select_probe_model_ref(provider_name, provider_cfg) if provider_cfg.models else None
+            default_model_id = default_model_ref.id if default_model_ref else None
+            default_api_model = default_model_ref.alias or default_model_ref.id if default_model_ref else None
             status = self._provider_status_from_counts(
                 initialized=self._initialized and provider_loaded,
                 total_keys=total_keys,
@@ -199,7 +202,7 @@ class AgentService:
                     "tool_choice": ref.tool_choice,
                     "thinking_configured": bool(ref.thinking),
                     "custom_headers_configured": bool(ref.custom_headers),
-                    "is_default": provider_name == llm_cfg.default_provider and ref.id == llm_cfg.default_model,
+                    "is_default": ref.id == default_model_id,
                 }
                 for ref in provider_cfg.models
             ]
@@ -212,7 +215,9 @@ class AgentService:
                     "endpoint": provider_cfg.api_base_url,
                     "models": model_refs,
                     "default_provider": llm_cfg.default_provider,
-                    "default_model": llm_cfg.default_model,
+                    "default_model": default_api_model,
+                    "default_model_id": default_model_id,
+                    "global_default_model": llm_cfg.default_model,
                     "is_default_provider": provider_name == llm_cfg.default_provider,
                     "total_keys": total_keys,
                     "healthy_keys": healthy_keys,

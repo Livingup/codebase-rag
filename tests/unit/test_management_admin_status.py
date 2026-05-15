@@ -6,7 +6,15 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from codebase_rag.config.schema import ManagementApiConfig
+from codebase_rag.config.schema import (
+    AgentConfig,
+    ApiKeyConfig,
+    LLMConfig,
+    LLMProviderConfig,
+    ManagementApiConfig,
+    ProviderModelRef,
+)
+from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.management_api.admin_ui import require_local_request
 from codebase_rag.services.management_api.service import ManagementApiService
 
@@ -198,6 +206,64 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             require_local_request(SimpleNamespace(client=SimpleNamespace(host="192.168.1.10")))
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_llm_provider_status_uses_provider_probe_model_as_default_display(self):
+        agent_config = AgentConfig(
+            llm=LLMConfig(
+                default_provider="openai_compatible_primary",
+                default_model="gpt-5.4",
+                providers={
+                    "deepseek": LLMProviderConfig(
+                        api_format="deepseek",
+                        api_base_url="https://api.deepseek.com",
+                        models=[
+                            ProviderModelRef(id="deepseek-v4-flash"),
+                            ProviderModelRef(id="deepseek-v4-pro"),
+                        ],
+                        api_keys=[ApiKeyConfig(key="deepseek-key")],
+                    ),
+                    "zhipu": LLMProviderConfig(
+                        api_format="zhipu",
+                        api_base_url="https://open.bigmodel.cn",
+                        models=[
+                            ProviderModelRef(id="glm-5.1"),
+                            ProviderModelRef(id="glm-4.7"),
+                        ],
+                        api_keys=[ApiKeyConfig(key="zhipu-key")],
+                    ),
+                    "openai_compatible_secondary": LLMProviderConfig(
+                        api_format="gemini",
+                        api_base_url="http://localhost:8317",
+                        models=[
+                            ProviderModelRef(id="gemini-3.1-pro", alias="gemini-3.1-pro-preview"),
+                            ProviderModelRef(id="gemini-3-flash"),
+                        ],
+                        api_keys=[ApiKeyConfig(key="gemini-key")],
+                    ),
+                    "openai_compatible_primary": LLMProviderConfig(
+                        api_format="openai_responses",
+                        api_base_url="${OPENAI_COMPAT_SECONDARY_BASE_URL}",
+                        models=[ProviderModelRef(id="gpt-5.4")],
+                        api_keys=[ApiKeyConfig(key="openai_compatible_primary-key")],
+                    ),
+                },
+            )
+        )
+        service = AgentService(config_manager=SimpleNamespace(config=SimpleNamespace(agent=agent_config)))
+        service._initialized = True
+        service._providers = {"deepseek": object(), "zhipu": object(), "openai_compatible_secondary": object(), "openai_compatible_primary": object()}
+
+        statuses = {item["id"]: item for item in service.get_llm_provider_status_snapshot()}
+
+        self.assertEqual(statuses["deepseek"]["default_model"], "deepseek-v4-flash")
+        self.assertEqual(statuses["deepseek"]["default_model_id"], "deepseek-v4-flash")
+        self.assertEqual(statuses["zhipu"]["default_model"], "glm-5.1")
+        self.assertEqual(statuses["openai_compatible_secondary"]["default_model"], "gemini-3.1-pro-preview")
+        self.assertEqual(statuses["openai_compatible_secondary"]["default_model_id"], "gemini-3.1-pro")
+        self.assertEqual(statuses["openai_compatible_primary"]["default_model"], "gpt-5.4")
+        self.assertEqual(statuses["openai_compatible_primary"]["global_default_model"], "gpt-5.4")
+        self.assertTrue(statuses["deepseek"]["models"][0]["is_default"])
+        self.assertTrue(statuses["openai_compatible_primary"]["models"][0]["is_default"])
 
 
 if __name__ == "__main__":
