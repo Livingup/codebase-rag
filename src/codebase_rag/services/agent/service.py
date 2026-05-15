@@ -249,11 +249,13 @@ class AgentService:
 
         started = time.monotonic()
         try:
+            probe_headers = dict(model_ref.custom_headers or {})
+            probe_headers.setdefault("X-Relay-Session-Id", f"codebase-rag-probe-{provider_name}-{uuid.uuid4().hex}")
             response_received = await asyncio.wait_for(
                 provider.probe_stream(
                     api_key=api_key,
                     model=api_model,
-                    custom_headers=model_ref.custom_headers,
+                    custom_headers=probe_headers,
                 ),
                 timeout=timeout,
             )

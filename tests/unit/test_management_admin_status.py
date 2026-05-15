@@ -319,11 +319,13 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["model"], "first-model")
         self.assertEqual(result["api_model"], "api-first-model")
         self.assertTrue(result["response_received"])
-        self.assertEqual(provider.probe_calls, [{
-            "api_key": "probe-key",
-            "model": "api-first-model",
-            "custom_headers": {"X-Test": "probe"},
-        }])
+        self.assertEqual(len(provider.probe_calls), 1)
+        self.assertEqual(provider.probe_calls[0]["api_key"], "probe-key")
+        self.assertEqual(provider.probe_calls[0]["model"], "api-first-model")
+        self.assertEqual(provider.probe_calls[0]["custom_headers"]["X-Test"], "probe")
+        self.assertTrue(provider.probe_calls[0]["custom_headers"]["X-Relay-Session-Id"].startswith(
+            "codebase-rag-probe-openai_compatible_primary-"
+        ))
         self.assertFalse(provider.chat_completion_called)
 
 
