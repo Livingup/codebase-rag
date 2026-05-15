@@ -319,32 +319,6 @@ agent:
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
         max_concurrency: 5                    # 该服务商最大并发请求数
-      openai_compatible_secondary:
-        api_format: "gemini"
-        api_base_url: "http://localhost:8317"
-        models:
-          - id: "gemini-3.1-pro"
-            alias: "gemini-3.1-pro-preview"
-            tool_choice: "auto"
-            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
-          - id: "gemini-3-flash"
-            alias: "gemini-3-flash-preview"
-            tool_choice: "auto"
-            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
-          - id: "gemini-2.5-flash"
-            tool_choice: "auto"
-            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
-          - id: "gemini-2.5-pro"
-            tool_choice: "auto"
-            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":24576}}}'
-        api_keys:
-          - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
-        retry:
-          max_retries_per_key: 3
-          retry_base_delay: 1.0
-          retry_backoff_multiplier: 2.0
-          key_cooldown_seconds: 60
-        max_concurrency: 10                   # 该服务商最大并发请求数
       # custom_openai_compatible:
       #   api_format: "openai_responses"
       #   api_base_url: "${CUSTOM_OPENAI_COMPAT_BASE_URL}"
@@ -637,18 +611,6 @@ workflow:
     max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3-flash"
-        priority: 10
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3.1-pro"
-        priority: 20
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-pro"
-        priority: 30
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 40
       - provider: "deepseek"
         model: "deepseek-v4-flash"
         priority: 50
@@ -662,18 +624,6 @@ workflow:
     timeout: 30                         # agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3-flash"
-        priority: 10
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3.1-pro"
-        priority: 20
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-pro"
-        priority: 30
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 40
       - provider: "deepseek"
         model: "deepseek-v4-flash"
         priority: 50
@@ -751,18 +701,6 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "openai_compatible_secondary"             # 引用 agent.llm.providers 中的 key
-        model: "gemini-3-flash"           # 引用该 provider 下 models[].id
-        priority: 1
-      - provider: "openai_compatible_secondary"
-        model: "gemini-3.1-pro"
-        priority: 2
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-pro"
-        priority: 3
-      - provider: "openai_compatible_secondary"
-        model: "gemini-2.5-flash"
-        priority: 4
       - provider: "deepseek"
         model: "deepseek-v4-flash"
         priority: 50
