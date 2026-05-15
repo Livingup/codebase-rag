@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from codebase_rag.common.keypool import KeyPool
 from codebase_rag.config.schema import (
     AgentConfig,
     ApiKeyConfig,
@@ -151,6 +152,24 @@ class _Qdrant:
         return {"ok": True, "status": "available", "message": "qdrant ok", "latency_ms": 1.0}
 
 
+class _ProbeProvider:
+    def __init__(self) -> None:
+        self.probe_calls = []
+        self.chat_completion_called = False
+
+    async def probe_stream(self, api_key: str, model: str, custom_headers=None) -> bool:
+        self.probe_calls.append({
+            "api_key": api_key,
+            "model": model,
+            "custom_headers": custom_headers,
+        })
+        return True
+
+    async def chat_completion(self, *args, **kwargs):
+        self.chat_completion_called = True
+        raise AssertionError("probe_llm_provider must not use full chat_completion")
+
+
 class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
     def _service(self) -> ManagementApiService:
         return ManagementApiService(
@@ -264,6 +283,48 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(statuses["openai_compatible_primary"]["global_default_model"], "gpt-5.4")
         self.assertTrue(statuses["deepseek"]["models"][0]["is_default"])
         self.assertTrue(statuses["openai_compatible_primary"]["models"][0]["is_default"])
+
+    async def test_llm_live_probe_uses_first_configured_model_and_stream_probe(self):
+        agent_config = AgentConfig(
+            llm=LLMConfig(
+                default_provider="openai_compatible_primary",
+                default_model="gpt-5.4",
+                providers={
+                    "openai_compatible_primary": LLMProviderConfig(
+                        api_format="openai_responses",
+                        api_base_url="${OPENAI_COMPAT_SECONDARY_BASE_URL}",
+                        models=[
+                            ProviderModelRef(
+                                id="first-model",
+                                alias="api-first-model",
+                                custom_headers={"X-Test": "probe"},
+                            ),
+                            ProviderModelRef(id="gpt-5.4"),
+                        ],
+                        api_keys=[ApiKeyConfig(key="probe-key")],
+                    ),
+                },
+            )
+        )
+        service = AgentService(config_manager=SimpleNamespace(config=SimpleNamespace(agent=agent_config)))
+        provider = _ProbeProvider()
+        service._initialized = True
+        service._providers = {"openai_compatible_primary": provider}
+        service._keypools = {"openai_compatible_primary": KeyPool(["probe-key"])}
+
+        result = await service.probe_llm_provider("openai_compatible_primary", timeout=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["model"], "first-model")
+        self.assertEqual(result["api_model"], "api-first-model")
+        self.assertTrue(result["response_received"])
+        self.assertEqual(provider.probe_calls, [{
+            "api_key": "probe-key",
+            "model": "api-first-model",
+            "custom_headers": {"X-Test": "probe"},
+        }])
+        self.assertFalse(provider.chat_completion_called)
 
 
 if __name__ == "__main__":

@@ -191,6 +191,33 @@ class AnthropicProvider(LLMProvider):
         except Exception:
             return False
 
+    async def probe_stream(
+        self,
+        api_key: str,
+        model: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        client = self._make_client(api_key)
+        headers = dict(custom_headers or {})
+        try:
+            async with client.messages.stream(
+                model=model,
+                max_tokens=1,
+                temperature=0.0,
+                messages=[MessageParam(role="user", content=".")],
+                extra_headers=headers,
+            ) as stream:
+                async for text in stream.text_stream:
+                    if text:
+                        return True
+            return False
+        except anthropic.AuthenticationError as e:
+            raise LLMAuthError(f"Anthropic auth error: {e}") from e
+        except anthropic.RateLimitError as e:
+            raise LLMRateLimitError(f"Anthropic rate limit: {e}") from e
+        except anthropic.APIError as e:
+            raise LLMAPIError(f"Anthropic API error: {e}") from e
+
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         """Count tokens via Anthropic SDK count_tokens API."""
         if not api_key:

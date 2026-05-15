@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from codebase_rag.services.agent.models import LLMResponse, Message, ToolSchema
+
+
+async def close_stream(stream: Any) -> None:
+    for method_name in ("close", "aclose"):
+        method = getattr(stream, method_name, None)
+        if not method:
+            continue
+        result = method()
+        if inspect.isawaitable(result):
+            await result
+        return
 
 
 class LLMProvider(ABC):
@@ -34,6 +46,22 @@ class LLMProvider(ABC):
     async def health_check(self, api_key: str) -> bool:
         """Check if a key is valid and the provider is reachable."""
         ...
+
+    async def probe_stream(
+        self,
+        api_key: str,
+        model: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        response = await self.chat_completion(
+            api_key=api_key,
+            messages=[Message(role="user", content=".")],
+            model=model,
+            max_output_tokens=1,
+            tool_choice="none",
+            custom_headers=custom_headers,
+        )
+        return bool(response.content or response.thinking_content or response.tool_calls)
 
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         """Count tokens for text. Subclasses should override with accurate implementation."""

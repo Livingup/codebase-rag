@@ -28,7 +28,7 @@ from codebase_rag.services.agent.models import (
     ToolCall,
     ToolSchema,
 )
-from codebase_rag.services.agent.providers.base import LLMProvider
+from codebase_rag.services.agent.providers.base import LLMProvider, close_stream
 
 logger = get_logger(__name__)
 
@@ -166,6 +166,42 @@ class DeepSeekProvider(LLMProvider):
             return True
         except Exception:
             return False
+
+    async def probe_stream(
+        self,
+        api_key: str,
+        model: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        client = self._make_client(api_key)
+        headers = dict(custom_headers or {})
+        stream = None
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=[ChatCompletionUserMessageParam(role="user", content=".")],
+                temperature=0.0,
+                max_tokens=1,
+                extra_headers=headers or None,
+                extra_body={"thinking": {"type": "disabled"}},
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content or getattr(delta, "reasoning_content", None) or delta.tool_calls:
+                    return True
+            return False
+        except openai.AuthenticationError as e:
+            raise LLMAuthError(f"DeepSeek auth error: {e}") from e
+        except openai.RateLimitError as e:
+            raise LLMRateLimitError(f"DeepSeek rate limit: {e}") from e
+        except openai.APIError as e:
+            raise LLMAPIError(f"DeepSeek API error: {e}") from e
+        finally:
+            if stream is not None:
+                await close_stream(stream)
 
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         enc = tiktoken.get_encoding("cl100k_base")

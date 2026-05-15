@@ -17,7 +17,7 @@ from codebase_rag.services.agent.models import (
     ToolCall,
     ToolSchema,
 )
-from codebase_rag.services.agent.providers.base import LLMProvider
+from codebase_rag.services.agent.providers.base import LLMProvider, close_stream
 
 logger = get_logger(__name__)
 
@@ -158,6 +158,57 @@ class GeminiLLMProvider(LLMProvider):
             return True
         except Exception:
             return False
+
+    async def probe_stream(
+        self,
+        api_key: str,
+        model: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        headers = dict(custom_headers or {})
+        http_opts_kwargs: dict = {}
+        if self._api_base_url:
+            http_opts_kwargs["baseUrl"] = self._api_base_url
+        if headers:
+            http_opts_kwargs["headers"] = headers
+        client_kwargs: dict = {"api_key": api_key}
+        if http_opts_kwargs:
+            client_kwargs["http_options"] = genai_types.HttpOptions(**http_opts_kwargs)
+        client = genai.Client(**client_kwargs)
+        contents = [
+            genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=".")])
+        ]
+        gen_config = genai_types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=1,
+        )
+        stream = None
+        try:
+            stream = await client.aio.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=gen_config,
+            )
+            async for chunk in stream:
+                if not chunk.candidates:
+                    continue
+                candidate = chunk.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    continue
+                for part in candidate.content.parts:
+                    if part.text or part.function_call:
+                        return True
+            return False
+        except Exception as e:
+            err_str = str(e).lower()
+            if "401" in err_str or "403" in err_str or "api key" in err_str:
+                raise LLMAuthError(f"Gemini auth error: {e}") from e
+            if "429" in err_str or "rate" in err_str or "quota" in err_str:
+                raise LLMRateLimitError(f"Gemini rate limit: {e}") from e
+            raise LLMAPIError(f"Gemini API error: {e}") from e
+        finally:
+            if stream is not None:
+                await close_stream(stream)
 
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         """Count tokens via Gemini countTokens API."""

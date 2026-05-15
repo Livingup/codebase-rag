@@ -27,7 +27,7 @@ from codebase_rag.services.agent.models import (
     ToolCall,
     ToolSchema,
 )
-from codebase_rag.services.agent.providers.base import LLMProvider
+from codebase_rag.services.agent.providers.base import LLMProvider, close_stream
 
 logger = get_logger(__name__)
 
@@ -156,6 +156,47 @@ class OpenAIResponsesProvider(LLMProvider):
             return True
         except Exception:
             return False
+
+    async def probe_stream(
+        self,
+        api_key: str,
+        model: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        client = self._make_client(api_key)
+        headers = dict(custom_headers or {})
+        stream = None
+        try:
+            stream = await client.responses.create(
+                model=model,
+                input=[EasyInputMessageParam(role="user", content=".")],
+                temperature=0.0,
+                max_output_tokens=1,
+                store=False,
+                stream=True,
+                extra_headers=headers or None,
+            )
+            async for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type in {
+                    "response.output_text.delta",
+                    "response.reasoning_summary_text.delta",
+                }:
+                    return True
+            return False
+        except openai.AuthenticationError as e:
+            raise LLMAuthError(f"OpenAI Responses auth error: {e}") from e
+        except openai.RateLimitError as e:
+            raise LLMRateLimitError(f"OpenAI Responses rate limit: {e}") from e
+        except openai.APIError as e:
+            err_str = str(e).lower()
+            if ("429" in err_str or "rate limit" in err_str or "rate_limit" in err_str
+                    or "concurrency" in err_str or "502" in err_str or "503" in err_str):
+                raise LLMRateLimitError(f"OpenAI Responses transient error (upstream): {e}") from e
+            raise LLMAPIError(f"OpenAI Responses API error: {e}") from e
+        finally:
+            if stream is not None:
+                await close_stream(stream)
 
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         """Count tokens via tiktoken (accurate for OpenAI models)."""

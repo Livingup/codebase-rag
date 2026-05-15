@@ -249,36 +249,40 @@ class AgentService:
 
         started = time.monotonic()
         try:
-            response = await asyncio.wait_for(
-                provider.chat_completion(
+            response_received = await asyncio.wait_for(
+                provider.probe_stream(
                     api_key=api_key,
-                    messages=[Message(role="user", content="ping")],
                     model=api_model,
-                    temperature=0.0,
-                    max_output_tokens=1,
-                    tool_choice="none",
-                    thinking_config=None,
                     custom_headers=model_ref.custom_headers,
                 ),
                 timeout=timeout,
             )
+            if not response_received:
+                await keypool.report_failure(api_key)
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "message": "Minimal LLM stream ended before any output token was received",
+                    "model": model_id,
+                    "api_model": api_model,
+                    "response_received": False,
+                }
             await keypool.report_success(api_key)
             return {
                 "ok": True,
                 "status": "available",
-                "message": "Minimal LLM chat request succeeded",
+                "message": "Minimal LLM stream produced the first output token",
                 "latency_ms": round((time.monotonic() - started) * 1000, 1),
                 "model": model_id,
                 "api_model": api_model,
-                "finish_reason": response.finish_reason,
-                "response_received": bool(response.content or response.thinking_content or response.tool_calls),
+                "response_received": True,
             }
         except asyncio.TimeoutError:
             await keypool.report_failure(api_key)
             return {
                 "ok": False,
                 "status": "timeout",
-                "message": f"Minimal LLM chat request timed out after {timeout:g}s",
+                "message": f"Minimal LLM stream request timed out after {timeout:g}s",
                 "model": model_id,
                 "api_model": api_model,
             }
@@ -304,7 +308,7 @@ class AgentService:
             return {
                 "ok": False,
                 "status": "error",
-                "message": f"Minimal LLM chat request failed: {str(exc)[:160]}",
+                "message": f"Minimal LLM stream request failed: {str(exc)[:160]}",
                 "model": model_id,
                 "api_model": api_model,
             }
@@ -330,11 +334,6 @@ class AgentService:
         return "available"
 
     def _select_probe_model_ref(self, provider_name: str, provider_cfg: LLMProviderConfig) -> ProviderModelRef:
-        default_model = self._config.llm.default_model
-        if provider_name == self._config.llm.default_provider:
-            for model_ref in provider_cfg.models:
-                if model_ref.id == default_model:
-                    return model_ref
         return provider_cfg.models[0]
 
     # =========================================================================
