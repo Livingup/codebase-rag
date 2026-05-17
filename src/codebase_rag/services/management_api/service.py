@@ -37,6 +37,7 @@ from codebase_rag.services.management_api.models import (
     ClientStatusResponse,
     DeleteProjectResponse,
     HealthResponse,
+    InvalidRequestError,
     ManagementApiError,
     ProjectDetailResponse,
     ProjectExistsError,
@@ -606,7 +607,6 @@ class ManagementApiService:
 
     async def get_client_status(self, live: bool = False) -> ClientStatusResponse:
         """Return external client and model provider availability for the dashboard."""
-        live_probe = live or self._config.client_status.live_probe_enabled
         timeout = self._config.client_status.live_probe_timeout
         embedding_status = self._embedding.get_client_status_snapshot()
         qdrant_status = self._qdrant.get_client_status_snapshot()
@@ -620,6 +620,7 @@ class ManagementApiService:
         llm_probe_results: Dict[str, Optional[Dict[str, Any]]] = {
             str(item["id"]): None for item in llm_status
         }
+        live_probe = live or self._config.client_status.live_probe_enabled
         if live_probe:
             dashscope_probe, gemini_probe, qdrant_probe, llm_probe_results = await asyncio.gather(
                 self._embedding.probe_sparse_provider(timeout),
@@ -633,6 +634,67 @@ class ManagementApiService:
                 "qdrant": qdrant_probe,
             }
 
+        return self._build_client_status_response(
+            embedding_status=embedding_status,
+            qdrant_status=qdrant_status,
+            llm_status=llm_status,
+            probe_results=probe_results,
+            llm_probe_results=llm_probe_results,
+            live_probe=live_probe,
+        )
+
+    async def probe_client_status(self, client_id: str) -> ClientStatusResponse:
+        timeout = self._config.client_status.live_probe_timeout
+        embedding_status = self._embedding.get_client_status_snapshot()
+        qdrant_status = self._qdrant.get_client_status_snapshot()
+        llm_status = self._agent.get_llm_provider_status_snapshot()
+        llm_provider_names = {str(item["id"]) for item in llm_status}
+        valid_client_ids = {
+            "dashscope_embedding",
+            "gemini_embedding",
+            "qdrant",
+            *(f"llm_provider:{provider_name}" for provider_name in llm_provider_names),
+        }
+        if client_id not in valid_client_ids:
+            raise InvalidRequestError(f"Client status item is not available for probing: {client_id}")
+
+        probe_results: Dict[str, Optional[Dict[str, Any]]] = {
+            "dashscope_embedding": None,
+            "gemini_embedding": None,
+            "qdrant": None,
+        }
+        llm_probe_results: Dict[str, Optional[Dict[str, Any]]] = {
+            str(item["id"]): None for item in llm_status
+        }
+
+        if client_id == "dashscope_embedding":
+            probe_results["dashscope_embedding"] = await self._embedding.probe_sparse_provider(timeout)
+        elif client_id == "gemini_embedding":
+            probe_results["gemini_embedding"] = await self._embedding.probe_dense_provider(timeout)
+        elif client_id == "qdrant":
+            probe_results["qdrant"] = await self._qdrant.probe_client(timeout)
+        else:
+            provider_name = client_id.split(":", 1)[1]
+            llm_probe_results[provider_name] = await self._agent.probe_llm_provider(provider_name, timeout)
+
+        return self._build_client_status_response(
+            embedding_status=embedding_status,
+            qdrant_status=qdrant_status,
+            llm_status=llm_status,
+            probe_results=probe_results,
+            llm_probe_results=llm_probe_results,
+            live_probe=True,
+        )
+
+    def _build_client_status_response(
+        self,
+        embedding_status: Dict[str, Any],
+        qdrant_status: Dict[str, Any],
+        llm_status: List[Dict[str, Any]],
+        probe_results: Dict[str, Optional[Dict[str, Any]]],
+        llm_probe_results: Dict[str, Optional[Dict[str, Any]]],
+        live_probe: bool,
+    ) -> ClientStatusResponse:
         clients = [
             self._build_embedding_client_item(
                 data=embedding_status["sparse"],

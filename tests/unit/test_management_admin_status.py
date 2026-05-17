@@ -17,6 +17,7 @@ from codebase_rag.config.schema import (
 )
 from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.management_api.admin_ui import require_local_request
+from codebase_rag.services.management_api.models import InvalidRequestError
 from codebase_rag.services.management_api.service import ManagementApiService
 
 
@@ -32,6 +33,8 @@ class _ConfigManager:
 class _Embedding:
     def __init__(self) -> None:
         self._initialized = True
+        self.dense_probe_calls = 0
+        self.sparse_probe_calls = 0
 
     def get_client_status_snapshot(self):
         return {
@@ -64,13 +67,19 @@ class _Embedding:
         }
 
     async def probe_dense_provider(self, timeout: float):
+        self.dense_probe_calls += 1
         return {"ok": True, "status": "available", "message": "dense ok", "latency_ms": 1.0}
 
     async def probe_sparse_provider(self, timeout: float):
+        self.sparse_probe_calls += 1
         return {"ok": True, "status": "available", "message": "sparse ok", "latency_ms": 1.0}
 
 
 class _Agent:
+    def __init__(self) -> None:
+        self.all_probe_calls = 0
+        self.single_probe_calls = []
+
     def get_llm_provider_status_snapshot(self):
         return [
             {
@@ -104,6 +113,7 @@ class _Agent:
         ]
 
     async def probe_llm_providers(self, timeout: float):
+        self.all_probe_calls += 1
         return {
             "zhipu": {
                 "ok": True,
@@ -117,9 +127,24 @@ class _Agent:
             }
         }
 
+    async def probe_llm_provider(self, provider_name: str, timeout: float):
+        self.single_probe_calls.append(provider_name)
+        return {
+            "ok": True,
+            "status": "available",
+            "message": f"single {provider_name} ok",
+            "latency_ms": 1.0,
+            "model": "glm-5.1",
+            "api_model": "glm-5.1",
+            "response_received": True,
+        }
+
 
 class _Qdrant:
     _initialized = True
+
+    def __init__(self) -> None:
+        self.probe_calls = 0
 
     def get_client_status_snapshot(self):
         return {
@@ -149,6 +174,7 @@ class _Qdrant:
         }
 
     async def probe_client(self, timeout: float):
+        self.probe_calls += 1
         return {"ok": True, "status": "available", "message": "qdrant ok", "latency_ms": 1.0}
 
 
@@ -219,6 +245,31 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.live_probe["message"], "Minimal LLM chat request succeeded")
         self.assertEqual(provider.live_probe["api_model"], "glm-5.1")
         self.assertTrue(provider.live_probe["response_received"])
+
+    async def test_single_client_probe_only_attaches_requested_llm_result(self):
+        service = self._service()
+        response = await service.probe_client_status("llm_provider:zhipu")
+
+        self.assertTrue(response.live_probe)
+        self.assertEqual(response.status, "available")
+        provider = next(client for client in response.clients if client.id == "llm_provider:zhipu")
+        self.assertEqual(provider.live_probe["message"], "single zhipu ok")
+        self.assertTrue(all(
+            client.live_probe is None
+            for client in response.clients
+            if client.id != "llm_provider:zhipu"
+        ))
+        self.assertEqual(service._agent.single_probe_calls, ["zhipu"])
+        self.assertEqual(service._agent.all_probe_calls, 0)
+        self.assertEqual(service._embedding.dense_probe_calls, 0)
+        self.assertEqual(service._embedding.sparse_probe_calls, 0)
+        self.assertEqual(service._qdrant.probe_calls, 0)
+
+    async def test_single_client_probe_rejects_unknown_item(self):
+        service = self._service()
+
+        with self.assertRaises(InvalidRequestError):
+            await service.probe_client_status("llm_provider:missing")
 
     def test_admin_ui_requires_local_request(self):
         require_local_request(SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")))

@@ -28,6 +28,7 @@ from codebase_rag.services.management_api.models import (
 from codebase_rag.services.management_api.admin_ui import require_local_request
 from codebase_rag.services.management_api.service import ManagementApiService
 from codebase_rag.services.management_api.models import (
+    InvalidRequestError,
     ManagementApiError,
     ProjectNotFoundError,
     ServiceUnavailableError,
@@ -168,6 +169,14 @@ def create_router(service: ManagementApiService) -> APIRouter:
     async def client_status(request: Request, live: bool = False):
         require_local_request(request)
         return await service.get_client_status(live=live)
+
+    @router.post("/status/clients/{client_id}/probe", response_model=ClientStatusResponse)
+    async def probe_client_status(request: Request, client_id: str):
+        require_local_request(request)
+        try:
+            return await service.probe_client_status(client_id)
+        except InvalidRequestError as e:
+            _error(404, "CLIENT_STATUS_ITEM_NOT_FOUND", str(e))
 
     @router.post("/config/reload", response_model=ReloadConfigResponse)
     async def reload_config():

@@ -117,6 +117,18 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
     }
     button.action.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
     button.action:disabled { opacity: 0.58; cursor: wait; }
+    .card-actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+    button.card-action {
+      border: 1px solid rgba(37, 99, 235, 0.24);
+      border-radius: 9px;
+      background: #eff6ff;
+      color: var(--primary);
+      padding: 8px 12px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 13px;
+    }
+    button.card-action:disabled { opacity: 0.58; cursor: wait; }
     .meta { color: var(--muted); font-size: 13px; }
     .summary {
       display: grid;
@@ -210,6 +222,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
     function setLoading(loading) {
       document.getElementById('refresh-btn').disabled = loading;
       document.getElementById('probe-btn').disabled = loading;
+      document.querySelectorAll('.single-probe-btn').forEach(button => { button.disabled = loading; });
     }
     function showError(message) {
       const box = document.getElementById('error-box');
@@ -248,6 +261,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
             ${badge(client.status)}
           </div>
           <dl>${detailRows({...details, provider: client.provider, endpoint: client.endpoint})}</dl>
+          <div class="card-actions"><button class="card-action single-probe-btn" data-client-id="${escapeHtml(client.id)}">单独测试</button></div>
           <div class="keys">
             <div class="keys-title">Key 状态</div>
             ${keys.length ? keys.map(k => {
@@ -276,8 +290,26 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
         setLoading(false);
       }
     }
+    async function probeOne(clientId) {
+      setLoading(true);
+      showError('');
+      try {
+        const response = await fetch(`/api/v1/status/clients/${encodeURIComponent(clientId)}/probe`, { method: 'POST', cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+        render(await response.json());
+      } catch (err) {
+        showError(`单独测试失败：${err.message || err}`);
+      } finally {
+        setLoading(false);
+      }
+    }
     document.getElementById('refresh-btn').addEventListener('click', () => load(false));
     document.getElementById('probe-btn').addEventListener('click', () => load(true));
+    document.getElementById('client-cards').addEventListener('click', (event) => {
+      const button = event.target.closest('.single-probe-btn');
+      if (!button) return;
+      probeOne(button.dataset.clientId);
+    });
     load(false);
   </script>
 </body>
