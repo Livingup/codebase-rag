@@ -224,6 +224,11 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
       document.getElementById('probe-btn').disabled = loading;
       document.querySelectorAll('.single-probe-btn').forEach(button => { button.disabled = loading; });
     }
+    function setSingleProbeLoading(button, loading) {
+      if (!button) return;
+      button.disabled = loading;
+      button.textContent = loading ? '测试中...' : '单独测试';
+    }
     function showError(message) {
       const box = document.getElementById('error-box');
       box.textContent = message;
@@ -290,8 +295,8 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
         setLoading(false);
       }
     }
-    async function probeOne(clientId) {
-      setLoading(true);
+    async function probeOne(clientId, button) {
+      setSingleProbeLoading(button, true);
       showError('');
       try {
         const response = await fetch(`/api/v1/status/clients/${encodeURIComponent(clientId)}/probe`, { method: 'POST', cache: 'no-store' });
@@ -300,7 +305,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
       } catch (err) {
         showError(`单独测试失败：${err.message || err}`);
       } finally {
-        setLoading(false);
+        setSingleProbeLoading(button, false);
       }
     }
     document.getElementById('refresh-btn').addEventListener('click', () => load(false));
@@ -308,7 +313,7 @@ _ADMIN_DASHBOARD_HTML = """<!doctype html>
     document.getElementById('client-cards').addEventListener('click', (event) => {
       const button = event.target.closest('.single-probe-btn');
       if (!button) return;
-      probeOne(button.dataset.clientId);
+      probeOne(button.dataset.clientId, button);
     });
     load(false);
   </script>
