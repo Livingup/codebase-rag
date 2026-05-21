@@ -157,9 +157,26 @@ PowerShell 5.1+
 Python 3.11+
 Git for Windows
 NSSM，用于注册 Windows Service
+ripgrep 14+，提供 rg.exe，用于 codebase_context_analysis 的本地源码搜索
 ```
 
 `nssm.exe` 需要在 PATH 中，或调用脚本时通过 `-NssmExe` 指定完整路径。
+`rg.exe` 需要在 PATH 中。Windows 推荐安装命令：
+
+```powershell
+winget install --id BurntSushi.ripgrep.MSVC -e
+```
+
+如果没有 `winget`，可从 ripgrep 官方 release 下载 Windows MSVC zip，解压后把包含 `rg.exe` 的目录加入系统 PATH。
+
+安装后验证：
+
+```powershell
+where.exe rg
+rg --version
+```
+
+如果在服务运行后才安装或更新 ripgrep，需要重启 CodebaseRAG 服务；Context Engine 会在首次使用 `codebase_context_analysis` 时检测并缓存 `rg.exe` 可用性。
 
 ## 5. 开发完成后的本地源码接管测试
 
