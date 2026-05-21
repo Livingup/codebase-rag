@@ -34,9 +34,10 @@ from codebase_rag.services.git_operations.service import (
     GitOperationsService,
     compute_file_version_id,
 )
+from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
+from codebase_rag.services.memory_qdrant.errors import NoActiveInstanceError
 from codebase_rag.services.memory_qdrant.models import ActiveInstanceInfo
 from codebase_rag.services.memory_qdrant.service import MemoryQdrantService
-from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.mcp_service.models import (
     AddFileFailure,
     AddFileSuccess,
@@ -150,14 +151,6 @@ class McpService:
         # Step 0: Resolve project_id from .git/codebase-rag/project_id
         project_id = self._read_project_id(project_path)
 
-        # Verify active instance exists
-        active = await self._memory.get_active_instance_info(project_id)
-        if not active:
-            raise ProjectNotIndexedError(
-                f"Project at '{project_path}' has no active index. "
-                f"Register it via the management API first."
-            )
-
         # ---- Stage 1: Vector recall ----
         recall_limit = self._reranker_config.recall_limit
 
@@ -177,12 +170,18 @@ class McpService:
         )
 
         # Hybrid search
-        candidates_raw = await self._memory.hybrid_search(
-            project_id=project_id,
-            query_dense=emb.dense_vector,
-            query_sparse=emb.sparse_vector,
-            top_k=recall_limit,
-        )
+        try:
+            candidates_raw = await self._memory.hybrid_search(
+                project_id=project_id,
+                query_dense=emb.dense_vector,
+                query_sparse=emb.sparse_vector,
+                top_k=recall_limit,
+            )
+        except NoActiveInstanceError as e:
+            raise ProjectNotIndexedError(
+                f"Project at '{project_path}' has no active index and lazy rebuild failed. "
+                f"Ensure the project is registered and indexed via the management API."
+            ) from e
 
         if not candidates_raw:
             logger.info("mcp_search_no_candidates", project_id=project_id)
