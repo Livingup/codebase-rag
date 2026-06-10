@@ -384,23 +384,42 @@ agent:
               X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"              
         api_keys:
           - key: "${OPENAI_COMPAT_PRIMARY_KEY_1}"
-          - key: "${openai_compatible_primary_codex_KEY_2}"
-          - key: "${openai_compatible_primary_codex_KEY_3}"
-          - key: "${openai_compatible_primary_codex_KEY_4}"
         retry:
           max_retries_per_key: 3
           retry_base_delay: 1.0
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
         max_concurrency: 5                    # 该服务商最大并发请求数                
-    default_provider: "openai_compatible_primary"
+      openai_compatible_secondary:
+        api_format: "openai_responses"
+        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+        models:
+          - id: "gpt-5.4"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:                    
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
+          - id: "gpt-5.5"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:                    
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"              
+        api_keys:
+          - key: "${OPENAI_COMPAT_SECONDARY_KEY_1}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 5                    # 该服务商最大并发请求数                
+    default_provider: "openai_compatible_secondary"
     default_model: "gpt-5.4"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
     providers:
       - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 10
-      - provider: "openai_compatible_primary"
+      - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
         priority: 20
     temperature: 0.0
@@ -620,7 +639,7 @@ workflow:
       - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 60
-      - provider: "openai_compatible_primary"
+      - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
         priority: 70
   gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
@@ -633,7 +652,7 @@ workflow:
       - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 60
-      - provider: "openai_compatible_primary"
+      - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
         priority: 70
   compensation:                           # 失败文件补偿任务配置
@@ -650,7 +669,7 @@ context_engine:
     - provider: "deepseek"
       model: "deepseek-v4-pro"
       priority: 10
-    - provider: "openai_compatible_primary"
+    - provider: "openai_compatible_secondary"
       model: "gpt-5.4"
       priority: 20
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
@@ -710,7 +729,7 @@ mcp:
       - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 60
-      - provider: "openai_compatible_primary"
+      - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
         priority: 70
     recall_limit: 80                    # Stage 1 向量召回最大候选数
