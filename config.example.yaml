@@ -411,7 +411,7 @@ agent:
           retry_base_delay: 1.0
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
-        max_concurrency: 5                    # 该服务商最大并发请求数                
+        max_concurrency: 100                  # 该服务商最大并发请求数                
     default_provider: "openai_compatible_secondary"
     default_model: "gpt-5.4"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
