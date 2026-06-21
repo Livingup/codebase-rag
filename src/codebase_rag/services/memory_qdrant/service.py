@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -156,7 +157,12 @@ class MemoryQdrantService:
     # =========================================================================
 
     async def create_instance(
-        self, project_id: str, branch_name: str, commit_hash: str
+        self,
+        project_id: str,
+        branch_name: str,
+        commit_hash: str,
+        *,
+        staging: bool = False,
     ) -> InstanceHandle:
         """Create an in-memory Qdrant instance and register in LRU cache.
 
@@ -164,18 +170,23 @@ class MemoryQdrantService:
             InstanceHandle (cache key string) for subsequent operations.
         """
         self._check_initialized()
-        key = _cache_key(project_id, branch_name, commit_hash)
+        base_key = _cache_key(project_id, branch_name, commit_hash)
+        key = f"{base_key}#staging:{uuid.uuid4()}" if staging else base_key
 
         async with self._lock:
-            # Already cached?
-            if key in self._cache:
+            # Already cached? Only non-staging instances reuse the stable branch@commit key.
+            if not staging and key in self._cache:
                 self._cache[key].touch()
                 self._cache.move_to_end(key)
                 logger.info("instance_cache_hit", cache_key=key)
                 return key
 
-            # Evict if cache full
-            await self._evict_if_needed()
+            # Evict if cache full. A staged replacement must never evict the
+            # same project's current active instance before successful promote.
+            await self._evict_if_needed(
+                protected_project_id=project_id if staging else None,
+                allow_over_capacity=staging,
+            )
 
             # Create in-memory client
             client = AsyncQdrantClient(location=":memory:")
@@ -503,6 +514,33 @@ class MemoryQdrantService:
             memory_usage_mb=round(mem_mb, 2),
         )
 
+    async def set_active_handle(self, handle: InstanceHandle) -> None:
+        """Promote an already-loaded cached handle as the active search target."""
+        async with self._lock:
+            if handle not in self._cache:
+                raise InstanceNotFoundError(
+                    f"Instance not in cache: {handle}. Create it first."
+                )
+            inst = self._cache[handle]
+            active_key = _cache_key(inst.project_id, inst.branch_name, inst.commit_hash)
+            if handle != active_key:
+                existing = self._cache.pop(active_key, None)
+                if existing is not None:
+                    await existing.client.close()
+                    logger.info("instance_replaced", cache_key=active_key)
+                self._cache[active_key] = self._cache.pop(handle)
+                handle = active_key
+            self._active[inst.project_id] = handle
+            inst.touch()
+            self._cache.move_to_end(handle)
+
+        logger.info(
+            "active_instance_set",
+            project_id=inst.project_id,
+            cache_key=handle,
+            point_count=inst.point_count,
+        )
+
     # =========================================================================
     # 2.8 Cache query
     # =========================================================================
@@ -553,19 +591,45 @@ class MemoryQdrantService:
                 key for key, inst in self._cache.items()
                 if inst.project_id == project_id
             ]
-            for key in keys_to_remove:
-                inst = self._cache.pop(key)
-                await inst.client.close()
-                logger.info("instance_destroyed", cache_key=key)
-
+            removed = await self._destroy_keys_locked(keys_to_remove)
             self._active.pop(project_id, None)
 
         logger.info(
             "all_instances_destroyed",
             project_id=project_id,
-            count=len(keys_to_remove),
+            count=removed,
         )
-        return len(keys_to_remove)
+        return removed
+
+    async def destroy_instance(self, handle: InstanceHandle) -> bool:
+        """Close and remove one cached instance by handle."""
+        async with self._lock:
+            if handle not in self._cache:
+                return False
+            inst = self._cache[handle]
+            await self._destroy_keys_locked([handle])
+            if self._active.get(inst.project_id) == handle:
+                self._active.pop(inst.project_id, None)
+
+        logger.info("instance_destroyed", cache_key=handle)
+        return True
+
+    async def destroy_inactive_instances(self, project_id: str) -> int:
+        """Close cached project instances except the currently active one."""
+        async with self._lock:
+            active_key = self._active.get(project_id)
+            keys_to_remove = [
+                key for key, inst in self._cache.items()
+                if inst.project_id == project_id and key != active_key
+            ]
+            removed = await self._destroy_keys_locked(keys_to_remove)
+
+        logger.info(
+            "inactive_instances_destroyed",
+            project_id=project_id,
+            count=removed,
+        )
+        return removed
 
     # =========================================================================
     # 2.10 Update cache commit hash
@@ -631,6 +695,18 @@ class MemoryQdrantService:
             raise InstanceNotFoundError(f"Instance not found or evicted: {handle}")
         return inst
 
+    async def _destroy_keys_locked(self, keys: List[str]) -> int:
+        """Close and remove cached instances. Caller must hold ``_lock``."""
+        removed = 0
+        for key in keys:
+            inst = self._cache.pop(key, None)
+            if inst is None:
+                continue
+            await inst.client.close()
+            logger.info("instance_destroyed", cache_key=key)
+            removed += 1
+        return removed
+
     async def _get_active_instance_or_rebuild(
         self, project_id: str,
     ) -> Tuple[_CachedInstance, str]:
@@ -688,17 +764,33 @@ class MemoryQdrantService:
             return None, ""
         return inst, key
 
-    async def _evict_if_needed(self) -> None:
+    async def _evict_if_needed(
+        self,
+        protected_project_id: Optional[str] = None,
+        *,
+        allow_over_capacity: bool = False,
+    ) -> None:
         """Evict LRU instance if cache is full. Must hold lock.
 
         Eviction priority:
           1. Oldest non-active instance
           2. Oldest idle active instance (search idle > idle_timeout_minutes)
+
+        ``protected_project_id`` prevents staging reloads from evicting the same
+        project's active instance before a replacement has loaded successfully.
+        When no safe victim exists, ``allow_over_capacity`` lets a staging
+        replacement temporarily exceed the configured cache limit until promote
+        or failure cleanup runs.
         """
         if len(self._cache) < self._config.cache.max_branches:
             return
 
         active_keys = set(self._active.values())
+        protected_active_key = (
+            self._active.get(protected_project_id)
+            if protected_project_id is not None
+            else None
+        )
 
         # Priority 1: Find oldest non-active entry
         for key in self._cache:
@@ -711,6 +803,8 @@ class MemoryQdrantService:
         if idle_min > 0:
             now = datetime.now(timezone.utc)
             for key in self._cache:
+                if key == protected_active_key:
+                    continue
                 inst = self._cache[key]
                 idle_since = inst.last_search_time or inst.last_accessed
                 idle_seconds = (now - idle_since).total_seconds()
@@ -719,6 +813,15 @@ class MemoryQdrantService:
                     self._active.pop(inst.project_id, None)
                     await self._evict_instance(key)
                     return
+
+        if allow_over_capacity:
+            logger.warning(
+                "cache_over_capacity_allowed_for_staging",
+                cache_size=len(self._cache),
+                max_branches=self._config.cache.max_branches,
+                protected_project_id=protected_project_id,
+            )
+            return
 
         raise CacheFullError(
             f"Cache full ({len(self._cache)} instances) and all are active. "

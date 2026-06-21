@@ -427,49 +427,46 @@ class WorkflowOrchestratorService:
             unchanged=len(unchanged),
         )
 
-        # Step 5: Create new in-memory instance
+        # Step 5: Create a staging in-memory instance and keep the old active
+        # searchable until the new instance has fully loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash,
+            project_id, branch_name, commit_hash, staging=True,
         )
 
-        # Step 6: Bulk copy unchanged + fetch to_add from Qdrant Server
-        file_sem = asyncio.Semaphore(self._config.branch_switch.max_diff_concurrency)
+        try:
+            # Step 6: Bulk copy unchanged + fetch to_add from Qdrant Server
+            all_needed = list(unchanged | to_add)
+            logger.info(
+                "workflow_branch_switch_loading",
+                project_id=project_id,
+                files_to_load=len(all_needed),
+            )
+            files_loaded, points_loaded = await self._batch_load_qdrant_to_memory(
+                project_id=project_id,
+                file_version_ids=all_needed,
+                handle=handle,
+                log_event="branch_switch_batch_load",
+            )
 
-        async def _fetch_and_upsert(fvid: str) -> None:
-            async with file_sem:
-                try:
-                    records = await self._qdrant.get_file_points(project_id, fvid)
-                    if records:
-                        points = self._records_to_point_structs(records)
-                        await self._memory.upsert_points(handle, points)
-                except Exception:
-                    logger.warning(
-                        "branch_switch_fetch_failed",
-                        project_id=project_id,
-                        file_version_id=fvid[:16],
-                    )
-
-        # Fetch unchanged + to_add
-        all_needed = list(unchanged | to_add)
-        logger.info(
-            "workflow_branch_switch_loading",
-            project_id=project_id,
-            files_to_load=len(all_needed),
-        )
-        tasks = [_fetch_and_upsert(fvid) for fvid in all_needed]
-        if tasks:
-            await asyncio.gather(*tasks)
-
-        # Step 8: Set as active
-        await self._memory.set_active_instance(
-            project_id, branch_name, commit_hash,
-        )
+            # Step 7: Promote only after the staged load succeeds.
+            await self._memory.set_active_handle(handle)
+            await self._memory.destroy_inactive_instances(project_id)
+        except Exception:
+            await self._memory.destroy_instance(handle)
+            logger.exception(
+                "workflow_branch_switch_staging_failed",
+                project_id=project_id,
+                branch=branch_name,
+                commit=commit_hash[:8],
+            )
+            raise
 
         duration = int(time.monotonic() * 1000 - start_ms)
         logger.info(
             "workflow_branch_switch_complete",
             project_id=project_id,
-            files_loaded=len(all_needed),
+            files_loaded=files_loaded,
+            points_loaded=points_loaded,
             added=len(to_add),
             removed=len(to_remove),
             unchanged=len(unchanged),
@@ -542,44 +539,41 @@ class WorkflowOrchestratorService:
         )
         all_fvids = [e.file_version_id for e in file_tree]
 
-        # Step 4: Create in-memory instance
+        # Step 4: Create a staging instance so an existing active instance is
+        # preserved until the replacement is fully loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash,
+            project_id, branch_name, commit_hash, staging=True,
         )
 
-        # Step 5: Batch load from Qdrant Server
-        file_sem = asyncio.Semaphore(
-            self._config.branch_switch.max_diff_concurrency,
-        )
+        try:
+            # Step 5: Batch load from Qdrant Server
+            files_loaded, points_loaded = await self._batch_load_qdrant_to_memory(
+                project_id=project_id,
+                file_version_ids=all_fvids,
+                handle=handle,
+                log_event="rebuild_memory_batch_load",
+            )
 
-        async def _fetch_and_upsert(fvid: str) -> None:
-            async with file_sem:
-                try:
-                    records = await self._qdrant.get_file_points(project_id, fvid)
-                    if records:
-                        points = self._records_to_point_structs(records)
-                        await self._memory.upsert_points(handle, points)
-                except Exception:
-                    logger.warning(
-                        "rebuild_fetch_failed",
-                        project_id=project_id,
-                        file_version_id=fvid[:16],
-                    )
-
-        if all_fvids:
-            await asyncio.gather(*[_fetch_and_upsert(fvid) for fvid in all_fvids])
-
-        # Step 6: Set as active
-        await self._memory.set_active_instance(
-            project_id, branch_name, commit_hash,
-        )
+            # Step 6: Promote the staged instance after successful load.
+            await self._memory.set_active_handle(handle)
+            await self._memory.destroy_inactive_instances(project_id)
+        except Exception:
+            await self._memory.destroy_instance(handle)
+            logger.exception(
+                "rebuild_memory_staging_failed",
+                project_id=project_id,
+                branch=branch_name,
+                commit=commit_hash[:8],
+            )
+            raise
 
         duration = int(time.monotonic() * 1000 - start_ms)
         logger.info(
             "rebuild_memory_complete",
             project_id=project_id,
             branch=branch_name,
-            files_loaded=len(all_fvids),
+            files_loaded=files_loaded,
+            points_loaded=points_loaded,
             duration_ms=duration,
         )
 
@@ -969,37 +963,31 @@ class WorkflowOrchestratorService:
         if pending_entries:
             await asyncio.gather(*[_process_init_file(e) for e in pending_entries])
 
-        # Step 5: Build in-memory instance
+        # Step 5: Build a staging in-memory instance, then promote only after
+        # all readable persistent points have been loaded successfully.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash,
+            project_id, branch_name, commit_hash, staging=True,
         )
+        try:
+            files_loaded, memory_points_loaded = await self._batch_load_qdrant_to_memory(
+                project_id=project_id,
+                file_version_ids=processed_fvids,
+                handle=handle,
+                log_event="workflow_init_memory_batch_load",
+            )
 
-        # Load all points from Qdrant into memory
-        fetch_sem = asyncio.Semaphore(
-            self._config.branch_switch.max_diff_concurrency,
-        )
-
-        async def _load_to_memory(fvid: str) -> None:
-            async with fetch_sem:
-                try:
-                    records = await self._qdrant.get_file_points(project_id, fvid)
-                    if records:
-                        points = self._records_to_point_structs(records)
-                        await self._memory.upsert_points(handle, points)
-                except Exception:
-                    logger.warning(
-                        "workflow_init_memory_load_failed",
-                        file_version_id=fvid[:16],
-                    )
-
-        load_tasks = [_load_to_memory(fvid) for fvid in processed_fvids]
-        if load_tasks:
-            await asyncio.gather(*load_tasks)
-
-        # Step 6: Set as active
-        await self._memory.set_active_instance(
-            project_id, branch_name, commit_hash,
-        )
+            # Step 6: Set as active
+            await self._memory.set_active_handle(handle)
+            await self._memory.destroy_inactive_instances(project_id)
+        except Exception:
+            await self._memory.destroy_instance(handle)
+            logger.exception(
+                "workflow_init_memory_staging_failed",
+                project_id=project_id,
+                branch=branch_name,
+                commit=commit_hash[:8],
+            )
+            raise
 
         self._current_tasks.pop(project_id, None)
 
@@ -1012,6 +1000,8 @@ class WorkflowOrchestratorService:
             processed=processed,
             skipped=skipped,
             failed=len(failed_files),
+            memory_files_loaded=files_loaded,
+            memory_points_loaded=memory_points_loaded,
             duration_s=round(duration, 2),
         )
 
@@ -1062,47 +1052,41 @@ class WorkflowOrchestratorService:
             existing_in_storage=len(existing_fvids),
         )
 
-        # Step 3: Create in-memory instance
+        # Step 3: Create a staging in-memory instance. Do not replace any
+        # existing active instance until all persisted points are loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash,
+            project_id, branch_name, commit_hash, staging=True,
         )
 
-        # Step 4: Load existing points from persistent storage into memory
-        fetch_sem = asyncio.Semaphore(
-            self._config.branch_switch.max_diff_concurrency,
-        )
-        loaded_count = 0
+        try:
+            # Step 4: Load existing points from persistent storage into memory
+            files_loaded, loaded_count = await self._batch_load_qdrant_to_memory(
+                project_id=project_id,
+                file_version_ids=existing_fvids,
+                handle=handle,
+                log_event="workflow_incremental_memory_batch_load",
+            )
 
-        async def _load_to_memory(fvid: str) -> None:
-            nonlocal loaded_count
-            async with fetch_sem:
-                try:
-                    records = await self._qdrant.get_file_points(project_id, fvid)
-                    if records:
-                        points = self._records_to_point_structs(records)
-                        await self._memory.upsert_points(handle, points)
-                        loaded_count += len(records)
-                except Exception:
-                    logger.warning(
-                        "workflow_incremental_memory_load_failed",
-                        file_version_id=fvid[:16],
-                    )
-
-        if existing_fvids:
-            load_tasks = [_load_to_memory(fvid) for fvid in existing_fvids]
-            await asyncio.gather(*load_tasks)
-
-        # Step 5: Set as active
-        await self._memory.set_active_instance(
-            project_id, branch_name, commit_hash,
-        )
+            # Step 5: Set as active only after the staged load succeeds.
+            await self._memory.set_active_handle(handle)
+            await self._memory.destroy_inactive_instances(project_id)
+        except Exception:
+            await self._memory.destroy_instance(handle)
+            logger.exception(
+                "workflow_incremental_memory_staging_failed",
+                project_id=project_id,
+                branch=branch_name,
+                commit=commit_hash[:8],
+            )
+            raise
 
         duration = time.monotonic() - start
 
         logger.info(
             "workflow_incremental_initialization_complete",
             project_id=project_id,
-            existing_files_loaded=len(existing_fvids),
+            existing_files_available=len(existing_fvids),
+            existing_files_loaded=files_loaded,
             points_loaded=loaded_count,
             duration_s=round(duration, 2),
         )
@@ -1361,6 +1345,47 @@ class WorkflowOrchestratorService:
     # Internal: memory helpers
     # =========================================================================
 
+    async def _batch_load_qdrant_to_memory(
+        self,
+        *,
+        project_id: str,
+        file_version_ids: List[str],
+        handle: str,
+        log_event: str,
+    ) -> tuple[int, int]:
+        """Batch-load readable persisted Qdrant records into a memory instance.
+
+        ``QdrantStorageService.get_files_points`` preserves the per-file complete
+        knowledge-set/readability contract, so this helper never treats arbitrary
+        matching payloads as sufficient for memory reload.
+        """
+        unique_fvids = list(dict.fromkeys(file_version_ids))
+        if not unique_fvids:
+            return 0, 0
+
+        grouped = await self._qdrant.get_files_points(project_id, unique_fvids)
+        loaded_files = 0
+        loaded_points = 0
+        for fvid in unique_fvids:
+            records = grouped.get(fvid, [])
+            if not records:
+                continue
+            points = self._records_to_point_structs(records)
+            if not points:
+                continue
+            await self._memory.upsert_points(handle, points)
+            loaded_files += 1
+            loaded_points += len(points)
+
+        logger.info(
+            log_event,
+            project_id=project_id,
+            files_requested=len(unique_fvids),
+            files_loaded=loaded_files,
+            points_loaded=loaded_points,
+        )
+        return loaded_files, loaded_points
+
     async def _upsert_to_memory_from_qdrant(
         self, project_id: str, file_version_id: str,
     ) -> None:
@@ -1375,15 +1400,18 @@ class WorkflowOrchestratorService:
         if handle is None:
             return
 
-        records = await self._qdrant.get_file_points(project_id, file_version_id)
-        if records:
-            points = self._records_to_point_structs(records)
-            await self._memory.upsert_points(handle, points)
+        _, loaded_points = await self._batch_load_qdrant_to_memory(
+            project_id=project_id,
+            file_version_ids=[file_version_id],
+            handle=handle,
+            log_event="memory_upsert_from_qdrant",
+        )
+        if loaded_points:
             logger.debug(
                 "memory_upsert_from_qdrant",
                 project_id=project_id,
                 file_version_id=file_version_id[:16],
-                points=len(points),
+                points=loaded_points,
             )
 
     async def _delete_from_memory(

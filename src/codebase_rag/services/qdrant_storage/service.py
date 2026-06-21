@@ -9,11 +9,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import uuid
 import time
-from typing import Dict, List, Optional, Set
+import uuid
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Dict, List, Optional, Set, TypeVar
 
+import httpx
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.config.loader import ConfigManager
@@ -26,6 +29,8 @@ from codebase_rag.services.qdrant_storage.errors import (
 from codebase_rag.services.qdrant_storage.models import PointData
 
 logger = get_logger(__name__)
+
+_T = TypeVar("_T")
 
 
 class QdrantStorageService:
@@ -41,6 +46,7 @@ class QdrantStorageService:
     def __init__(self, config_manager: ConfigManager) -> None:
         self._config_manager = config_manager
         self._client: Optional[AsyncQdrantClient] = None
+        self._client_lock = asyncio.Lock()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._initialized = False
 
@@ -58,18 +64,7 @@ class QdrantStorageService:
 
         conn = self._config.connection
         try:
-            self._client = AsyncQdrantClient(
-                host=conn.host,
-                port=conn.port,
-                grpc_port=conn.grpc_port,
-                api_key=conn.api_key,
-                prefer_grpc=conn.prefer_grpc,
-                https=conn.https,
-                timeout=conn.timeout,
-                grpc_options={
-                    "grpc.max_receive_message_length": -1,
-                },
-            )
+            self._client = self._create_client()
         except Exception as e:
             raise QdrantConnectionError(f"Failed to create Qdrant client: {e}") from e
 
@@ -269,51 +264,55 @@ class QdrantStorageService:
     async def get_file_points(
         self, project_id: str, file_version_id: str
     ) -> List[models.Record]:
-        """Get all Points for a file_version_id."""
+        """Get readable Points for a single file_version_id."""
+        grouped = await self.get_files_points(project_id, [file_version_id])
+        return grouped.get(file_version_id, [])
+
+    async def get_files_points(
+        self, project_id: str, file_version_ids: List[str]
+    ) -> Dict[str, List[models.Record]]:
+        """Batch-load readable Points for many file_version_ids.
+
+        The returned records are filtered per file_version_id using the same
+        complete-knowledge-set selection contract as ``get_file_points``: prefer
+        one complete chunked knowledge set and only fall back to legacy records
+        without knowledge_set_id when no complete chunked set exists.
+        """
         self._check_initialized()
-        assert self._client is not None
-        assert self._semaphore is not None
 
-        collection = self._config.collection.name
+        unique_fvids = list(dict.fromkeys(file_version_ids))
+        selected: Dict[str, List[models.Record]] = {fvid: [] for fvid in unique_fvids}
+        if not unique_fvids:
+            return selected
 
-        records = []
-        offset = None
-        while True:
-            async with self._semaphore:
-                batch, next_offset = await self._client.scroll(
-                    collection_name=collection,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="file_version_id",
-                                match=models.MatchValue(value=file_version_id),
-                            ),
-                            models.FieldCondition(
-                                key="project_id",
-                                match=models.MatchValue(value=project_id),
-                            ),
-                        ]
-                    ),
-                    limit=self._config.scroll_batch_size,
-                    offset=offset,
-                    with_vectors=True,
-                    with_payload=True,
+        start = time.monotonic()
+        raw_count = 0
+        batch_size = self._config.scroll_batch_size
+        for i in range(0, len(unique_fvids), batch_size):
+            fvid_batch = unique_fvids[i : i + batch_size]
+            records = await self._scroll_records(
+                scroll_filter=self._project_file_versions_filter(project_id, fvid_batch),
+                with_vectors=True,
+                with_payload=True,
+            )
+            raw_count += len(records)
+            grouped = self._group_records_by_file_version(records)
+            for fvid in fvid_batch:
+                selected[fvid] = self._select_readable_knowledge_set(
+                    grouped.get(fvid, []),
                 )
-            records.extend(batch)
-            if next_offset is None:
-                break
-            offset = next_offset
 
-        selected_records = self._select_readable_knowledge_set(records)
-
-        logger.debug(
-            "get_file_points",
+        elapsed = time.monotonic() - start
+        loaded_files = sum(1 for records in selected.values() if records)
+        logger.info(
+            "get_files_points",
             project_id=project_id,
-            file_version_id=file_version_id[:16],
-            records_count=len(records),
-            selected_count=len(selected_records),
+            total_requested=len(unique_fvids),
+            files_loaded=loaded_files,
+            raw_records=raw_count,
+            elapsed_ms=round(elapsed * 1000, 1),
         )
-        return selected_records
+        return selected
 
     # =========================================================================
     # 2.4 Check existence (content-addressing dedup)
@@ -322,65 +321,49 @@ class QdrantStorageService:
     async def check_existence(
         self, project_id: str, file_version_ids: List[str]
     ) -> Dict[str, bool]:
-        """Check which file_version_ids already have Points stored.
+        """Check which file_version_ids already have readable Points stored.
 
-        Core interface for content-addressed deduplication.
+        Core interface for content-addressed deduplication. Batched reads still
+        preserve the file-level completeness contract instead of accepting any
+        raw payload hit as a usable knowledge set.
         """
         self._check_initialized()
-        assert self._client is not None
-        assert self._semaphore is not None
 
-        collection = self._config.collection.name
-        result: Dict[str, bool] = {}
-
-        async def _check_one(fvid: str) -> None:
-            records = []
-            offset = None
-            while True:
-                async with self._semaphore:
-                    batch, next_offset = await self._client.scroll(
-                        collection_name=collection,
-                        scroll_filter=models.Filter(
-                            must=[
-                                models.FieldCondition(
-                                    key="file_version_id",
-                                    match=models.MatchValue(value=fvid),
-                                ),
-                                models.FieldCondition(
-                                    key="project_id",
-                                    match=models.MatchValue(value=project_id),
-                                ),
-                            ]
-                        ),
-                        limit=self._config.scroll_batch_size,
-                        offset=offset,
-                        with_vectors=False,
-                        with_payload=[
-                            "knowledge_set_id",
-                            "chunk_index",
-                            "chunk_count",
-                        ],
-                    )
-                records.extend(batch)
-                if next_offset is None:
-                    break
-                offset = next_offset
-            result[fvid] = self._has_complete_knowledge_set(records)
+        unique_fvids = list(dict.fromkeys(file_version_ids))
+        result: Dict[str, bool] = {fvid: False for fvid in unique_fvids}
+        if not unique_fvids:
+            return result
 
         start = time.monotonic()
+        raw_count = 0
         batch_size = self._config.scroll_batch_size
-        for i in range(0, len(file_version_ids), batch_size):
-            batch = file_version_ids[i : i + batch_size]
-            tasks = [_check_one(fvid) for fvid in batch]
-            await asyncio.gather(*tasks)
+        for i in range(0, len(unique_fvids), batch_size):
+            fvid_batch = unique_fvids[i : i + batch_size]
+            records = await self._scroll_records(
+                scroll_filter=self._project_file_versions_filter(project_id, fvid_batch),
+                with_vectors=False,
+                with_payload=[
+                    "file_version_id",
+                    "knowledge_set_id",
+                    "chunk_index",
+                    "chunk_count",
+                ],
+            )
+            raw_count += len(records)
+            grouped = self._group_records_by_file_version(records)
+            for fvid in fvid_batch:
+                result[fvid] = self._has_complete_knowledge_set(
+                    grouped.get(fvid, []),
+                )
 
         existing_count = sum(1 for v in result.values() if v)
         elapsed = time.monotonic() - start
         logger.info(
             "check_existence",
             project_id=project_id,
-            total_checked=len(file_version_ids),
+            total_checked=len(unique_fvids),
             existing=existing_count,
+            raw_records=raw_count,
             elapsed_ms=round(elapsed * 1000, 1),
         )
         return result
@@ -544,6 +527,147 @@ class QdrantStorageService:
             raise RuntimeError(
                 "QdrantStorageService is not initialized. Call initialize() first."
             )
+
+    def _create_client(self) -> AsyncQdrantClient:
+        conn = self._config.connection
+        return AsyncQdrantClient(
+            host=conn.host,
+            port=conn.port,
+            grpc_port=conn.grpc_port,
+            prefer_grpc=conn.prefer_grpc,
+            https=conn.https,
+            api_key=conn.api_key,
+            timeout=conn.timeout,
+            pool_size=max(self._config.max_concurrency * 2, 10),
+        )
+
+    async def _reset_client(self) -> None:
+        """Recreate the long-lived Qdrant client after transport pool failures."""
+        async with self._client_lock:
+            old_client = self._client
+            self._client = self._create_client()
+            if old_client is not None:
+                try:
+                    await old_client.close()
+                except Exception:
+                    logger.debug("qdrant_old_client_close_failed", exc_info=True)
+        logger.warning("qdrant_client_recreated")
+
+    async def _request_with_recovery(
+        self,
+        operation_name: str,
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        max_attempts = 3
+        base_delay = 0.25
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await operation()
+            except Exception as e:
+                if attempt >= max_attempts or not self._is_recoverable_client_error(e):
+                    raise
+                logger.warning(
+                    "qdrant_operation_recoverable_error",
+                    operation=operation_name,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    error=str(e)[:300],
+                )
+                await self._reset_client()
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+        raise RuntimeError(f"unreachable retry state for {operation_name}")
+
+    @staticmethod
+    def _is_recoverable_client_error(error: Exception) -> bool:
+        if isinstance(error, httpx.PoolTimeout):
+            return True
+        if isinstance(error, ResponseHandlingException):
+            return True
+        cause = error.__cause__
+        while cause is not None:
+            if isinstance(cause, httpx.PoolTimeout):
+                return True
+            cause = cause.__cause__
+        return False
+
+    async def _scroll_records(
+        self,
+        *,
+        scroll_filter: models.Filter,
+        with_vectors: bool,
+        with_payload: bool | List[str],
+    ) -> List[models.Record]:
+        self._check_initialized()
+        assert self._semaphore is not None
+
+        collection = self._config.collection.name
+        records: List[models.Record] = []
+        offset = None
+        while True:
+            async with self._semaphore:
+                batch, next_offset = await self._request_with_recovery(
+                    "scroll",
+                    lambda: self._scroll_once(
+                        collection=collection,
+                        scroll_filter=scroll_filter,
+                        offset=offset,
+                        with_vectors=with_vectors,
+                        with_payload=with_payload,
+                    ),
+                )
+            records.extend(batch)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return records
+
+    async def _scroll_once(
+        self,
+        *,
+        collection: str,
+        scroll_filter: models.Filter,
+        offset,
+        with_vectors: bool,
+        with_payload: bool | List[str],
+    ):
+        assert self._client is not None
+        return await self._client.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=self._config.scroll_batch_size,
+            offset=offset,
+            with_vectors=with_vectors,
+            with_payload=with_payload,
+        )
+
+    @staticmethod
+    def _project_file_versions_filter(
+        project_id: str, file_version_ids: Iterable[str],
+    ) -> models.Filter:
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="project_id",
+                    match=models.MatchValue(value=project_id),
+                ),
+                models.FieldCondition(
+                    key="file_version_id",
+                    match=models.MatchAny(any=list(file_version_ids)),
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _group_records_by_file_version(
+        records: Iterable[models.Record],
+    ) -> Dict[str, List[models.Record]]:
+        grouped: Dict[str, List[models.Record]] = {}
+        for record in records:
+            payload = record.payload or {}
+            fvid = payload.get("file_version_id")
+            if isinstance(fvid, str):
+                grouped.setdefault(fvid, []).append(record)
+        return grouped
 
     @staticmethod
     def _point_id(

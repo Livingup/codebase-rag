@@ -481,9 +481,9 @@ class ManagementApiService:
         branch = head.branch_name or "HEAD"
         task_id = str(uuid.uuid4())
 
-        if force:
-            await self._memory.destroy_all_instances(project_id)
-
+        # Force rebuild is intentionally non-destructive: workflow initialization
+        # now loads a staged replacement and promotes it only after success, so
+        # the existing active in-memory instance remains searchable during reload.
         self._workflow.enqueue_initialization(project_id, branch, head.commit_hash)
 
         logger.info(
