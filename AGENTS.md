@@ -81,7 +81,7 @@ unregister-local-service.ps1  # 卸载 Windows Service
 start-local-service.ps1       # 启动正式服务并执行健康检查
 stop-local-service.ps1        # 停止正式服务
 restart-local-service.ps1     # 重启正式服务并执行健康检查
-refresh-local-service-config.ps1 # 使用最新 config.example.yaml 刷新正式 config.yaml，默认热 reload，可选重启服务
+refresh-local-service-config.ps1 # 同步真实 .env 和最新 config.example.yaml 到正式配置目录，默认热 reload，可选重启服务
 doctor-local-service.ps1      # 本地诊断 Python/Git/目录/端口/健康检查
 start-source-takeover.ps1     # 停正式服务，用本地最新源码接管正式配置启动测试
 push-source-to-remote.ps1     # 提交并推送源码到远程 Git 仓库
@@ -104,21 +104,14 @@ Copy-Item .\.env.example .\.env
 notepad .\.env
 ```
 
-运行服务必填：
+运行服务必填项不在本文档手工枚举，统一按当前 `config.example.yaml` 的占位符确定：
 
-```text
-CODEBASE_RAG_DATA_DIR
-QDRANT_API_KEY
-DASHSCOPE_API_KEY
-GEMINI_EMBED_KEY_1
-```
+- 当前启用配置中出现的 `${变量名}`，真实 `.env` 必须提供同名变量且值非空。
+- 注释示例中的 provider、模型或外部服务占位符，只有在取消注释并启用后才需要提供。
+- `config.example.yaml` 发生变更后，应同步检查 `.env.example` 和真实 `.env`，确保新增占位符都有对应变量。
+- `.env.example` 允许同时包含运维脚本使用的变量；这类变量不一定出现在 `config.example.yaml` 中，但应能被对应脚本读取。
 
-同步源码到远程 Git 仓库可选填写：
-
-```text
-CODEBASE_RAG_GIT_REMOTE
-CODEBASE_RAG_GIT_BRANCH
-```
+同步源码到远程 Git 仓库、安装目录、服务名、健康检查地址等运维脚本参数，按实际使用的脚本要求在 `.env` 中填写。
 
 通用脚本读取 `.env` 的顺序：
 
@@ -377,15 +370,14 @@ Copy-Item .\.env.example .\.env
 notepad .\.env
 ```
 
-必须填写：
+必须填写规则：
 
-- `CODEBASE_RAG_DATA_DIR`：本地数据存储目录路径。
-- `QDRANT_API_KEY`：Qdrant 向量数据库 API Key。
-- `DASHSCOPE_API_KEY`：阿里云 DashScope API Key（Embedding 用）。
-- `GEMINI_EMBED_KEY_1`：Google Gemini Embedding API Key。
-- 至少一个 Agent LLM Key（如 `ZHIPU_KEY_1`、`GEMINI_KEY_1` 等）。
+- 以当前 `config.example.yaml` 为准，凡是启用配置中出现的 `${变量名}`，真实 `.env` 必须提供同名变量且值非空。
+- Agent LLM Key 不按“至少一个”粗略判断，而是按当前启用的 provider、默认 provider、工作流队列、Context Engine、MCP reranker 等实际引用关系填写。
+- 注释掉的 provider 示例不要求填写；只有取消注释并启用后，才需要补齐其中的占位符变量。
+- 运维脚本变量按安装、注册服务、启动、健康检查、Git 推送等脚本的实际使用场景填写。
 
-没有的 Key 直接删掉该行，不要留空占位。
+没有启用、也没有被脚本使用的 Key 可以删掉；被当前启用配置或脚本引用的变量不得留空占位。
 
 ### 8.2 构建并解压本地安装包
 
@@ -463,50 +455,56 @@ git pull --ff-only
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
 
-### 9.1 仅配置模板变更时刷新并热 reload
+### 9.1 `.env` 与配置模板变更时更新服务
 
-如果本次只修改了 `config.example.yaml`，没有修改 Python 源码、依赖、运维脚本或入口逻辑，可以不重新构建 wheel、不重新安装程序目录，只刷新正式配置并触发配置热 reload。
+正式服务实际读取的是：
 
-服务不会自动监听 `config.yaml` 文件变化；配置热更新需要显式调用 Management API：
+```text
+${CODEBASE_RAG_DATA_DIR}\config\.env
+${CODEBASE_RAG_DATA_DIR}\config\config.yaml
+```
+
+源码仓库中的 `.env` 和 `config.example.yaml` 修改后，必须先同步到正式配置目录；服务不会自动监听这两个文件变化。
+
+配置热更新需要显式调用 Management API：
 
 ```text
 POST http://127.0.0.1:18080/api/v1/config/reload
 ```
 
-配置热 reload 会重新读取并校验正式 `config.yaml`，替换内存中的 `AppConfig`，并重新协调 Git watcher。大部分通过 `ConfigManager` 动态读取的业务参数无需重启即可生效。
+更新规则：
 
-在源码仓库根目录执行：
+| 修改内容 | 推荐命令 | 是否需要重启 | 原因 |
+| --- | --- | --- | --- |
+| 只修改 `.env` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart` | 需要 | `.env` 会被加载到服务进程环境中，已有环境变量和已初始化客户端不应只依赖热 reload 更新。 |
+| 只修改 `config.example.yaml` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env` | 通常不需要 | 脚本会刷新正式 `config.yaml`，默认调用 `/api/v1/config/reload` 并健康检查。 |
+| 同时修改 `.env` 和 `config.example.yaml` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart` | 需要 | 既要同步正式 `.env`，又要刷新正式 `config.yaml`；按 `.env` 变更处理，重启最稳妥。 |
 
-```powershell
-git pull --ff-only
-.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env
-```
+如果 `config.example.yaml` 的变更涉及服务启动期配置（如 Management API 端口、MCP 监听端口、日志初始化参数、已初始化客户端连接参数等），即使没有修改 `.env`，也应使用 `-Restart`。
 
-如果只想刷新正式 `config.yaml`，暂时不触发热 reload：
+如果只想把文件同步到正式配置目录，暂时不触发 reload 或重启：
 
 ```powershell
 .\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -SkipReload
 ```
 
-在解压后的本地安装包目录执行：
+在解压后的本地安装包目录执行同名脚本：
 
 ```powershell
 .\scripts\refresh-local-service-config.ps1 -EnvFile <path-to-real-env>
-```
-
-如果变更涉及服务启动期配置（如 Management API 端口、MCP 监听端口、日志初始化参数、已初始化客户端连接参数等），应强制重启服务：
-
-```powershell
-.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart
+.\scripts\refresh-local-service-config.ps1 -EnvFile <path-to-real-env> -Restart
 ```
 
 脚本会执行：
 
 1. 读取用户提供的真实 `.env`。
-2. 定位 `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`。
-3. 使用当前源码或安装包内的 `config.example.yaml` 覆盖正式 `config.yaml`。
-4. 默认调用 `/api/v1/config/reload` 触发热 reload 并执行健康检查。
-5. 如果传入 `-Restart`，重启 Windows Service 并执行健康检查。
+2. 定位 `${CODEBASE_RAG_DATA_DIR}\config`。
+3. 复制真实 `.env` 到 `${CODEBASE_RAG_DATA_DIR}\config\.env`，并校正其中的 `CODEBASE_RAG_DATA_DIR`。
+4. 使用当前源码或安装包内的 `config.example.yaml` 覆盖正式 `config.yaml`。
+5. 默认调用 `/api/v1/config/reload` 触发热 reload 并执行健康检查。
+6. 如果传入 `-Restart`，重启 Windows Service 并执行健康检查。
+
+如果 Python 源码、依赖、运维脚本或入口逻辑也发生变化，不使用本节的轻量刷新流程，应重新构建 zip 并执行 `update-from-zip.ps1`。
 
 ## 10. 日常运维命令
 

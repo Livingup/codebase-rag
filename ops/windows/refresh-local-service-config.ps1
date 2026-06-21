@@ -61,6 +61,23 @@ Ensure-Directory $configDir
 Copy-Item -Path $configTemplatePath -Destination $configPath -Force
 Write-Host "Config refreshed: $configPath"
 
+$envPath = Join-Path $configDir ".env"
+$resolvedEnvSource = (Resolve-Path $resolvedEnvFile).Path
+$resolvedEnvTarget = if (Test-Path $envPath) { (Resolve-Path $envPath).Path } else { $envPath }
+if ([String]::Compare($resolvedEnvSource, $resolvedEnvTarget, $true) -ne 0) {
+    Copy-Item -Path $resolvedEnvSource -Destination $envPath -Force
+}
+$envDataDir = $resolvedDataDir -replace "\\", "/"
+$envContent = Get-Content -Path $envPath -Raw
+if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {
+    $envContent = $envContent -replace "(?m)^CODEBASE_RAG_DATA_DIR=.*$", "CODEBASE_RAG_DATA_DIR=$envDataDir"
+}
+else {
+    $envContent = "CODEBASE_RAG_DATA_DIR=$envDataDir`r`n" + $envContent
+}
+Set-Content -Path $envPath -Value $envContent -Encoding UTF8
+Write-Host "Environment refreshed: $envPath"
+
 $ServiceName = Get-CodebaseRagServiceName $ServiceName
 $HealthUrl = Get-CodebaseRagHealthUrl $HealthUrl
 if (-not $ReloadUrl) {
