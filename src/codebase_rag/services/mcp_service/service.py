@@ -644,13 +644,56 @@ class McpService:
     ):
         """Process a single file for add_file_knowledge.
 
-        Validates tokens, verifies blob hash, generates embeddings, builds
-        PointData list, and submits through KnowledgeSyncService.
+        Verifies blob hash, fast-skips already published file versions, validates
+        tokens, generates embeddings, builds PointData list, and submits through
+        KnowledgeSyncService.
 
         Raises on any failure (token limit, file not found, etc).
         """
         assert self._git_ops is not None
         assert self._knowledge_sync is not None
+
+        # Verify the client-provided blob hash against current worktree content
+        # before accepting any idempotent skip.
+        current_blob_hash = await self._git_ops.get_workdir_blob_hash(
+            project_path, file_path,
+        )
+        if current_blob_hash != blob_hash:
+            raise ValueError(
+                "blob_hash mismatch for "
+                f"{file_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
+                "Please recompute the Git blob hash for the latest file content."
+            )
+        fvid = compute_file_version_id(file_path, blob_hash)
+
+        try:
+            existing_result = await self._knowledge_sync.try_skip_existing_file_version(
+                project_id=project_id,
+                file_path=file_path,
+                file_version_id=fvid,
+                update_latest=True,
+                update_memory=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "add_file_knowledge_existing_fast_path_failed",
+                project_id=project_id,
+                file_path=file_path,
+                file_version_id=fvid[:16],
+                error=str(e)[:200],
+            )
+        else:
+            if existing_result is not None:
+                logger.info(
+                    "add_file_knowledge_submitted",
+                    project_id=project_id,
+                    file_path=file_path,
+                    file_version_id=fvid[:16],
+                    points=len(descriptions),
+                    published=existing_result.published,
+                    skipped_existing=existing_result.skipped_existing,
+                )
+                return existing_result
 
         # Token validation
         over_limit: List[str] = []
@@ -664,18 +707,6 @@ class McpService:
             raise ValueError(
                 "Token limit exceeded: " + "; ".join(over_limit)
             )
-
-        # Verify the client-provided blob hash against current worktree content
-        current_blob_hash = await self._git_ops.get_workdir_blob_hash(
-            project_path, file_path,
-        )
-        if current_blob_hash != blob_hash:
-            raise ValueError(
-                "blob_hash mismatch for "
-                f"{file_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
-                "Please recompute the Git blob hash for the latest file content."
-            )
-        fvid = compute_file_version_id(file_path, blob_hash)
 
         # Generate embeddings (dense + sparse) for all descriptions
         embeddings = await self._embedding.embed(descriptions, is_query=False)

@@ -148,6 +148,48 @@ class KnowledgeSyncService:
                 )
             return result
 
+    async def try_skip_existing_file_version(
+        self,
+        project_id: str,
+        file_path: str,
+        file_version_id: str,
+        old_file_version_id: Optional[str] = None,
+        update_latest: bool = True,
+        update_memory: bool = True,
+    ) -> Optional[KnowledgeSyncResult]:
+        """Return a skipped-existing result if Qdrant already has this file version.
+
+        This is a pre-embedding fast path for idempotent client submissions.
+        It only handles complete, already published knowledge sets and never
+        publishes or reuses pending jobs; callers can fall back to the normal
+        submit_points path when ``None`` is returned.
+        """
+        self._check_initialized()
+        file_lock_key = self._file_lock_key(project_id, file_path)
+        version_lock_key = self._version_lock_key(project_id, file_version_id)
+        async with self._file_locks[file_lock_key]:
+            async with self._version_locks[version_lock_key]:
+                existing = await self._qdrant.check_existence(project_id, [file_version_id])
+                if not existing.get(file_version_id, False):
+                    return None
+
+                if update_latest:
+                    self._store.set_latest(project_id, file_path, file_version_id)
+                    self._store.cancel_stale_file_jobs(
+                        project_id, file_path, file_version_id,
+                    )
+                self._store.remove_job(project_id, file_version_id)
+                if update_memory:
+                    await self.upsert_memory_from_qdrant(
+                        project_id, file_version_id, old_file_version_id,
+                    )
+                return KnowledgeSyncResult(
+                    file_version_id=file_version_id,
+                    points_count=0,
+                    published=False,
+                    skipped_existing=True,
+                )
+
     async def retry_ready_jobs(
         self,
         project_id: Optional[str] = None,
