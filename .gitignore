@@ -21,6 +21,8 @@ Thumbs.db
 
 # Data
 data/
+data-temp/
+docs/
 
 # Test / Coverage
 .pytest_cache/

@@ -58,13 +58,13 @@ embedding:
 # --- 01-Qdrant 存储服务 ---
 qdrant_storage:
   connection:
-    host: "${QDRANT_HOST}"         # 中心化 Qdrant：腾讯云 NAT VPS（多用户共享同一仓库知识库）
-    port: ${QDRANT_PORT}                          # NAT 公网端口 → 容器内 8443 (HTTPS REST via Caddy)
-    grpc_port: ${QDRANT_GRPC_PORT}                     # NAT 公网端口 → 容器内 6334 (gRPC)
-    prefer_grpc: false                   # 公网链路优先 HTTP，gRPC 经 NAT 复杂度高
-    https: true
-    timeout: 60                          # 公网链路加大超时（秒）
-    api_key: "${QDRANT_API_KEY}"         # 远程 Qdrant 鉴权密钥，存放在 .env
+    host: "${QDRANT_HOST}"               # Qdrant 服务地址，真实值存放在私有 .env
+    port: ${QDRANT_PORT}                  # Qdrant REST 端口，真实值存放在私有 .env
+    grpc_port: ${QDRANT_GRPC_PORT}        # Qdrant gRPC 端口，真实值存放在私有 .env
+    prefer_grpc: false                   # 公网链路通常优先 HTTP；按实际部署调整
+    https: ${QDRANT_HTTPS}
+    timeout: 60                          # 外部服务链路超时（秒）
+    api_key: "${QDRANT_API_KEY}"         # Qdrant 鉴权密钥，存放在私有 .env
   collection:
     name: "codebase"
     dense_vector:
@@ -283,7 +283,7 @@ agent:
       #     retry_backoff_multiplier: 2.0
       #     key_cooldown_seconds: 60
       #   max_concurrency: 5                  # 该服务商最大并发请求数
-      # kiro:
+      # custom_anthropic_compatible:
       #   api_format: "anthropic"
       #   api_base_url: "${CUSTOM_ANTHROPIC_COMPAT_BASE_URL}"
       #   models:
@@ -326,6 +326,8 @@ agent:
       #     - id: "gpt-5.4"
       #       tool_choice: "auto"
       #       thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+      #       custom_headers:
+      #         X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
       #   api_keys:
       #     - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
       #   retry:
@@ -334,54 +336,20 @@ agent:
       #     retry_backoff_multiplier: 2.0
       #     key_cooldown_seconds: 60
       #   max_concurrency: 5                  # 该服务商最大并发请求数
-#      custom_openai_compatible:
-#        api_format: "openai_responses"
-#        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
-#        models:
-#          - id: "gpt-5.4"
-#            tool_choice: "auto"
-#            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-#            custom_headers:
-#              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
-#        api_keys:
-#          - key: "${CUSTOM_OPENAI_COMPAT_KEY_1}"
-#        retry:
-#          max_retries_per_key: 3
-#          retry_base_delay: 1.0
-#          retry_backoff_multiplier: 2.0
-#          key_cooldown_seconds: 60
-#        max_concurrency: 2                    # 该服务商最大并发请求数
-#      custom_openai_compatible:
-#        api_format: "openai_responses"
-#        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
-#        models:
-#          - id: "gpt-5.4"
-#            tool_choice: "auto"
-#            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-#            custom_headers:
-#              X-Relay-Endpoint-Id: "${CUSTOM_OPENAI_COMPAT_ENDPOINT_ID}"
-#        api_keys:
-#          - key: "${custom_openai_compatible_KEY_1}"
-#        retry:
-#          max_retries_per_key: 3
-#          retry_base_delay: 1.0
-#          retry_backoff_multiplier: 2.0
-#          key_cooldown_seconds: 60
-#        max_concurrency: 5                    # 该服务商最大并发请求数
       openai_compatible_primary:
         api_format: "openai_responses"
-        api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
+        api_base_url: "${OPENAI_COMPAT_PRIMARY_BASE_URL}"
         models:
           - id: "gpt-5.4"
             tool_choice: "auto"
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-            custom_headers:                    
+            custom_headers:
               X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"
           - id: "gpt-5.5"
             tool_choice: "auto"
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-            custom_headers:                    
-              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"              
+            custom_headers:
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_PRIMARY_ENDPOINT_ID}"
         api_keys:
           - key: "${OPENAI_COMPAT_PRIMARY_KEY_1}"
         retry:
@@ -389,7 +357,7 @@ agent:
           retry_base_delay: 1.0
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
-        max_concurrency: 5                    # 该服务商最大并发请求数                
+        max_concurrency: 5                    # 该服务商最大并发请求数
       openai_compatible_secondary:
         api_format: "openai_responses"
         api_base_url: "${OPENAI_COMPAT_SECONDARY_BASE_URL}"
@@ -397,13 +365,13 @@ agent:
           - id: "gpt-5.4"
             tool_choice: "auto"
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-            custom_headers:                    
+            custom_headers:
               X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
           - id: "gpt-5.5"
             tool_choice: "auto"
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
-            custom_headers:                    
-              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"              
+            custom_headers:
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
         api_keys:
           - key: "${OPENAI_COMPAT_SECONDARY_KEY_1}"
         retry:
@@ -411,7 +379,7 @@ agent:
           retry_base_delay: 1.0
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
-        max_concurrency: 100                  # 该服务商最大并发请求数                
+        max_concurrency: 100                  # 该服务商最大并发请求数
     default_provider: "openai_compatible_secondary"
     default_model: "gpt-5.4"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
