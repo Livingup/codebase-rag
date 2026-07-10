@@ -133,6 +133,20 @@ agent:
         compression_threshold: 300000
         supports_tool_calling: true
         supports_structured_output: true
+      gpt-5.6-luna:
+        name: "gpt-5.6-luna"
+        context_window: 1050000
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
+      gpt-5.6-terra:
+        name: "gpt-5.6-terra"
+        context_window: 1050000
+        max_output_tokens: 128000
+        compression_threshold: 300000
+        supports_tool_calling: true
+        supports_structured_output: true
       gpt-5.5:
         name: "gpt-5.5"
         context_window: 400000
@@ -372,6 +386,16 @@ agent:
             thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
             custom_headers:
               X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
+          - id: "gpt-5.6-luna"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
+          - id: "gpt-5.6-terra"
+            tool_choice: "auto"
+            thinking: '{"reasoning":{"effort":"xhigh","summary":"auto"}}'
+            custom_headers:
+              X-Relay-Endpoint-Id: "${OPENAI_COMPAT_SECONDARY_ENDPOINT_ID}"
         api_keys:
           - key: "${OPENAI_COMPAT_SECONDARY_KEY_1}"
         retry:
@@ -380,16 +404,19 @@ agent:
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
         max_concurrency: 100                  # 该服务商最大并发请求数
-    default_provider: "openai_compatible_secondary"
-    default_model: "gpt-5.4"
+    default_provider: "deepseek"
+    default_model: "deepseek-v4-pro"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
     providers:
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
+      - provider: "openai_compatible_secondary"
+        model: "gpt-5.6-terra"
         priority: 10
       - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
         priority: 20
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 30
     temperature: 0.0
     timeout: 600                            # 压缩 agent 超时（秒）
 
@@ -642,28 +669,31 @@ workflow:
     max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "deepseek"
-        model: "deepseek-v4-flash"
+      - provider: "openai_compatible_secondary"
+        model: "gpt-5.6-terra"
         priority: 50
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 60
       - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
+        priority: 60
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
         priority: 70
   gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
     timeout: 30                         # agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "deepseek"
-        model: "deepseek-v4-flash"
+      - provider: "openai_compatible_secondary"
+        model: "gpt-5.6-luna"
         priority: 50
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 60
       - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
+        priority: 60
+      - provider: "deepseek"
+        model: "deepseek-v4-flash"
         priority: 70
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 80
   compensation:                           # 失败文件补偿任务配置
     enabled: true                         # 是否启用后台补偿
     scan_interval: 60                     # 扫描间隔基准（秒）
@@ -675,12 +705,15 @@ workflow:
 # --- 11-Context Engine 服务 ---
 context_engine:
   providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-    - provider: "deepseek"
-      model: "deepseek-v4-pro"
+    - provider: "openai_compatible_secondary"
+      model: "gpt-5.6-terra"
       priority: 10
     - provider: "openai_compatible_secondary"
       model: "gpt-5.4"
       priority: 20
+    - provider: "deepseek"
+      model: "deepseek-v4-pro"
+      priority: 30
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   mcp_servers:                         # 需要接入的 MCP 服务（key 对应 mcp_client.servers）
     codebase_rag:
@@ -732,15 +765,18 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "deepseek"
-        model: "deepseek-v4-flash"
+      - provider: "openai_compatible_secondary"
+        model: "gpt-5.6-luna"
         priority: 50
       - provider: "deepseek"
-        model: "deepseek-v4-pro"
+        model: "deepseek-v4-flash"
         priority: 60
+      - provider: "deepseek"
+        model: "deepseek-v4-pro"
+        priority: 70
       - provider: "openai_compatible_secondary"
         model: "gpt-5.4"
-        priority: 70
+        priority: 80
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 3600                         # 重排序 agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
