@@ -1,7 +1,8 @@
 """MCP Server — registers tools and resources, handles MCP protocol.
 
 Uses the official Python MCP SDK to expose codebase_search, project_status,
-and list_projects tools via Streamable HTTP or SSE transport.
+list_projects, register_project and knowledge tools via Streamable HTTP or SSE
+transport.
 
 Tool handler logic is implemented as module-level async functions (handle_*)
 so they can be unit-tested independently of the MCP SDK Server internals.
@@ -22,6 +23,7 @@ from mcp.types import (
 )
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.services.management_api.models import ManagementApiError
 from codebase_rag.services.management_api.service import ManagementApiService
 from codebase_rag.services.mcp_service.models import (
     McpServiceError,
@@ -201,6 +203,37 @@ TOOL_DEFINITIONS: list[Tool] = [
             ],
         },
     ),
+    Tool(
+        name="register_project",
+        description=(
+            "把本地 Git 仓库注册到 codebase-rag，并触发异步初始化/索引。\n"
+            "\n"
+            "【调用边界 · 强制】\n"
+            "- 仅当用户明确要求“注册项目/把仓库加入 codebase-rag”时才可调用本工具。\n"
+            "- 禁止未经用户同意私自调用。\n"
+            "- 禁止因为“后续搜索更方便”“分析前先注册一下”“自动补全索引”等理由默认调用。\n"
+            "\n"
+            "入参使用仓库根目录绝对路径（含 .git 的父目录）。注册成功只表示已登记并入队初始化，"
+            "不代表索引已 ready；请再用 project_status / list_projects / codebase_search 验收可用性。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "git_repo_path": {
+                    "type": "string",
+                    "description": (
+                        "Git 仓库根目录的绝对路径（即 .git/ 所在的父目录）。"
+                        "例如 'G:/project/MyRepo'，而非 'G:/project/MyRepo/.git'。"
+                    ),
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "可选的项目展示名；不传时由服务端使用目录名或已有注册名称。",
+                },
+            },
+            "required": ["git_repo_path"],
+        },
+    ),
 ]
 
 
@@ -227,6 +260,8 @@ async def handle_call_tool(
         return await handle_project_status(arguments, mcp_service)
     elif name == "list_projects":
         return await handle_list_projects(management_api)
+    elif name == "register_project":
+        return await handle_register_project(arguments, management_api)
     elif name == "codebase_context_analysis":
         return await handle_context_analysis(arguments, context_engine)
     elif name == "get_file_knowledge":
@@ -372,6 +407,49 @@ async def handle_list_projects(
         )
 
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def handle_register_project(
+    args: dict,
+    management_api: ManagementApiService,
+) -> list[TextContent]:
+    """Handle register_project tool call.
+
+    Thin northbound adapter over ManagementApiService.register_project.
+    Does not wait for index readiness.
+    """
+    git_repo_path = args.get("git_repo_path", "")
+    if not git_repo_path or not isinstance(git_repo_path, str):
+        raise ValueError("Missing required parameter: 'git_repo_path'.")
+
+    display_name = args.get("display_name", "")
+    if display_name is None:
+        display_name = ""
+    if not isinstance(display_name, str):
+        raise ValueError("Optional parameter 'display_name' must be a string.")
+
+    try:
+        project = await management_api.register_project(
+            git_repo_path=git_repo_path,
+            display_name=display_name,
+        )
+    except ManagementApiError as e:
+        raise ValueError(str(e)) from e
+
+    text = (
+        f"项目已注册并入队异步初始化/索引。\n"
+        f"project_id: {project.project_id}\n"
+        f"display_name: {project.display_name}\n"
+        f"git_repo_path: {project.git_repo_path}\n"
+        f"status: {project.status}\n"
+        f"branch: {project.branch or 'N/A'}\n"
+        f"commit_hash: {project.commit_hash or 'N/A'}\n"
+        f"knowledge_points: {project.knowledge_points}\n"
+        f"\n"
+        f"注意：注册成功只表示已登记并入队初始化，不代表索引已 ready。"
+        f"请再用 project_status / list_projects / codebase_search 验收可用性。"
+    )
+    return [TextContent(type="text", text=text)]
 
 
 async def handle_get_file_knowledge(
