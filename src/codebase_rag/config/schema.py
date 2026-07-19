@@ -513,7 +513,7 @@ class MCPRerankerConfig(BaseModel):
     """Reranker business config (RAG search logic, sibling of servers)."""
     providers: List[MCPRerankerProviderEntry] = Field(default_factory=list)
     recall_limit: int = 400             # max candidates from hybrid search (Stage 1)
-    timeout: int = 120                  # agent timeout in seconds
+    timeout: int = 600                  # agent timeout in seconds (10 minutes)
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
 
 

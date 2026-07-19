@@ -778,7 +778,7 @@ mcp:
         model: "gpt-5.4"
         priority: 80
     recall_limit: 80                    # Stage 1 向量召回最大候选数
-    timeout: 3600                         # 重排序 agent 超时（秒）
+    timeout: 600                          # 重排序 agent 超时（秒，10 分钟）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   knowledge_submission:
     point_token_limit: 2048              # 单条知识描述最大 tokens

@@ -306,18 +306,33 @@ class McpService:
             agent_name = self._reranker_agent_names[tried_idx]
             tried_idx += 1
 
-            all_scores: List[RerankerScoreEntry] = []
+            # id -> best score; supports multi-batch submit_scores with dedupe
+            score_by_id: Dict[str, float] = {}
 
             async def handle_submit_scores(scores: list) -> str:
+                batch_accepted = 0
                 for entry in scores:
                     point_id = entry.get("id")
-                    score = entry.get("score", 0.0)
-                    if point_id is not None and point_id in valid_ids:
-                        score = max(0.0, min(1.0, float(score)))
-                        all_scores.append(RerankerScoreEntry(id=point_id, score=score))
-                return f"已接收 {len(scores)} 条评分。"
+                    if point_id is None or point_id not in valid_ids:
+                        continue
+                    score = max(0.0, min(1.0, float(entry.get("score", 0.0))))
+                    prev = score_by_id.get(point_id)
+                    if prev is None or score > prev:
+                        score_by_id[point_id] = score
+                    batch_accepted += 1
+
+                unique_count = len(score_by_id)
+                progress = (
+                    f"已接收 {batch_accepted} 条有效评分；"
+                    f"累计唯一有效 {unique_count}/{top_k}。"
+                )
+                # Enough unique scores: end immediately, do not wait for end_task.
+                if unique_count >= top_k:
+                    raise AgentTaskComplete()
+                return progress
 
             async def handle_end_task(**kwargs) -> str:
+                # Optional early exit when scores are still below pick_n.
                 raise AgentTaskComplete()
 
             tool_handlers = {
@@ -333,7 +348,7 @@ class McpService:
                     user_message=user_message,
                 )
             except AgentTaskComplete:
-                pass  # Normal exit via end_task
+                pass  # Normal exit via submit_scores reaching N or end_task
             except Exception as e:
                 last_error = e
                 logger.warning(
@@ -343,7 +358,10 @@ class McpService:
                 )
                 continue  # Register & try next provider
 
-            return all_scores
+            return [
+                RerankerScoreEntry(id=point_id, score=score)
+                for point_id, score in score_by_id.items()
+            ]
 
         raise RerankerError(
             f"All reranker providers exhausted. Last error: {last_error}"
@@ -414,9 +432,9 @@ class McpService:
             "根据 business_description 与查询的相关性进行 0.0~1.0 打分，"
             "分数越高相关性越强。给出相关性最高的 N 条（N 由用户指定）及其分数。\n\n"
             "## 工具使用规则\n"
-            "1. 使用 submit_scores 工具提交挑选出的 N 条的 id 和分数，可多次调用分批提交\n"
+            "1. 使用 submit_scores 提交 id 与分数，可多次分批提交\n"
             "2. 每次回复只调用一个工具\n"
-            "3. 提交完毕后，调用 end_task 工具结束任务\n"
+            "3. 累计有效唯一结果达到 N 时任务可自动结束；不足 N 也可调用 end_task 主动收工\n"
         )
 
         tools = [
