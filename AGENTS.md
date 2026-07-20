@@ -580,3 +580,48 @@ Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 - 本地安装 zip 只交付运行所需 wheel、依赖 wheel、配置模板和运维脚本。
 - 开发接管测试必须先停正式服务，避免两个实例同时监听同一端口或同一 Git 仓库。
 - 涉及持久化结构变更时，必须先备份再接管测试或更新。
+
+## 12. Qdrant 向量数据库持久化约定
+
+当前 Codebase RAG 系统采用 **本地 Qdrant Docker 容器** 进行向量数据的持久化存储（访问地址为 `localhost:6333`）。本地持久化减少了对外部网络的依赖，提高了服务响应速度。
+
+**云端 Qdrant 回退配置（文档不保存明文密钥）：**
+云端地址与端口可记录在文档中；`QDRANT_API_KEY` 只保存在本机受控备份，不得复制到 `AGENTS.md`、Git 提交、Issue、聊天或日志中。回退参数格式如下：
+
+```env
+QDRANT_HOST=qdrant.mindloop.chat
+QDRANT_PORT=48831
+QDRANT_GRPC_PORT=32293
+QDRANT_HTTPS=true
+QDRANT_API_KEY=<从本机受控备份按需查询>
+```
+
+迁移时保留了以下两个本机备份：
+- 正式数据目录备份（优先使用）：`C:\ProgramData\CodebaseRAG\config\.env.qdrant.bak`
+- 源码工作区备份（本地临时副本，不得加入 Git）：`G:\project\codebase-rag\.env.qdrant.bak`
+
+在管理员 PowerShell 中查询。第一段只确认密钥是否存在，不显示内容；第二段仅在实际回退时执行，会把完整 Qdrant 配置（包括密钥）显示在当前受控终端：
+
+```powershell
+$backup = 'C:\ProgramData\CodebaseRAG\config\.env.qdrant.bak'
+if (-not (Test-Path -LiteralPath $backup)) {
+    throw "Qdrant 回退备份不存在：$backup"
+}
+
+# 安全检查：只确认 API Key 存在，不显示密钥
+if (Select-String -LiteralPath $backup -Pattern '^QDRANT_API_KEY=.+$' -Quiet) {
+    'QDRANT_API_KEY 已保存在回退备份中'
+} else {
+    throw '回退备份中缺少 QDRANT_API_KEY'
+}
+
+# 仅在实际回退时查询完整参数；该命令会在终端显示密钥
+Get-Content -LiteralPath $backup |
+    Where-Object { $_ -match '^QDRANT_(HOST|PORT|GRPC_PORT|HTTPS|API_KEY)=' }
+```
+
+回退时将受控备份中的 `QDRANT_` 配置写入真实 `.env`，随后必须重启 CodebaseRAG 服务使进程环境生效：
+
+```powershell
+Restart-Service CodebaseRAG
+```

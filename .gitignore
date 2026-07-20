@@ -1,5 +1,6 @@
 # Environment variables (API keys)
 .env
+/.env.qdrant.bak
 
 # Python
 __pycache__/
