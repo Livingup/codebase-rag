@@ -43,40 +43,54 @@ class JevClientTest(unittest.IsolatedAsyncioTestCase):
         self.client = JevRerankerClient()
 
     def test_build_jev_endpoint(self) -> None:
-        # Base URLs without path get /v1/systemone appended
-        self.assertEqual(
-            _build_jev_endpoint("https://api.typesafe.ai"),
-            "https://api.typesafe.ai/v1/systemone",
-        )
-        self.assertEqual(
-            _build_jev_endpoint("http://localhost:8317/"),
-            "http://localhost:8317/v1/systemone",
-        )
-        # Explicit endpoints remain as-is
+        # 1. OpenRouter
         self.assertEqual(
             _build_jev_endpoint("https://openrouter.ai/api/alpha/decisions"),
             "https://openrouter.ai/api/alpha/decisions",
         )
         self.assertEqual(
+            _build_jev_endpoint("https://openrouter.ai"),
+            "https://openrouter.ai/api/alpha/decisions",
+        )
+        # 2. TypeSafe Native (Direct API)
+        self.assertEqual(
             _build_jev_endpoint("https://api.typesafe.ai/v1/systemone"),
             "https://api.typesafe.ai/v1/systemone",
+        )
+        self.assertEqual(
+            _build_jev_endpoint("https://api.typesafe.ai"),
+            "https://api.typesafe.ai/v1/systemone",
+        )
+        # 3. Vercel AI Gateway
+        self.assertEqual(
+            _build_jev_endpoint("https://ai-gateway.vercel.sh/v4/ai/evaluation-model"),
+            "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
+        )
+        self.assertEqual(
+            _build_jev_endpoint("https://ai-gateway.vercel.sh"),
+            "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
         )
 
     def test_build_jev_payload(self) -> None:
         c = _candidate("auth", 0.7)
-        payload = _build_jev_payload("jev-latest", "用户认证机制", c)
+        # OpenRouter / TypeSafe Direct include model in body
+        payload_standard = _build_jev_payload("jev-latest", "用户认证机制", c, is_vercel=False)
+        self.assertEqual(payload_standard["model"], "jev-latest")
+        self.assertEqual(payload_standard["state"]["file_path"], "src/auth.py")
+        self.assertEqual(payload_standard["state"]["target_context"], "Business description for auth")
 
-        self.assertEqual(payload["model"], "jev-latest")
-        self.assertEqual(payload["state"]["file_path"], "src/auth.py")
-        self.assertEqual(payload["state"]["target_context"], "Business description for auth")
-
-        q = payload["questions"]["relevance"]
+        q = payload_standard["questions"]["relevance"]
         self.assertEqual(q["type"], "noul")
         self.assertIn("用户认证机制", q["instructions"])
         self.assertIn("true", q["criteria"])
         self.assertIn("false", q["criteria"])
-        # Ensure no non-standard fields exist in question
         self.assertEqual(set(q.keys()), {"type", "instructions", "criteria"})
+
+        # Vercel AI Gateway omits model from body (passed via ai-model-id header)
+        payload_vercel = _build_jev_payload("typesafe-ai/jev", "用户认证机制", c, is_vercel=True)
+        self.assertNotIn("model", payload_vercel)
+        self.assertEqual(payload_vercel["state"]["file_path"], "src/auth.py")
+        self.assertEqual(set(payload_vercel.keys()), {"state", "questions"})
 
     async def test_evaluate_candidates_success_and_dual_key_sort(self) -> None:
         pcfg = LLMProviderConfig(
@@ -125,6 +139,87 @@ class JevClientTest(unittest.IsolatedAsyncioTestCase):
         # doc3 third (noul 0.70)
         self.assertEqual(scores[2].id, "doc3")
         self.assertEqual(scores[2].score, 0.70)
+
+    async def test_evaluate_candidates_vercel_gateway(self) -> None:
+        pcfg = LLMProviderConfig(
+            api_format="jev",
+            api_base_url="https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
+            api_keys=[ApiKeyConfig(key="vck-test-key")],
+            retry=RetryConfig(max_retries_per_key=1, retry_base_delay=0.01),
+        )
+        entry = MCPRerankerProviderEntry(provider="jev_vercel", model="typesafe-ai/jev", priority=5)
+        c = _candidate("doc_vercel", vector_score=0.6)
+
+        captured_requests = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_requests.append(request)
+            return httpx.Response(200, json={"answers": {"relevance": {"noul": 0.91}}})
+
+        transport = httpx.MockTransport(handler)
+        with patch("httpx.AsyncClient", return_value=httpx.AsyncClient(transport=transport)):
+            scores = await self.client.evaluate_candidates(
+                query="检索用户结算",
+                candidates=[c],
+                entry=entry,
+                provider_cfg=pcfg,
+                top_k=1,
+            )
+
+        self.assertEqual(len(scores), 1)
+        self.assertEqual(scores[0].id, "doc_vercel")
+        self.assertEqual(scores[0].score, 0.91)
+
+        # Assert Vercel specific headers and body
+        req = captured_requests[0]
+        self.assertEqual(req.headers.get("ai-gateway-protocol-version"), "0.0.1")
+        self.assertEqual(req.headers.get("ai-model-id"), "typesafe-ai/jev")
+        self.assertEqual(req.headers.get("ai-evaluation-model-specification-version"), "4")
+        self.assertEqual(req.headers.get("authorization"), "Bearer vck-test-key")
+
+        import json
+        body = json.loads(req.content.decode("utf-8"))
+        self.assertNotIn("model", body)
+        self.assertIn("state", body)
+        self.assertIn("questions", body)
+
+    async def test_evaluate_candidates_openrouter(self) -> None:
+        pcfg = LLMProviderConfig(
+            api_format="jev",
+            api_base_url="https://openrouter.ai/api/alpha/decisions",
+            api_keys=[ApiKeyConfig(key="sk-or-key")],
+            retry=RetryConfig(max_retries_per_key=1, retry_base_delay=0.01),
+        )
+        entry = MCPRerankerProviderEntry(provider="jev_openrouter", model="~typesafe/jev-latest", priority=5)
+        c = _candidate("doc_or", vector_score=0.5)
+
+        captured_requests = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_requests.append(request)
+            return httpx.Response(200, json={"answers": {"relevance": {"noul": 0.88}}})
+
+        transport = httpx.MockTransport(handler)
+        with patch("httpx.AsyncClient", return_value=httpx.AsyncClient(transport=transport)):
+            scores = await self.client.evaluate_candidates(
+                query="查询决策",
+                candidates=[c],
+                entry=entry,
+                provider_cfg=pcfg,
+                top_k=1,
+            )
+
+        self.assertEqual(len(scores), 1)
+        self.assertEqual(scores[0].id, "doc_or")
+        self.assertEqual(scores[0].score, 0.88)
+
+        req = captured_requests[0]
+        self.assertEqual(str(req.url), "https://openrouter.ai/api/alpha/decisions")
+        self.assertEqual(req.headers.get("authorization"), "Bearer sk-or-key")
+
+        import json
+        body = json.loads(req.content.decode("utf-8"))
+        self.assertEqual(body.get("model"), "~typesafe/jev-latest")
 
     async def test_keypool_failover_on_401(self) -> None:
         pcfg = LLMProviderConfig(

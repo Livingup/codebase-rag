@@ -429,6 +429,53 @@ agent:
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
         max_concurrency: 100                  # 该服务商最大并发请求数
+      # --- Jev (System One) 决策重排序服务商（支持 3 大渠道） ---
+      # 渠道 1: OpenRouter 决策端点 (https://openrouter.ai/api/alpha/decisions)
+      jev_openrouter:
+        api_format: "jev"
+        api_base_url: "${JEV_OPENROUTER_BASE_URL}"
+        models:
+          - id: "~typesafe/jev-latest"
+        api_keys:
+          - key: "${OPENROUTER_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 0.5
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 20                   # 该服务商最大并发请求数
+        request_timeout: 10                   # 单次调用超时（秒）
+      # 渠道 2: TypeSafe AI 官方原生直连 (https://api.typesafe.ai/v1/systemone)
+      jev_official:
+        api_format: "jev"
+        api_base_url: "${JEV_OFFICIAL_BASE_URL}"
+        models:
+          - id: "jev-latest"
+        api_keys:
+          - key: "${TYPESAFE_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 0.5
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 20                   # 该服务商最大并发请求数
+        request_timeout: 10                   # 单次调用超时（秒）
+      # 渠道 3: Vercel AI Gateway 评估模型 (https://ai-gateway.vercel.sh/v4/ai/evaluation-model)
+      jev_vercel:
+        api_format: "jev"
+        api_base_url: "${JEV_VERCEL_BASE_URL}"
+        models:
+          - id: "typesafe-ai/jev"
+        api_keys:
+          - key: "${VERCEL_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 0.5
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 20                   # 该服务商最大并发请求数
+        request_timeout: 10                   # 单次调用超时（秒）
+      # 通用 Jev 渠道（支持直接配置任意 Jev 兼容网关）
       jev_provider:
         api_format: "jev"
         api_base_url: "${JEV_BASE_URL}"
@@ -804,9 +851,16 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "jev_provider"
+      # --- Jev 渠道选择（按需启用其一或多个级联）：
+      - provider: "jev_openrouter"
         model: "~typesafe/jev-latest"
         priority: 5
+      # - provider: "jev_official"
+      #   model: "jev-latest"
+      #   priority: 5
+      # - provider: "jev_vercel"
+      #   model: "typesafe-ai/jev"
+      #   priority: 5
       - provider: "deepseek"
         model: "deepseek-flash"
         priority: 10

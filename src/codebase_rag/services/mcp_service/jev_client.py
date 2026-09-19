@@ -25,17 +25,35 @@ logger = get_logger(__name__)
 
 
 def _build_jev_endpoint(base_url: str) -> str:
-    """Resolve full Jev POST endpoint from base_url."""
+    """Resolve full Jev POST endpoint from base_url.
+
+    Supports:
+      - Vercel AI Gateway: https://ai-gateway.vercel.sh/v4/ai/evaluation-model
+      - OpenRouter: https://openrouter.ai/api/alpha/decisions
+      - TypeSafe Official: https://api.typesafe.ai/v1/systemone
+    """
     url = base_url.strip().rstrip("/")
-    if url.endswith("/systemone") or url.endswith("/decisions"):
+    if url.endswith("/systemone") or url.endswith("/decisions") or url.endswith("/evaluation-model"):
         return url
+    if "vercel" in url:
+        return f"{url}/v4/ai/evaluation-model"
+    if "openrouter" in url:
+        return f"{url}/api/alpha/decisions"
     return f"{url}/v1/systemone"
+
+
+def _is_vercel_gateway(endpoint: str, headers: Optional[Dict[str, str]] = None) -> bool:
+    """Determine whether target endpoint or headers indicate Vercel AI Gateway."""
+    if headers and "ai-gateway-protocol-version" in headers:
+        return True
+    return "vercel" in endpoint or endpoint.endswith("/evaluation-model")
 
 
 def _build_jev_payload(
     model: str,
     query: str,
     candidate: CandidatePoint,
+    is_vercel: bool = False,
 ) -> dict:
     """Build request payload strictly conforming to Jev API specifications.
     
@@ -43,9 +61,12 @@ def _build_jev_payload(
     - questions: relevance question with type=noul.
     - instructions: natural language guidance indicating context recall reranking.
     - criteria: true/false judgment rubrics.
+
+    For Vercel AI Gateway, the model ID is declared via the 'ai-model-id' header,
+    so 'model' is omitted from the request body.
+    For OpenRouter and TypeSafe Direct API, 'model' is included in the request body.
     """
-    return {
-        "model": model,
+    payload = {
         "state": {
             "file_path": candidate.file_path,
             "target_context": candidate.business_description,
@@ -65,6 +86,9 @@ def _build_jev_payload(
             },
         },
     }
+    if not is_vercel:
+        payload["model"] = model
+    return payload
 
 
 class JevRerankerClient:
@@ -121,12 +145,23 @@ class JevRerankerClient:
         max_concurrency = max(1, provider_cfg.max_concurrency or 15)
         sem = asyncio.Semaphore(max_concurrency)
 
-        # Merge custom headers
-        base_headers = {"Content-Type": "application/json"}
-        # Check model-level or provider-level custom headers
+        # Merge custom headers from model or provider config
+        custom_headers: Dict[str, str] = {}
         for m in provider_cfg.models:
             if m.id == entry.model and m.custom_headers:
-                base_headers.update(m.custom_headers)
+                custom_headers.update(m.custom_headers)
+
+        is_vercel = _is_vercel_gateway(endpoint, custom_headers)
+
+        # Base headers
+        base_headers = {"Content-Type": "application/json"}
+        if is_vercel:
+            base_headers.update({
+                "ai-gateway-protocol-version": "0.0.1",
+                "ai-model-id": entry.model,
+                "ai-evaluation-model-specification-version": "4",
+            })
+        base_headers.update(custom_headers)
 
         scores: List[RerankerScoreEntry] = []
         failures: List[CandidatePoint] = []
@@ -137,7 +172,7 @@ class JevRerankerClient:
 
             async def _eval_one(c: CandidatePoint) -> None:
                 nonlocal last_error
-                payload = _build_jev_payload(entry.model, query, c)
+                payload = _build_jev_payload(entry.model, query, c, is_vercel=is_vercel)
                 max_retries = max(1, provider_cfg.retry.max_retries_per_key)
                 base_delay = max(0.1, provider_cfg.retry.retry_base_delay)
                 multiplier = max(1.0, provider_cfg.retry.retry_backoff_multiplier)
@@ -161,8 +196,12 @@ class JevRerankerClient:
                             if status == 200:
                                 data = resp.json()
                                 answers = data.get("answers", {})
-                                noul_entry = answers.get("relevance", {})
-                                raw_noul = noul_entry.get("noul")
+                                rel_entry = answers.get("relevance", {})
+                                raw_noul = None
+                                if isinstance(rel_entry, dict):
+                                    raw_noul = rel_entry.get("noul")
+                                elif isinstance(rel_entry, (int, float)):
+                                    raw_noul = rel_entry
 
                                 if raw_noul is not None and isinstance(raw_noul, (int, float)):
                                     noul_score = max(0.0, min(1.0, float(raw_noul)))
