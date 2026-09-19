@@ -97,6 +97,50 @@ class JevRerankerClient:
     def __init__(self) -> None:
         self._keypools: Dict[str, KeyPool] = {}
         self._keypool_lock = asyncio.Lock()
+        self._semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._sem_lock = asyncio.Lock()
+        self._clients: Dict[str, httpx.AsyncClient] = {}
+        self._client_lock = asyncio.Lock()
+
+    async def aclose(self) -> None:
+        """Close all persistent HTTP clients safely."""
+        async with self._client_lock:
+            for client in self._clients.values():
+                if not client.is_closed:
+                    try:
+                        await asyncio.wait_for(client.aclose(), timeout=5.0)
+                    except Exception:
+                        pass
+            self._clients.clear()
+
+    async def _get_or_create_semaphore(
+        self,
+        provider_name: str,
+        max_concurrency: int,
+    ) -> asyncio.Semaphore:
+        async with self._sem_lock:
+            if provider_name not in self._semaphores:
+                self._semaphores[provider_name] = asyncio.Semaphore(max_concurrency)
+            return self._semaphores[provider_name]
+
+    async def _get_or_create_client(
+        self,
+        provider_name: str,
+        max_concurrency: int,
+        timeout_seconds: float,
+    ) -> httpx.AsyncClient:
+        async with self._client_lock:
+            if provider_name not in self._clients or self._clients[provider_name].is_closed:
+                limits = httpx.Limits(
+                    max_connections=max(10, max_concurrency * 2),
+                    max_keepalive_connections=max(5, max_concurrency),
+                    keepalive_expiry=60.0,
+                )
+                self._clients[provider_name] = httpx.AsyncClient(
+                    limits=limits,
+                    timeout=httpx.Timeout(timeout_seconds),
+                )
+            return self._clients[provider_name]
 
     async def _get_or_create_keypool(
         self,
@@ -149,7 +193,8 @@ class JevRerankerClient:
         endpoint = _build_jev_endpoint(provider_cfg.api_base_url)
         timeout_seconds = float(provider_cfg.request_timeout or 10.0)
         max_concurrency = max(1, provider_cfg.max_concurrency or 15)
-        sem = asyncio.Semaphore(max_concurrency)
+        sem = await self._get_or_create_semaphore(entry.provider, max_concurrency)
+        client = await self._get_or_create_client(entry.provider, max_concurrency, timeout_seconds)
 
         # Merge custom headers from model or provider config
         custom_headers: Dict[str, str] = {}
@@ -173,114 +218,124 @@ class JevRerankerClient:
         failures: List[CandidatePoint] = []
         last_error: Optional[Exception] = None
 
-        limits = httpx.Limits(max_connections=max_concurrency * 2, max_keepalive_connections=max_concurrency)
-        async with httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(timeout_seconds)) as client:
+        async def _eval_one(c: CandidatePoint) -> None:
+            nonlocal last_error
+            payload = _build_jev_payload(entry.model, query, c, is_vercel=is_vercel)
+            max_retries = max(1, provider_cfg.retry.max_retries_per_key)
+            base_delay = max(0.1, provider_cfg.retry.retry_base_delay)
+            multiplier = max(1.0, provider_cfg.retry.retry_backoff_multiplier)
 
-            async def _eval_one(c: CandidatePoint) -> None:
-                nonlocal last_error
-                payload = _build_jev_payload(entry.model, query, c, is_vercel=is_vercel)
-                max_retries = max(1, provider_cfg.retry.max_retries_per_key)
-                base_delay = max(0.1, provider_cfg.retry.retry_base_delay)
-                multiplier = max(1.0, provider_cfg.retry.retry_backoff_multiplier)
+            async with sem:
+                for attempt in range(max_retries):
+                    key = await keypool.get_key()
+                    if not key:
+                        err = RerankerError(f"All API keys for Jev provider '{entry.provider}' are exhausted or in cooldown.")
+                        last_error = err
+                        failures.append(c)
+                        return
 
-                async with sem:
-                    for attempt in range(max_retries):
-                        key = await keypool.get_key()
-                        if not key:
-                            err = RerankerError(f"All API keys for Jev provider '{entry.provider}' are exhausted or in cooldown.")
-                            last_error = err
-                            failures.append(c)
-                            return
+                    headers = dict(base_headers)
+                    headers["Authorization"] = f"Bearer {key}"
 
-                        headers = dict(base_headers)
-                        headers["Authorization"] = f"Bearer {key}"
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.post(endpoint, json=payload, headers=headers),
+                            timeout=timeout_seconds,
+                        )
+                        status = resp.status_code
 
-                        try:
-                            resp = await client.post(endpoint, json=payload, headers=headers)
-                            status = resp.status_code
+                        if status == 200:
+                            data = resp.json()
+                            answers = data.get("answers", {})
+                            rel_entry = answers.get("relevance", {})
+                            raw_noul = None
+                            if isinstance(rel_entry, dict):
+                                raw_noul = rel_entry.get("noul")
+                            elif isinstance(rel_entry, (int, float)):
+                                raw_noul = rel_entry
 
-                            if status == 200:
-                                data = resp.json()
-                                answers = data.get("answers", {})
-                                rel_entry = answers.get("relevance", {})
-                                raw_noul = None
-                                if isinstance(rel_entry, dict):
-                                    raw_noul = rel_entry.get("noul")
-                                elif isinstance(rel_entry, (int, float)):
-                                    raw_noul = rel_entry
-
-                                if raw_noul is not None and isinstance(raw_noul, (int, float)):
-                                    noul_score = max(0.0, min(1.0, float(raw_noul)))
-                                    await keypool.report_success(key)
-                                    scores.append(RerankerScoreEntry(id=c.id, score=noul_score))
-                                    return
-                                else:
-                                    logger.warning("jev_invalid_noul_response", point_id=c.id, response=data)
-                                    await keypool.report_failure(key)
-
-                            elif status in (401, 403):
-                                logger.warning("jev_key_auth_error", provider=entry.provider, key_suffix=key[-6:], status=status)
-                                await keypool.mark_unhealthy(key)
-                                continue  # Try next available key immediately
-
-                            elif status == 429:
-                                logger.warning("jev_rate_limited", provider=entry.provider, key_suffix=key[-6:], attempt=attempt)
-                                await keypool.report_failure(key)
-                                retry_after = resp.headers.get("Retry-After")
-                                if retry_after and retry_after.isdigit():
-                                    delay = float(retry_after)
-                                else:
-                                    delay = base_delay * (multiplier ** attempt)
-                                await asyncio.sleep(delay)
-                                continue
-
-                            elif status >= 500:
-                                logger.warning("jev_server_error", provider=entry.provider, status=status, attempt=attempt)
-                                await keypool.report_failure(key)
-                                delay = base_delay * (multiplier ** attempt)
-                                await asyncio.sleep(delay)
-                                continue
-
+                            if raw_noul is not None and isinstance(raw_noul, (int, float)):
+                                noul_score = max(0.0, min(1.0, float(raw_noul)))
+                                await keypool.report_success(key)
+                                scores.append(RerankerScoreEntry(id=c.id, score=noul_score))
+                                return
                             else:
-                                err_msg = f"Jev HTTP {status}: {resp.text[:200]}"
-                                logger.warning("jev_unexpected_status", provider=entry.provider, status=status, error=err_msg)
+                                logger.warning("jev_invalid_noul_response", point_id=c.id, response=data)
                                 await keypool.report_failure(key)
-                                delay = base_delay * (multiplier ** attempt)
-                                await asyncio.sleep(delay)
-                                continue
 
-                        except (httpx.RequestError, asyncio.TimeoutError) as e:
-                            last_error = e
-                            logger.warning(
-                                "jev_network_transient_error",
-                                provider=entry.provider,
-                                key_suffix=key[-6:],
-                                error=str(e)[:150],
-                                attempt=attempt,
-                            )
+                        elif status in (401, 403):
+                            logger.warning("jev_key_auth_error", provider=entry.provider, key_suffix=key[-6:], status=status)
+                            await keypool.mark_unhealthy(key)
+                            continue  # Try next available key immediately
+
+                        elif status == 429:
+                            logger.warning("jev_rate_limited", provider=entry.provider, key_suffix=key[-6:], attempt=attempt)
+                            retry_after = resp.headers.get("Retry-After")
+                            if retry_after and retry_after.isdigit():
+                                delay = float(retry_after)
+                            else:
+                                delay = base_delay * (multiplier ** attempt) * (0.8 + 0.4 * ((attempt + 1) % 3))
+                            await asyncio.sleep(delay)
+                            continue
+
+                        elif status >= 500:
+                            logger.warning("jev_server_error", provider=entry.provider, status=status, attempt=attempt)
                             await keypool.report_failure(key)
                             delay = base_delay * (multiplier ** attempt)
                             await asyncio.sleep(delay)
                             continue
 
-                    # If all attempts fail for this candidate:
-                    failures.append(c)
+                        else:
+                            err_msg = f"Jev HTTP {status}: {resp.text[:200]}"
+                            logger.warning("jev_unexpected_status", provider=entry.provider, status=status, error=err_msg)
+                            await keypool.report_failure(key)
+                            delay = base_delay * (multiplier ** attempt)
+                            await asyncio.sleep(delay)
+                            continue
 
-            # Concurrent execution across all candidates
-            tasks = [_eval_one(c) for c in candidates]
-            await asyncio.gather(*tasks, return_exceptions=False)
+                    except (httpx.RequestError, asyncio.TimeoutError, TimeoutError) as e:
+                        last_error = e
+                        logger.warning(
+                            "jev_network_transient_error",
+                            provider=entry.provider,
+                            key_suffix=key[-6:],
+                            error=str(e)[:150],
+                            attempt=attempt,
+                        )
+                        await keypool.report_failure(key)
+                        delay = base_delay * (multiplier ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+
+                # If all attempts fail for this candidate:
+                failures.append(c)
+
+        # Batch hard timeout: allow up to 3x single call timeout, max 45s
+        batch_timeout = min(45.0, max(15.0, timeout_seconds * 3.0))
+        tasks = [_eval_one(c) for c in candidates]
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=False), timeout=batch_timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "jev_batch_evaluation_timeout",
+                provider=entry.provider,
+                candidates=len(candidates),
+                completed_scores=len(scores),
+                batch_timeout=batch_timeout,
+            )
 
         # Check overall failure rate
         total = len(candidates)
-        failed_count = len(failures)
-        if total > 0 and (failed_count / total) > 0.20:
+        scored_ids = {s.id for s in scores}
+        unscored = [c for c in candidates if c.id not in scored_ids]
+        if total > 0 and (len(unscored) / total) > 0.30:
             raise RerankerError(
-                f"Jev provider '{entry.provider}' failure rate ({failed_count}/{total}, {failed_count/total:.1%}) "
-                f"exceeded threshold (20%). Last error: {last_error}"
+                f"Jev provider '{entry.provider}' failure rate ({len(unscored)}/{total}, {len(unscored)/total:.1%}) "
+                f"exceeded threshold (30%). Last error: {last_error}"
             )
 
         # For minor transient failures, assign minimum fallback score 0.0
-        for fc in failures:
+        for fc in unscored:
             scores.append(RerankerScoreEntry(id=fc.id, score=0.0))
 
         # Dual-key sort: Primary by score descending; Secondary by vector_score descending

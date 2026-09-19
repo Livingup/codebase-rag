@@ -73,6 +73,8 @@ class EmbeddingService:
         self._sparse_keypool: Optional[KeyPool] = None
         self._dense_cfg: Optional[EmbeddingProviderConfig] = None
         self._sparse_cfg: Optional[EmbeddingProviderConfig] = None
+        self._dense_semaphore: Optional[asyncio.Semaphore] = None
+        self._sparse_semaphore: Optional[asyncio.Semaphore] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._initialized = False
 
@@ -88,8 +90,10 @@ class EmbeddingService:
         """Initialize providers, KeyPools, and validate connectivity."""
         logger.info("embedding_service_initializing")
 
-        # Concurrency limiter
-        self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
+        # Concurrency limiters (Dense and Sparse decoupled)
+        self._dense_semaphore = asyncio.Semaphore(self._config.max_concurrency)
+        self._sparse_semaphore = asyncio.Semaphore(self._config.max_concurrency)
+        self._semaphore = self._dense_semaphore
 
         # --- Dense provider ---
         dense_name = self._config.dense.active_provider
@@ -179,8 +183,10 @@ class EmbeddingService:
         old_emb = old_config.embedding
 
         # 1. Concurrency limit
-        if new_emb.max_concurrency != old_emb.max_concurrency or self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(new_emb.max_concurrency)
+        if new_emb.max_concurrency != old_emb.max_concurrency or self._dense_semaphore is None:
+            self._dense_semaphore = asyncio.Semaphore(new_emb.max_concurrency)
+            self._sparse_semaphore = asyncio.Semaphore(new_emb.max_concurrency)
+            self._semaphore = self._dense_semaphore
 
         # 2. Dense provider reconciliation
         dense_name = new_emb.dense.active_provider
@@ -584,7 +590,10 @@ class EmbeddingService:
 
         Uses the global concurrency semaphore.
         """
-        assert self._semaphore is not None
+        sem = self._dense_semaphore if "dense" in provider_name else self._sparse_semaphore
+        if sem is None:
+            sem = self._semaphore
+        assert sem is not None
 
         retry_cfg = self._get_retry_config(provider_name)
         max_retries = retry_cfg.max_retries_per_key
@@ -602,16 +611,35 @@ class EmbeddingService:
                 )
 
             try:
-                async with self._semaphore:
+                async with sem:
                     result = await call_fn(key)
                 await keypool.report_success(key)
                 return result
             except Exception as e:
                 last_error = e
-                await keypool.report_failure(key)
+                err_str = str(e)
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                is_rate_limit = (
+                    status_code == 429
+                    or "429" in err_str
+                    or "RESOURCE_EXHAUSTED" in err_str
+                    or "Too Many Requests" in err_str
+                )
 
-                # L1: Retry delay with exponential backoff
+                if not is_rate_limit:
+                    await keypool.report_failure(key)
+                else:
+                    logger.warning(
+                        "embedding_rate_limit_encountered",
+                        provider=provider_name,
+                        key_suffix=key[-6:],
+                        error=err_str[:120],
+                    )
+
+                # L1: Retry delay with exponential backoff (rate limits back off with at least 1.5s)
                 delay = base_delay * (backoff ** (attempt % max_retries))
+                if is_rate_limit:
+                    delay = max(delay, 1.5)
                 logger.warning(
                     "embedding_call_retry",
                     provider=provider_name,

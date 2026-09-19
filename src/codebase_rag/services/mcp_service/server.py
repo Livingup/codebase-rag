@@ -313,7 +313,16 @@ async def handle_codebase_search(
             )
             task_index.append((q_idx, r_idx))
 
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        all_results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error("handle_codebase_search_timeout", queries_count=len(queries), tasks_count=len(tasks))
+        all_results = [
+            TimeoutError("Search timed out after 120s") for _ in tasks
+        ]
 
     # Assemble grouped results
     grouped: List[QuerySearchGroup] = []

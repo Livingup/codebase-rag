@@ -129,6 +129,8 @@ class McpService:
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         self._initialized = False
+        if hasattr(self, "_jev_client") and self._jev_client is not None:
+            await self._jev_client.aclose()
         logger.info("mcp_service_shutdown")
 
     # =========================================================================
@@ -236,12 +238,16 @@ class McpService:
             provider_count=len(self._reranker_agent_names),
         )
         try:
-            scores = await self._run_reranker(query, candidates, pick_n)
-        except RerankerError as e:
+            rerank_timeout = float(self._reranker_config.timeout or 60.0)
+            scores = await asyncio.wait_for(
+                self._run_reranker(query, candidates, pick_n),
+                timeout=rerank_timeout,
+            )
+        except (RerankerError, asyncio.TimeoutError, Exception) as e:
             logger.warning(
                 "stage2_reranker_fallback",
                 project_id=project_id,
-                reason="reranker_failed",
+                reason="reranker_failed_or_timeout",
                 error=str(e),
                 fallback="un-reranked top_k",
             )

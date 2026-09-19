@@ -224,7 +224,7 @@ class LLMProviderConfig(BaseModel):
     models: List[ProviderModelRef] = Field(default_factory=list)
     api_keys: List[ApiKeyConfig] = Field(default_factory=list)
     retry: RetryConfig = Field(default_factory=RetryConfig)
-    request_timeout: int = 600  # single LLM call timeout in seconds (10min)
+    request_timeout: int = 1800  # single LLM call timeout in seconds (30min)
     max_concurrency: int = 3    # 该服务商的最大并发请求数（受服务商平台并发限制约束）
 
 
@@ -513,7 +513,7 @@ class MCPRerankerConfig(BaseModel):
     """Reranker business config (RAG search logic, sibling of servers)."""
     providers: List[MCPRerankerProviderEntry] = Field(default_factory=list)
     recall_limit: int = 400             # max candidates from hybrid search (Stage 1)
-    timeout: int = 600                  # agent timeout in seconds (10 minutes)
+    timeout: int = 60                   # reranker timeout in seconds (default 60s)
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
 
 
