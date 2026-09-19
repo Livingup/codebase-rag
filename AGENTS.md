@@ -455,19 +455,33 @@ git pull --ff-only
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
 
-### 9.1 配置热重载（Hot-Reload）与服务更新
+### 9.1 配置热重载（Hot-Reload）与服务更新规范
 
-正式服务实际读取的是：
+正式服务实际读取的是运行数据目录中的配置文件：
 
 ```text
 ${CODEBASE_RAG_DATA_DIR}\config\.env
 ${CODEBASE_RAG_DATA_DIR}\config\config.yaml
 ```
 
-**配置解耦原则**：
-- 源码仓库仅维护 `.env.example` 和 `config.example.yaml` 模板。
-- 正式运行配置严格保存在 `${CODEBASE_RAG_DATA_DIR}\config\`（默认 `C:\ProgramData\CodebaseRAG\config\`），禁止将正式运行配置存入源码仓库。
-- 运维脚本 `refresh-local-service-config.ps1` 直接面向正式配置目录操作，不再依赖仓库目录下的 `.env`，也不再执行模板强制覆盖。
+**配置维护与更新的两大场景标准流程**：
+
+#### 场景 1：结构变更（新增、删除或重命名配置字段名）
+- **触发条件**：新增功能特性、调整配置项命名、增删 Provider/Model 结构、引入新的环境变量等架构或功能变更。
+- **操作规则**：
+  1. **必须修改项目模板**：修改源码仓库根目录的 `config.example.yaml` 与 `.env.example`，同步更新 `src/codebase_rag/config/schema.py` 及相关测试。
+  2. **严禁将正式配置写回仓库**：仓库中只保留模板，不包含任何真实密钥和环境私有数据。
+  3. **同步到运行目录**：将新增/变更的配置结构同步至正式配置目录（`${CODEBASE_RAG_DATA_DIR}\config\`）。
+  4. **触发更新**：执行 `.\ops\windows\refresh-local-service-config.ps1`。若涉及进程不可变参数（端口/系统目录等），追加 `-Restart` 重启服务。
+
+#### 场景 2：数值变更（仅调整现有字段的值或参数）
+- **触发条件**：日常调优参数、修改阈值、调整模型优先级或重排序策略、增删/轮换 API Key 凭据、调整并发信号量等。
+- **操作规则**：
+  1. **严禁修改项目中的 example 模板**：仓库中的 `config.example.yaml` 和 `.env.example` 是公开示例模板，不得因本地/生产环境调参而被修改或污染。
+  2. **直接修改服务的配置文件**：直接编辑服务部署/数据目录中的真实配置文件（`${CODEBASE_RAG_DATA_DIR}\config\config.yaml` 或 `${CODEBASE_RAG_DATA_DIR}\config\.env`）。
+  3. **触发平滑热重载**：在终端执行 `.\ops\windows\refresh-local-service-config.ps1`（或调用 `POST http://127.0.0.1:18080/api/v1/config/reload`）。
+     - 服务端内部通过 `ConfigManager` 协同各服务 `Reconciler` 增量平滑迁移（KeyPool 密钥动态更新且完整保留现有健康度、失败计数与冷却状态；LLM/Embedding Provider 动态切换与连接重连）。
+     - 只要不修改进程不可变参数，**无需重启服务**即可瞬间生效。
 
 配置热重载接口：
 
@@ -479,11 +493,11 @@ POST http://127.0.0.1:18080/api/v1/config/reload
 - **动态 Reconcile**：动态刷新各 LLM Provider/Model、KeyPool 密钥（增删改并完整保留现有健康度、失败计数与冷却状态）、并发信号量大小、向量数据库客户端连接与探活、外部 MCP Server 连接、Workflow 代理注册等。
 - **不可变参数感知**：自动检测进程不可变参数（Management API / MCP 监听端口或 Host、系统数据根目录、系统日志级别）。若存在不可变变更，API 成功完成支持动态更新的部分并返回 `requires_restart: true` 及原因列表，而不引发服务中断或异常崩溃。
 
-更新规则：
+更新规则速查表：
 
 | 修改内容 | 推荐命令 | 是否需要重启 | 行为说明 |
 | --- | --- | --- | --- |
-| 修改参数规则、优先级、模型配置或密钥凭据 | `.\ops\windows\refresh-local-service-config.ps1` | 不需要 | 直接针对 `${CODEBASE_RAG_DATA_DIR}\config\` 触发热重载，Reconciler 平滑平移连接与状态。 |
+| 调整字段值、参数规则、模型优先级或 Key 凭据 | `.\ops\windows\refresh-local-service-config.ps1` | 不需要 | 直接针对 `${CODEBASE_RAG_DATA_DIR}\config\` 触发热重载，Reconciler 平滑平移连接与状态。 |
 | 改动核心服务端口、系统数据根目录等不可变参数 | `.\ops\windows\refresh-local-service-config.ps1 -Restart` | 需要 | 脚本在检测到需重启时自动或手动追加 `-Restart` 重启 Windows Service。 |
 | 仅需同步指定外部配置文件并触发重载 | `.\ops\windows\refresh-local-service-config.ps1 -ConfigPath <path> -EnvFile <path>` | 视配置而定 | 可显式指定输入文件路径同步至正式配置目录并重载。 |
 
