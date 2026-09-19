@@ -53,6 +53,7 @@ from codebase_rag.services.mcp_service.models import (
 )
 from codebase_rag.services.qdrant_storage.models import PointData
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService
+from codebase_rag.services.mcp_service.jev_client import JevRerankerClient
 
 logger = get_logger(__name__)
 
@@ -100,6 +101,8 @@ class McpService:
         self._sorted_providers: list = []
         self._reranker_agent_names: List[str] = []
         self._reranker_next_idx: int = 0
+        self._jev_client = JevRerankerClient()
+        self._registered_agents: Dict[int, str] = {}
         self._initialized = False
 
     @property
@@ -289,83 +292,136 @@ class McpService:
         candidates: List[CandidatePoint],
         top_k: int,
     ) -> List[RerankerScoreEntry]:
-        """Run the reranker agent to pick top_k most relevant candidates.
+        """Run the reranker to pick top_k most relevant candidates.
 
-        Lazy fallback: tries the current registered agent first. On failure,
-        registers the next provider in the queue and retries.
-
-        Returns:
-            List of RerankerScoreEntry with id + score (up to pick_n).
+        Iterates through configured providers in priority order:
+        - If api_format == "jev": executes JevRerankerClient with KeyPool and retries.
+        - Otherwise: executes AgentService tool-calling reranker.
+        Falls back to next provider on failure.
         """
-        user_message = self._build_reranker_user_message(query, candidates, top_k)
-        valid_ids = {c.id for c in candidates}
         last_error: Optional[Exception] = None
-        tried_idx = 0
 
-        while tried_idx < len(self._reranker_agent_names) or await self._register_next_reranker():
-            agent_name = self._reranker_agent_names[tried_idx]
-            tried_idx += 1
+        # Support pre-registered / mocked agent names (e.g. in unit tests)
+        if not self._sorted_providers and self._reranker_agent_names:
+            for agent_name in self._reranker_agent_names:
+                try:
+                    return await self._run_agent_reranker(agent_name, query, candidates, top_k)
+                except Exception as e:
+                    last_error = e
+                    continue
+            raise RerankerError(f"All reranker providers exhausted. Last error: {last_error}")
 
-            # id -> best score; supports multi-batch submit_scores with dedupe
-            score_by_id: Dict[str, float] = {}
+        for idx, entry in enumerate(self._sorted_providers):
+            pcfg = self._config_manager.config.agent.llm.providers.get(entry.provider)
+            if not pcfg:
+                logger.warning("reranker_provider_not_found_in_config", provider=entry.provider)
+                continue
 
-            async def handle_submit_scores(scores: list) -> str:
-                batch_accepted = 0
-                for entry in scores:
-                    point_id = entry.get("id")
-                    if point_id is None or point_id not in valid_ids:
-                        continue
-                    score = max(0.0, min(1.0, float(entry.get("score", 0.0))))
-                    prev = score_by_id.get(point_id)
-                    if prev is None or score > prev:
-                        score_by_id[point_id] = score
-                    batch_accepted += 1
-
-                unique_count = len(score_by_id)
-                progress = (
-                    f"已接收 {batch_accepted} 条有效评分；"
-                    f"累计唯一有效 {unique_count}/{top_k}。"
-                )
-                # Enough unique scores: end immediately, do not wait for end_task.
-                if unique_count >= top_k:
-                    raise AgentTaskComplete()
-                return progress
-
-            async def handle_end_task(**kwargs) -> str:
-                # Optional early exit when scores are still below pick_n.
-                raise AgentTaskComplete()
-
-            tool_handlers = {
-                "submit_scores": handle_submit_scores,
-                "end_task": handle_end_task,
-            }
-
-            try:
-                await self._agent.run_agent(
-                    agent_name=agent_name,
-                    input_variables={},
-                    tool_handlers=tool_handlers,
-                    user_message=user_message,
-                )
-            except AgentTaskComplete:
-                pass  # Normal exit via submit_scores reaching N or end_task
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    "reranker_provider_failed",
-                    agent_name=agent_name,
-                    error=str(e)[:200],
-                )
-                continue  # Register & try next provider
-
-            return [
-                RerankerScoreEntry(id=point_id, score=score)
-                for point_id, score in score_by_id.items()
-            ]
+            if pcfg.api_format == "jev":
+                try:
+                    logger.info(
+                        "stage2_reranker_running_jev",
+                        provider=entry.provider,
+                        model=entry.model,
+                        queue_index=idx,
+                    )
+                    scores = await self._jev_client.evaluate_candidates(
+                        query=query,
+                        candidates=candidates,
+                        entry=entry,
+                        provider_cfg=pcfg,
+                        top_k=top_k,
+                    )
+                    return scores
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "jev_reranker_provider_failed",
+                        provider=entry.provider,
+                        model=entry.model,
+                        error=str(e)[:200],
+                    )
+                    continue
+            else:
+                try:
+                    logger.info(
+                        "stage2_reranker_running_agent",
+                        provider=entry.provider,
+                        model=entry.model,
+                        queue_index=idx,
+                    )
+                    agent_name = await self._ensure_reranker_agent(entry, idx)
+                    scores = await self._run_agent_reranker(agent_name, query, candidates, top_k)
+                    return scores
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "agent_reranker_provider_failed",
+                        provider=entry.provider,
+                        model=entry.model,
+                        error=str(e)[:200],
+                    )
+                    continue
 
         raise RerankerError(
             f"All reranker providers exhausted. Last error: {last_error}"
         )
+
+    async def _run_agent_reranker(
+        self,
+        agent_name: str,
+        query: str,
+        candidates: List[CandidatePoint],
+        top_k: int,
+    ) -> List[RerankerScoreEntry]:
+        """Execute agent-based reranker via tool calling."""
+        user_message = self._build_reranker_user_message(query, candidates, top_k)
+        valid_ids = {c.id for c in candidates}
+        score_by_id: Dict[str, float] = {}
+
+        async def handle_submit_scores(scores: list) -> str:
+            batch_accepted = 0
+            for entry in scores:
+                point_id = entry.get("id")
+                if point_id is None or point_id not in valid_ids:
+                    continue
+                score = max(0.0, min(1.0, float(entry.get("score", 0.0))))
+                prev = score_by_id.get(point_id)
+                if prev is None or score > prev:
+                    score_by_id[point_id] = score
+                batch_accepted += 1
+
+            unique_count = len(score_by_id)
+            progress = (
+                f"已接收 {batch_accepted} 条有效评分；"
+                f"累计唯一有效 {unique_count}/{top_k}。"
+            )
+            if unique_count >= top_k:
+                raise AgentTaskComplete()
+            return progress
+
+        async def handle_end_task(**kwargs) -> str:
+            raise AgentTaskComplete()
+
+        tool_handlers = {
+            "submit_scores": handle_submit_scores,
+            "end_task": handle_end_task,
+        }
+
+        try:
+            await self._agent.run_agent(
+                agent_name=agent_name,
+                input_variables={},
+                tool_handlers=tool_handlers,
+                user_message=user_message,
+            )
+        except AgentTaskComplete:
+            pass
+
+        return [
+            RerankerScoreEntry(id=point_id, score=score)
+            for point_id, score in score_by_id.items()
+        ]
 
     @staticmethod
     def _build_reranker_user_message(
@@ -399,29 +455,29 @@ class McpService:
     # =========================================================================
 
     async def _register_reranker_agent(self) -> None:
-        """Sort providers and register only the first one. Others are lazy."""
+        """Sort providers and store for priority dispatch."""
         reranker_cfg = self._reranker_config
 
         if not reranker_cfg.providers:
             logger.warning("reranker_no_providers_configured")
             return
 
-        # Sort by priority and store for lazy registration
+        # Sort by priority and store for priority queue dispatch
         self._sorted_providers = sorted(reranker_cfg.providers, key=lambda e: e.priority)
+        self._registered_agents = {}
         self._reranker_agent_names = []
-        self._reranker_next_idx = 0
 
-        # Register only the first (highest priority) provider
-        await self._register_next_reranker()
+        # Pre-register first provider if it's agent-based
+        if self._sorted_providers:
+            first_entry = self._sorted_providers[0]
+            pcfg = self._config_manager.config.agent.llm.providers.get(first_entry.provider)
+            if pcfg and pcfg.api_format != "jev":
+                await self._ensure_reranker_agent(first_entry, 0)
 
-    async def _register_next_reranker(self) -> bool:
-        """Register the next provider in the queue. Returns False if exhausted."""
-        if self._reranker_next_idx >= len(self._sorted_providers):
-            return False
-
-        entry = self._sorted_providers[self._reranker_next_idx]
-        idx = self._reranker_next_idx
-        self._reranker_next_idx += 1
+    async def _ensure_reranker_agent(self, entry: MCPRerankerProviderEntry, idx: int) -> str:
+        """Register reranker agent for an agent-based provider entry if not already registered."""
+        if idx in self._registered_agents:
+            return self._registered_agents[idx]
 
         agent_name = f"{_RERANKER_AGENT_PREFIX}_{idx}"
 
@@ -499,6 +555,7 @@ class McpService:
             max_rate_limit_retries=self._reranker_config.max_rate_limit_retries,
         )
         await self._agent.register_agent(agent_def)
+        self._registered_agents[idx] = agent_name
         self._reranker_agent_names.append(agent_name)
         logger.info(
             "reranker_agent_registered",
@@ -507,7 +564,7 @@ class McpService:
             model=entry.model,
             queue_index=idx,
         )
-        return True
+        return agent_name
 
     # =========================================================================
     # 2.4 Project info helpers

@@ -219,7 +219,7 @@ class ProviderModelRef(BaseModel):
 
 
 class LLMProviderConfig(BaseModel):
-    api_format: str  # "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu" | "deepseek"
+    api_format: str  # "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu" | "deepseek" | "jev"
     api_base_url: str
     models: List[ProviderModelRef] = Field(default_factory=list)
     api_keys: List[ApiKeyConfig] = Field(default_factory=list)

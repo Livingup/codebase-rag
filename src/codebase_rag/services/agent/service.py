@@ -137,6 +137,9 @@ class AgentService:
 
         # Initialize providers and keypools
         for pname, pcfg in llm_cfg.providers.items():
+            if pcfg.api_format == "jev":
+                # Jev is a System One decision model used directly by MCP reranker
+                continue
             self._providers[pname] = _create_provider(pname, pcfg)
 
             keys = [k.key for k in pcfg.api_keys if k.key]

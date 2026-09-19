@@ -126,6 +126,13 @@ agent:
         compression_threshold: 200000
         supports_tool_calling: true
         supports_structured_output: true
+      gemini-3.7-flash-high:
+        name: "gemini-3.7-flash-high"
+        context_window: 1048576
+        max_output_tokens: 65536
+        compression_threshold: 350000
+        supports_tool_calling: true
+        supports_structured_output: true
       gpt-5.4:
         name: "gpt-5.4"
         context_window: 1048576
@@ -189,8 +196,8 @@ agent:
         compression_threshold: 180000
         supports_tool_calling: true
         supports_structured_output: true
-      deepseek-v4-flash:
-        name: "deepseek-v4-flash"
+      deepseek-flash:
+        name: "deepseek-flash"
         context_window: 1048576
         max_output_tokens: 393216
         compression_threshold: 300000
@@ -265,6 +272,9 @@ agent:
         api_format: "deepseek"
         api_base_url: "https://api.deepseek.com"
         models:
+          - id: "deepseek-flash"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
           - id: "deepseek-v4-flash"
             tool_choice: "auto"
             thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
@@ -404,6 +414,35 @@ agent:
           retry_backoff_multiplier: 2.0
           key_cooldown_seconds: 60
         max_concurrency: 100                  # 该服务商最大并发请求数
+      localcliproxy:
+        api_format: "gemini"
+        api_base_url: "${LOCALCLIPROXY_BASE_URL}"
+        models:
+          - id: "gemini-3.7-flash-high"
+            tool_choice: "auto"
+            thinking: '{"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}'
+        api_keys:
+          - key: "${LOCALCLIPROXY_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 100                  # 该服务商最大并发请求数
+      jev_provider:
+        api_format: "jev"
+        api_base_url: "${JEV_BASE_URL}"
+        models:
+          - id: "~typesafe/jev-latest"
+        api_keys:
+          - key: "${JEV_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 0.5
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 20                   # 该服务商最大并发请求数
+        request_timeout: 10                   # 单次调用超时（秒）
     default_provider: "deepseek"
     default_model: "deepseek-v4-pro"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
@@ -412,7 +451,7 @@ agent:
         model: "gpt-5.6-terra"
         priority: 10
       - provider: "openai_compatible_secondary"
-        model: "gpt-5.4"
+        model: "gpt-5.6-luna"
         priority: 20
       - provider: "deepseek"
         model: "deepseek-v4-pro"
@@ -673,7 +712,7 @@ workflow:
         model: "gpt-5.6-terra"
         priority: 50
       - provider: "openai_compatible_secondary"
-        model: "gpt-5.4"
+        model: "gpt-5.6-luna"
         priority: 60
       - provider: "deepseek"
         model: "deepseek-v4-pro"
@@ -686,10 +725,10 @@ workflow:
         model: "gpt-5.6-luna"
         priority: 50
       - provider: "openai_compatible_secondary"
-        model: "gpt-5.4"
+        model: "gpt-5.6-luna"
         priority: 60
       - provider: "deepseek"
-        model: "deepseek-v4-flash"
+        model: "deepseek-flash"
         priority: 70
       - provider: "deepseek"
         model: "deepseek-v4-pro"
@@ -709,7 +748,7 @@ context_engine:
       model: "gpt-5.6-terra"
       priority: 10
     - provider: "openai_compatible_secondary"
-      model: "gpt-5.4"
+      model: "gpt-5.6-luna"
       priority: 20
     - provider: "deepseek"
       model: "deepseek-v4-pro"
@@ -765,18 +804,18 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
+      - provider: "jev_provider"
+        model: "~typesafe/jev-latest"
+        priority: 5
+      - provider: "deepseek"
+        model: "deepseek-flash"
+        priority: 10
       - provider: "openai_compatible_secondary"
         model: "gpt-5.6-luna"
         priority: 50
       - provider: "deepseek"
-        model: "deepseek-v4-flash"
-        priority: 60
-      - provider: "deepseek"
         model: "deepseek-v4-pro"
         priority: 70
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.4"
-        priority: 80
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 600                          # 重排序 agent 超时（秒，10 分钟）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
