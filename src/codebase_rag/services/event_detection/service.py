@@ -124,17 +124,23 @@ class EventDetectionService:
         self._hook_check_task = asyncio.create_task(self._periodic_hook_check())
 
         self._initialized = True
+        self._config_manager.register_reconciler("event_detection", self.reconcile)
         logger.info(
             "event_detection_service_initialized",
             mode=self._config.hook_receiver.mode,
             watcher_enabled=self._config.watcher.enabled,
         )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile event detection configuration (watchers)."""
+        await self.reconcile_watchers()
+
     async def shutdown(self) -> None:
         """Graceful shutdown: stop watchers and hook receiver.
 
         Does NOT remove hook scripts (they can be reused on next startup).
         """
+        self._config_manager.unregister_reconciler("event_detection")
         logger.info("event_detection_service_shutting_down")
 
         # Cancel periodic hook health check

@@ -150,6 +150,7 @@ class McpClientService:
         self._servers: Dict[str, _ServerConnection] = {}
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._config_manager.register_reconciler("mcp_client", self.reconcile)
 
     @property
     def _config(self) -> McpClientConfig:
@@ -193,8 +194,35 @@ class McpClientService:
                 servers=list(self._servers.keys()),
             )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile MCP server connections with new configuration."""
+        if not self._initialized:
+            return
+
+        logger.info("mcp_client_service_reconciling")
+        old_servers = old_config.mcp_client.servers
+        new_servers = new_config.mcp_client.servers
+
+        async with self._init_lock:
+            # 1. Remove deleted servers
+            for name in set(old_servers.keys()) - set(new_servers.keys()):
+                self._servers.pop(name, None)
+                logger.info("mcp_client_server_removed", server=name)
+
+            # 2. Add or update servers
+            for name, server_cfg in new_servers.items():
+                if name not in self._servers or old_servers.get(name) != server_cfg:
+                    conn = _ServerConnection(server_cfg)
+                    try:
+                        await conn.discover_tools()
+                        self._servers[name] = conn
+                        logger.info("mcp_client_server_reconciled", server=name)
+                    except Exception as e:
+                        logger.warning("mcp_client_server_reconcile_failed", server=name, error=str(e)[:200])
+
     async def shutdown(self) -> None:
         """Clear all server connections."""
+        self._config_manager.unregister_reconciler("mcp_client")
         logger.info("mcp_client_service_shutting_down")
         self._servers.clear()
         self._initialized = False

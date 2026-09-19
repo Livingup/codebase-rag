@@ -82,6 +82,7 @@ class QdrantStorageService:
         await self._ensure_collection()
 
         self._initialized = True
+        self._config_manager.register_reconciler("qdrant_storage", self.reconcile)
         logger.info(
             "qdrant_storage_service_initialized",
             host=conn.host,
@@ -89,8 +90,54 @@ class QdrantStorageService:
             collection=self._config.collection.name,
         )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile Qdrant connection and collection settings."""
+        logger.info("qdrant_storage_service_reconciling")
+
+        old_conn = old_config.qdrant_storage.connection
+        new_conn = new_config.qdrant_storage.connection
+
+        # If connection params changed, attempt graceful swap
+        if (
+            old_conn.host != new_conn.host
+            or old_conn.port != new_conn.port
+            or old_conn.grpc_port != new_conn.grpc_port
+            or old_conn.https != new_conn.https
+            or old_conn.api_key != new_conn.api_key
+            or self._client is None
+        ):
+            logger.info(
+                "reconciling_qdrant_connection",
+                old_host=old_conn.host,
+                new_host=new_conn.host,
+            )
+            new_client = self._create_client()
+            try:
+                await new_client.get_collections()
+            except Exception as e:
+                await new_client.close()
+                raise QdrantConnectionError(
+                    f"Reconcile failed to connect to new Qdrant Server at {new_conn.host}:{new_conn.port}: {e}"
+                ) from e
+
+            async with self._client_lock:
+                old_client = self._client
+                self._client = new_client
+
+            if old_client:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
+
+        if new_config.qdrant_storage.max_concurrency != old_config.qdrant_storage.max_concurrency or self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(new_config.qdrant_storage.max_concurrency)
+
+        logger.info("qdrant_storage_service_reconciled")
+
     async def shutdown(self) -> None:
         """Close Qdrant connection."""
+        self._config_manager.unregister_reconciler("qdrant_storage")
         if self._client:
             await self._client.close()
             self._client = None

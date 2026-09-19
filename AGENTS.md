@@ -1,4 +1,4 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 本文档约定 Codebase RAG 在 Windows 本地运行场景下的开发、测试、提交、打包、本地安装与用户端更新流程。目标用户主要在 Windows 本地长期运行服务，因此所有运维脚本集中放在 `ops/windows/`，本文档只说明脚本用途和调用方式，不内嵌脚本源码。
 
@@ -81,7 +81,7 @@ unregister-local-service.ps1  # 卸载 Windows Service
 start-local-service.ps1       # 启动正式服务并执行健康检查
 stop-local-service.ps1        # 停止正式服务
 restart-local-service.ps1     # 重启正式服务并执行健康检查
-refresh-local-service-config.ps1 # 同步真实 .env 和最新 config.example.yaml 到正式配置目录，默认热 reload，可选重启服务
+refresh-local-service-config.ps1 # 触发正式配置热 reload 或重启，支持动态感知进程不可变变更并提示重启
 doctor-local-service.ps1      # 本地诊断 Python/Git/目录/端口/健康检查
 start-source-takeover.ps1     # 停正式服务，用本地最新源码接管正式配置启动测试
 push-source-to-remote.ps1     # 提交并推送源码到远程 Git 仓库
@@ -455,7 +455,7 @@ git pull --ff-only
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
 
-### 9.1 `.env` 与配置模板变更时更新服务
+### 9.1 配置热重载（Hot-Reload）与服务更新
 
 正式服务实际读取的是：
 
@@ -464,47 +464,30 @@ ${CODEBASE_RAG_DATA_DIR}\config\.env
 ${CODEBASE_RAG_DATA_DIR}\config\config.yaml
 ```
 
-源码仓库中的 `.env` 和 `config.example.yaml` 修改后，必须先同步到正式配置目录；服务不会自动监听这两个文件变化。
+**配置解耦原则**：
+- 源码仓库仅维护 `.env.example` 和 `config.example.yaml` 模板。
+- 正式运行配置严格保存在 `${CODEBASE_RAG_DATA_DIR}\config\`（默认 `C:\ProgramData\CodebaseRAG\config\`），禁止将正式运行配置存入源码仓库。
+- 运维脚本 `refresh-local-service-config.ps1` 直接面向正式配置目录操作，不再依赖仓库目录下的 `.env`，也不再执行模板强制覆盖。
 
-配置热更新需要显式调用 Management API：
+配置热重载接口：
 
 ```text
 POST http://127.0.0.1:18080/api/v1/config/reload
 ```
 
+系统内部采用 Reconciler 增量协同机制（ConfigManager + Service Reconcilers）：
+- **动态 Reconcile**：动态刷新各 LLM Provider/Model、KeyPool 密钥（增删改并完整保留现有健康度、失败计数与冷却状态）、并发信号量大小、向量数据库客户端连接与探活、外部 MCP Server 连接、Workflow 代理注册等。
+- **不可变参数感知**：自动检测进程不可变参数（Management API / MCP 监听端口或 Host、系统数据根目录、系统日志级别）。若存在不可变变更，API 成功完成支持动态更新的部分并返回 `requires_restart: true` 及原因列表，而不引发服务中断或异常崩溃。
+
 更新规则：
 
-| 修改内容 | 推荐命令 | 是否需要重启 | 原因 |
+| 修改内容 | 推荐命令 | 是否需要重启 | 行为说明 |
 | --- | --- | --- | --- |
-| 只修改 `.env` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart` | 需要 | `.env` 会被加载到服务进程环境中，已有环境变量和已初始化客户端不应只依赖热 reload 更新。 |
-| 只修改 `config.example.yaml` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env` | 通常不需要 | 脚本会刷新正式 `config.yaml`，默认调用 `/api/v1/config/reload` 并健康检查。 |
-| 同时修改 `.env` 和 `config.example.yaml` | `.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -Restart` | 需要 | 既要同步正式 `.env`，又要刷新正式 `config.yaml`；按 `.env` 变更处理，重启最稳妥。 |
+| 修改参数规则、优先级、模型配置或密钥凭据 | `.\ops\windows\refresh-local-service-config.ps1` | 不需要 | 直接针对 `${CODEBASE_RAG_DATA_DIR}\config\` 触发热重载，Reconciler 平滑平移连接与状态。 |
+| 改动核心服务端口、系统数据根目录等不可变参数 | `.\ops\windows\refresh-local-service-config.ps1 -Restart` | 需要 | 脚本在检测到需重启时自动或手动追加 `-Restart` 重启 Windows Service。 |
+| 仅需同步指定外部配置文件并触发重载 | `.\ops\windows\refresh-local-service-config.ps1 -ConfigPath <path> -EnvFile <path>` | 视配置而定 | 可显式指定输入文件路径同步至正式配置目录并重载。 |
 
-如果 `config.example.yaml` 的变更涉及服务启动期配置（如 Management API 端口、MCP 监听端口、日志初始化参数、已初始化客户端连接参数等），即使没有修改 `.env`，也应使用 `-Restart`。
-
-如果只想把文件同步到正式配置目录，暂时不触发 reload 或重启：
-
-```powershell
-.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env -SkipReload
-```
-
-在解压后的本地安装包目录执行同名脚本：
-
-```powershell
-.\scripts\refresh-local-service-config.ps1 -EnvFile <path-to-real-env>
-.\scripts\refresh-local-service-config.ps1 -EnvFile <path-to-real-env> -Restart
-```
-
-脚本会执行：
-
-1. 读取用户提供的真实 `.env`。
-2. 定位 `${CODEBASE_RAG_DATA_DIR}\config`。
-3. 复制真实 `.env` 到 `${CODEBASE_RAG_DATA_DIR}\config\.env`，并校正其中的 `CODEBASE_RAG_DATA_DIR`。
-4. 使用当前源码或安装包内的 `config.example.yaml` 覆盖正式 `config.yaml`。
-5. 默认调用 `/api/v1/config/reload` 触发热 reload 并执行健康检查。
-6. 如果传入 `-Restart`，重启 Windows Service 并执行健康检查。
-
-如果 Python 源码、依赖、运维脚本或入口逻辑也发生变化，不使用本节的轻量刷新流程，应重新构建 zip 并执行 `update-from-zip.ps1`。
+如果 Python 源码、依赖、运维脚本或入口逻辑发生变化，不使用轻量刷新流程，应重新构建 zip 并执行 `update-from-zip.ps1`。
 
 ## 10. 日常运维命令
 
@@ -535,7 +518,7 @@ Get-Service CodebaseRAG
 刷新正式配置并热 reload：
 
 ```powershell
-.\ops\windows\refresh-local-service-config.ps1 -EnvFile .\.env
+.\ops\windows\refresh-local-service-config.ps1
 ```
 
 诊断服务：

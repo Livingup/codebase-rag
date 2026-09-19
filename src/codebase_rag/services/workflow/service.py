@@ -150,10 +150,43 @@ class WorkflowOrchestratorService:
             logger.info("compensation_task_started")
 
         self._initialized = True
+        self._config_manager.register_reconciler("workflow", self.reconcile)
         logger.info("workflow_service_initialized")
+
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile agent definitions, routing queues, and compensation loop."""
+        logger.info("workflow_service_reconciling")
+
+        # 1. Rebuild and re-register agents if workflow prompts or providers changed
+        await self._register_agents()
+
+        # 2. Reconcile compensation background task
+        old_comp = old_config.workflow.compensation.enabled
+        new_comp = new_config.workflow.compensation.enabled
+
+        if not old_comp and new_comp:
+            if self._comp_task is None or self._comp_task.done():
+                self._comp_task = asyncio.create_task(self._compensation_loop())
+                logger.info("compensation_task_started_via_reconcile")
+        elif old_comp and not new_comp:
+            if self._comp_task is not None and not self._comp_task.done():
+                self._comp_task.cancel()
+                try:
+                    await self._comp_task
+                except asyncio.CancelledError:
+                    pass
+                self._comp_task = None
+                logger.info("compensation_task_stopped_via_reconcile")
+
+        logger.info(
+            "workflow_service_reconciled",
+            kp_providers=list(self._kp_provider_order),
+            gray_providers=list(self._gray_provider_order),
+        )
 
     async def shutdown(self) -> None:
         """Gracefully stop task queue and wait for current tasks."""
+        self._config_manager.unregister_reconciler("workflow")
         logger.info("workflow_service_shutting_down")
 
         # Cancel compensation task

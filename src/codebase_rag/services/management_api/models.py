@@ -219,6 +219,9 @@ class ReloadConfigResponse(BaseModel):
 
     reloaded: bool
     message: str = ""
+    requires_restart: bool = False
+    restart_reasons: List[str] = []
+    reconciled_services: List[str] = []
 
 
 class UpdateConfigResponse(BaseModel):

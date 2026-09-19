@@ -162,6 +162,7 @@ class EmbeddingService:
         )
 
         self._initialized = True
+        self._config_manager.register_reconciler("embedding", self.reconcile)
         logger.info(
             "embedding_service_initialized",
             dense_provider=dense_name,
@@ -170,8 +171,78 @@ class EmbeddingService:
             sparse_keys=self._sparse_keypool.healthy_keys,
         )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile embedding providers, KeyPools, and concurrency limits."""
+        logger.info("embedding_service_reconciling")
+
+        new_emb = new_config.embedding
+        old_emb = old_config.embedding
+
+        # 1. Concurrency limit
+        if new_emb.max_concurrency != old_emb.max_concurrency or self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(new_emb.max_concurrency)
+
+        # 2. Dense provider reconciliation
+        dense_name = new_emb.dense.active_provider
+        dense_cfg = new_emb.dense.providers.get(dense_name)
+        if dense_cfg is not None:
+            dense_keys = [k.key for k in dense_cfg.api_keys if k.key]
+            if dense_name != old_emb.dense.active_provider or self._dense_provider is None:
+                factory = _DENSE_PROVIDER_FACTORIES.get(dense_name)
+                if factory:
+                    if self._dense_provider and hasattr(self._dense_provider, "close"):
+                        await self._dense_provider.close()
+                    self._dense_provider = factory(dense_cfg)
+                    self._dense_cfg = dense_cfg
+                    if dense_keys:
+                        self._dense_keypool = KeyPool(
+                            keys=dense_keys,
+                            cooldown_seconds=dense_cfg.retry.key_cooldown_seconds,
+                            max_consecutive_failures=dense_cfg.retry.max_retries_per_key,
+                        )
+            elif dense_keys and self._dense_keypool:
+                await self._dense_keypool.update_keys(
+                    keys=dense_keys,
+                    cooldown_seconds=dense_cfg.retry.key_cooldown_seconds,
+                    max_consecutive_failures=dense_cfg.retry.max_retries_per_key,
+                )
+
+        # 3. Sparse provider reconciliation
+        sparse_name = new_emb.sparse.active_provider
+        sparse_cfg = new_emb.sparse.providers.get(sparse_name)
+        if sparse_cfg is not None:
+            sparse_keys = [k.key for k in sparse_cfg.api_keys if k.key]
+            if sparse_name != old_emb.sparse.active_provider or self._sparse_provider is None:
+                factory_s = _SPARSE_PROVIDER_FACTORIES.get(sparse_name)
+                if factory_s:
+                    if self._sparse_provider and hasattr(self._sparse_provider, "close"):
+                        await self._sparse_provider.close()
+                    self._sparse_provider = factory_s(sparse_cfg)
+                    self._sparse_cfg = sparse_cfg
+                    if sparse_keys:
+                        self._sparse_keypool = KeyPool(
+                            keys=sparse_keys,
+                            cooldown_seconds=sparse_cfg.retry.key_cooldown_seconds,
+                            max_consecutive_failures=sparse_cfg.retry.max_retries_per_key,
+                        )
+            elif sparse_keys and self._sparse_keypool:
+                await self._sparse_keypool.update_keys(
+                    keys=sparse_keys,
+                    cooldown_seconds=sparse_cfg.retry.key_cooldown_seconds,
+                    max_consecutive_failures=sparse_cfg.retry.max_retries_per_key,
+                )
+
+        logger.info(
+            "embedding_service_reconciled",
+            dense_provider=dense_name,
+            sparse_provider=sparse_name,
+            dense_healthy_keys=self._dense_keypool.healthy_keys if self._dense_keypool else 0,
+            sparse_healthy_keys=self._sparse_keypool.healthy_keys if self._sparse_keypool else 0,
+        )
+
     async def shutdown(self) -> None:
         """Close HTTP clients and release resources."""
+        self._config_manager.unregister_reconciler("embedding")
         if self._dense_provider and hasattr(self._dense_provider, "close"):
             await self._dense_provider.close()
         if self._sparse_provider and hasattr(self._sparse_provider, "close"):
@@ -383,6 +454,7 @@ class EmbeddingService:
         try:
             ok = await asyncio.wait_for(provider.health_check(api_key), timeout=timeout)
         except TimeoutError:
+            await keypool.report_failure(api_key)
             elapsed = asyncio.get_running_loop().time() - started
             return {
                 "ok": False,
@@ -392,6 +464,7 @@ class EmbeddingService:
                 "key_suffix": api_key[-6:],
             }
         except Exception as e:
+            await keypool.report_failure(api_key)
             elapsed = asyncio.get_running_loop().time() - started
             return {
                 "ok": False,
@@ -401,6 +474,12 @@ class EmbeddingService:
                 "key_suffix": api_key[-6:],
             }
         elapsed = asyncio.get_running_loop().time() - started
+        
+        if ok:
+            await keypool.report_success(api_key)
+        else:
+            await keypool.report_failure(api_key)
+            
         return {
             "ok": bool(ok),
             "status": "available" if ok else "unavailable",

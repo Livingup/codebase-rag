@@ -733,20 +733,26 @@ class ManagementApiService:
             clients=clients,
         )
 
-    async def reload_config(self) -> None:
+    async def reload_config(self) -> Dict[str, Any]:
         """Trigger configuration hot reload via ConfigManager.
 
-        Re-reads config.yaml from disk, validates it, and replaces the
-        in-memory AppConfig singleton.  All services read config via
-        @property from ConfigManager, so they automatically pick up
-        the new values on next access.
+        Re-reads config.yaml and .env from disk, validates it, invokes registered
+        reconcilers across all downstream services, and replaces the in-memory
+        AppConfig singleton.
+
+        Returns:
+            Dict containing requires_restart, restart_reasons, and reconciled_services.
 
         Raises:
             Exception: If config file is invalid or reload fails.
         """
         await self._config_manager.reload()
-        await self._event_detection.reconcile_watchers()
         logger.info("config_reload_triggered_via_api")
+        return {
+            "requires_restart": bool(self._config_manager.last_restart_reasons),
+            "restart_reasons": list(self._config_manager.last_restart_reasons),
+            "reconciled_services": list(self._config_manager.last_reconciled_services),
+        }
 
     # =========================================================================
     # Internal helpers

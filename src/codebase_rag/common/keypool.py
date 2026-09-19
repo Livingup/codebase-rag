@@ -93,6 +93,8 @@ class KeyPool:
             for state in self._states:
                 if state.key == key:
                     state.consecutive_failures = 0
+                    state.healthy = True
+                    state.cooldown_until = 0.0
                     break
 
     async def report_failure(self, key: str) -> None:
@@ -144,3 +146,35 @@ class KeyPool:
             }
             for s in self._states
         ]
+
+    async def update_keys(
+        self,
+        keys: List[str],
+        cooldown_seconds: Optional[int] = None,
+        max_consecutive_failures: Optional[int] = None,
+    ) -> None:
+        """Dynamically update keys and parameters while preserving existing key health telemetry."""
+        if not keys:
+            raise ValueError("KeyPool requires at least one API key")
+
+        async with self._lock:
+            existing = {s.key: s for s in self._states}
+            new_states: List[KeyState] = []
+            for k in keys:
+                if k in existing:
+                    new_states.append(existing[k])
+                else:
+                    new_states.append(KeyState(key=k))
+            self._states = new_states
+            if cooldown_seconds is not None:
+                self._cooldown_seconds = cooldown_seconds
+            if max_consecutive_failures is not None:
+                self._max_consecutive_failures = max_consecutive_failures
+            self._index = 0
+            logger.info(
+                "keypool_keys_updated",
+                total_keys=len(self._states),
+                cooldown_seconds=self._cooldown_seconds,
+                max_consecutive_failures=self._max_consecutive_failures,
+            )
+

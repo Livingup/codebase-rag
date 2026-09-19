@@ -103,13 +103,19 @@ class JevRerankerClient:
         provider_name: str,
         provider_cfg: LLMProviderConfig,
     ) -> KeyPool:
-        """Lazily initialize or retrieve KeyPool for a Jev provider."""
         async with self._keypool_lock:
+            keys = [k.key for k in provider_cfg.api_keys if k.key]
+            if not keys:
+                self._keypools.pop(provider_name, None)
+                raise RerankerError(f"Jev provider '{provider_name}' has no valid API keys configured.")
             if provider_name not in self._keypools:
-                keys = [k.key for k in provider_cfg.api_keys if k.key]
-                if not keys:
-                    raise RerankerError(f"Jev provider '{provider_name}' has no valid API keys configured.")
                 self._keypools[provider_name] = KeyPool(
+                    keys=keys,
+                    cooldown_seconds=provider_cfg.retry.key_cooldown_seconds,
+                    max_consecutive_failures=provider_cfg.retry.max_retries_per_key,
+                )
+            else:
+                await self._keypools[provider_name].update_keys(
                     keys=keys,
                     cooldown_seconds=provider_cfg.retry.key_cooldown_seconds,
                     max_consecutive_failures=provider_cfg.retry.max_retries_per_key,

@@ -158,6 +158,7 @@ class AgentService:
             )
 
         self._initialized = True
+        self._config_manager.register_reconciler("agent", self.reconcile)
         logger.info(
             "agent_service_initialized",
             providers=list(self._providers.keys()),
@@ -165,7 +166,73 @@ class AgentService:
             default_model=llm_cfg.default_model,
         )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile LLM providers, KeyPools, and concurrency limits with new configuration."""
+        new_llm_cfg = new_config.agent.llm
+        old_llm_cfg = old_config.agent.llm
+
+        old_pnames = set(self._providers.keys())
+        new_pnames = {
+            name for name, pcfg in new_llm_cfg.providers.items()
+            if pcfg.api_format != "jev"
+        }
+
+        # 1. Remove deleted providers
+        for pname in old_pnames - new_pnames:
+            logger.info("reconcile_removing_provider", provider=pname)
+            self._providers.pop(pname, None)
+            self._keypools.pop(pname, None)
+            self._provider_sems.pop(pname, None)
+
+        # 2. Add or update providers
+        for pname in new_pnames:
+            pcfg = new_llm_cfg.providers[pname]
+            keys = [k.key for k in pcfg.api_keys if k.key]
+
+            if pname not in self._providers:
+                # Brand new provider
+                self._providers[pname] = _create_provider(pname, pcfg)
+                if keys:
+                    self._keypools[pname] = KeyPool(
+                        keys=keys,
+                        cooldown_seconds=pcfg.retry.key_cooldown_seconds,
+                        max_consecutive_failures=pcfg.retry.max_retries_per_key,
+                    )
+                self._provider_sems[pname] = asyncio.Semaphore(pcfg.max_concurrency)
+                logger.info("reconcile_added_provider", provider=pname)
+            else:
+                # Existing provider: update instance
+                self._providers[pname] = _create_provider(pname, pcfg)
+
+                # Update keypool if keys or retry changed
+                if keys:
+                    if pname in self._keypools:
+                        await self._keypools[pname].update_keys(
+                            keys=keys,
+                            cooldown_seconds=pcfg.retry.key_cooldown_seconds,
+                            max_consecutive_failures=pcfg.retry.max_retries_per_key,
+                        )
+                    else:
+                        self._keypools[pname] = KeyPool(
+                            keys=keys,
+                            cooldown_seconds=pcfg.retry.key_cooldown_seconds,
+                            max_consecutive_failures=pcfg.retry.max_retries_per_key,
+                        )
+                else:
+                    self._keypools.pop(pname, None)
+
+                # Update semaphore if concurrency changed
+                old_pcfg = old_llm_cfg.providers.get(pname)
+                if old_pcfg is None or old_pcfg.max_concurrency != pcfg.max_concurrency:
+                    self._provider_sems[pname] = asyncio.Semaphore(pcfg.max_concurrency)
+
+        logger.info(
+            "agent_service_reconciled",
+            active_providers=list(self._providers.keys()),
+        )
+
     async def shutdown(self) -> None:
+        self._config_manager.unregister_reconciler("agent")
         self._providers.clear()
         self._keypools.clear()
         self._agents.clear()

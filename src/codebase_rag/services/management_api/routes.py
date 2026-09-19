@@ -181,10 +181,13 @@ def create_router(service: ManagementApiService) -> APIRouter:
     @router.post("/config/reload", response_model=ReloadConfigResponse)
     async def reload_config():
         try:
-            await service.reload_config()
+            result = await service.reload_config()
             return ReloadConfigResponse(
                 reloaded=True,
                 message="Configuration reloaded successfully",
+                requires_restart=result.get("requires_restart", False),
+                restart_reasons=result.get("restart_reasons", []),
+                reconciled_services=result.get("reconciled_services", []),
             )
         except Exception as e:
             _error(500, "RELOAD_ERROR", f"Config reload failed: {e}")
