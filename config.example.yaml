@@ -475,21 +475,6 @@ agent:
           key_cooldown_seconds: 60
         max_concurrency: 20                   # 该服务商最大并发请求数
         request_timeout: 10                   # 单次调用超时（秒）
-      # 通用 Jev 渠道（支持直接配置任意 Jev 兼容网关）
-      jev_provider:
-        api_format: "jev"
-        api_base_url: "${JEV_BASE_URL}"
-        models:
-          - id: "~typesafe/jev-latest"
-        api_keys:
-          - key: "${JEV_API_KEY}"
-        retry:
-          max_retries_per_key: 3
-          retry_base_delay: 0.5
-          retry_backoff_multiplier: 2.0
-          key_cooldown_seconds: 60
-        max_concurrency: 20                   # 该服务商最大并发请求数
-        request_timeout: 10                   # 单次调用超时（秒）
     default_provider: "deepseek"
     default_model: "deepseek-v4-pro"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
