@@ -836,22 +836,23 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      # 1. Jev 官方直连（最高优先级）
-      - provider: "jev_official"
-        model: "jev-latest"
-        priority: 1
-      # 2. OpenRouter 聚合决策端点
-      - provider: "jev_openrouter"
-        model: "~typesafe/jev-latest"
-        priority: 2
-      # 3. Vercel AI Gateway 评估模型网关
-      - provider: "jev_vercel"
-        model: "typesafe-ai/jev"
-        priority: 3
-      # 4. 原有 LLM 对话模型兜底队列
+      # 1. DeepSeek 对话模型（最高优先级）
       - provider: "deepseek"
         model: "deepseek-flash"
-        priority: 10
+        priority: 1
+      # 2. Jev 官方直连
+      - provider: "jev_official"
+        model: "jev-latest"
+        priority: 2
+      # 3. OpenRouter 聚合决策端点
+      - provider: "jev_openrouter"
+        model: "~typesafe/jev-latest"
+        priority: 3
+      # 4. Vercel AI Gateway 评估模型网关
+      - provider: "jev_vercel"
+        model: "typesafe-ai/jev"
+        priority: 4
+      # 5. 原有 LLM 对话模型兜底队列
       - provider: "openai_compatible_secondary"
         model: "gpt-5.6-luna"
         priority: 50
