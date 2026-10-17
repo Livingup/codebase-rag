@@ -43,6 +43,12 @@ def _cache_key(project_id: str, branch_name: str, commit_hash: str) -> str:
     return f"{project_id}:{branch_name}@{commit_hash}"
 
 
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    """Retrieve an unobserved task exception to suppress asyncio warnings."""
+    if not task.cancelled():
+        task.exception()
+
+
 class _CachedInstance:
     """Internal wrapper for an in-memory Qdrant instance."""
 
@@ -89,8 +95,12 @@ class MemoryQdrantService:
         self._config_manager = config_manager
         # LRU cache: OrderedDict preserves insertion/access order
         self._cache: OrderedDict[str, _CachedInstance] = OrderedDict()
+        # Staging handles currently loading and protected from cache cleanup
+        self._loading: set[str] = set()
         # Active instance per project: project_id → cache_key
         self._active: Dict[str, str] = {}
+        # One shared lazy rebuild task per project_id
+        self._in_flight_rebuilds: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
         self._initialized = False
         # Lazy rebuild: called when search finds no active instance
@@ -130,12 +140,20 @@ class MemoryQdrantService:
                 pass
             self._idle_sweep_task = None
 
+        tasks = list(self._in_flight_rebuilds.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._in_flight_rebuilds.clear()
+
         async with self._lock:
             for key, inst in self._cache.items():
                 await inst.client.close()
                 logger.info("instance_released", cache_key=key)
             self._cache.clear()
             self._active.clear()
+            self._loading.clear()
         self._initialized = False
         logger.info("memory_qdrant_service_shutdown")
 
@@ -230,10 +248,13 @@ class MemoryQdrantService:
             # Register in cache
             cached = _CachedInstance(client, project_id, branch_name, commit_hash)
             self._cache[key] = cached
+            if staging:
+                self._loading.add(key)
 
             logger.info(
                 "instance_created",
                 cache_key=key,
+                staging=staging,
                 dense_dim=inst_cfg.dense_vector.size,
             )
             return key
@@ -522,6 +543,7 @@ class MemoryQdrantService:
                     f"Instance not in cache: {handle}. Create it first."
                 )
             inst = self._cache[handle]
+            self._loading.discard(handle)
             active_key = _cache_key(inst.project_id, inst.branch_name, inst.commit_hash)
             if handle != active_key:
                 existing = self._cache.pop(active_key, None)
@@ -615,12 +637,25 @@ class MemoryQdrantService:
         return True
 
     async def destroy_inactive_instances(self, project_id: str) -> int:
-        """Close cached project instances except the currently active one."""
+        """Close inactive project instances, preserving any still loading."""
         async with self._lock:
             active_key = self._active.get(project_id)
+            skipped_loading = sum(
+                1
+                for key, inst in self._cache.items()
+                if (
+                    inst.project_id == project_id
+                    and key != active_key
+                    and key in self._loading
+                )
+            )
             keys_to_remove = [
                 key for key, inst in self._cache.items()
-                if inst.project_id == project_id and key != active_key
+                if (
+                    inst.project_id == project_id
+                    and key != active_key
+                    and key not in self._loading
+                )
             ]
             removed = await self._destroy_keys_locked(keys_to_remove)
 
@@ -628,6 +663,7 @@ class MemoryQdrantService:
             "inactive_instances_destroyed",
             project_id=project_id,
             count=removed,
+            skipped_loading=skipped_loading,
         )
         return removed
 
@@ -700,12 +736,25 @@ class MemoryQdrantService:
         removed = 0
         for key in keys:
             inst = self._cache.pop(key, None)
+            self._loading.discard(key)
             if inst is None:
                 continue
             await inst.client.close()
             logger.info("instance_destroyed", cache_key=key)
             removed += 1
         return removed
+
+    async def _run_rebuild(
+        self,
+        project_id: str,
+        handler: RebuildHandler,
+    ) -> None:
+        """Run one project's lazy rebuild and release its single-flight slot."""
+        try:
+            await handler(project_id)
+        finally:
+            if self._in_flight_rebuilds.get(project_id) is asyncio.current_task():
+                del self._in_flight_rebuilds[project_id]
 
     async def _get_active_instance_or_rebuild(
         self, project_id: str,
@@ -714,19 +763,43 @@ class MemoryQdrantService:
 
         If no active instance exists but a rebuild handler is registered,
         invoke it to recreate the instance from Qdrant Server, then retry.
+        Concurrent requests for one project share the same rebuild task.
         """
         inst, key = self._try_get_active(project_id)
         if inst is not None:
             return inst, key
 
         # No active instance — attempt lazy rebuild
-        if self._rebuild_handler is not None:
-            logger.info(
-                "lazy_rebuild_triggered",
-                project_id=project_id,
-            )
+        handler = self._rebuild_handler
+        if handler is not None:
+            task = self._in_flight_rebuilds.get(project_id)
+            if task is None:
+                logger.info(
+                    "lazy_rebuild_triggered",
+                    project_id=project_id,
+                )
+                task = asyncio.create_task(
+                    self._run_rebuild(project_id, handler),
+                    name=f"lazy_rebuild:{project_id}",
+                )
+                task.add_done_callback(_consume_task_exception)
+                self._in_flight_rebuilds[project_id] = task
+            else:
+                logger.info(
+                    "lazy_rebuild_joined",
+                    project_id=project_id,
+                )
+
             try:
-                await self._rebuild_handler(project_id)
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if task.cancelled() and (current is None or current.cancelling() == 0):
+                    raise NoActiveInstanceError(
+                        f"No active instance for project '{project_id}' "
+                        "and lazy rebuild was cancelled."
+                    ) from None
+                raise
             except Exception as e:
                 logger.warning(
                     "lazy_rebuild_failed",
@@ -772,15 +845,15 @@ class MemoryQdrantService:
     ) -> None:
         """Evict LRU instance if cache is full. Must hold lock.
 
-        Eviction priority:
-          1. Oldest non-active instance
-          2. Oldest idle active instance (search idle > idle_timeout_minutes)
+        Eviction priority (loading staging instances are never eligible):
+          1. Oldest non-active instance that is not loading
+          2. Oldest idle active instance (search idle >= idle_timeout_minutes)
 
         ``protected_project_id`` prevents staging reloads from evicting the same
         project's active instance before a replacement has loaded successfully.
         When no safe victim exists, ``allow_over_capacity`` lets a staging
-        replacement temporarily exceed the configured cache limit until promote
-        or failure cleanup runs.
+        replacement exceed the configured cache limit. Promotion does not
+        proactively shrink the cache; normal cleanup/eviction still applies.
         """
         if len(self._cache) < self._config.cache.max_branches:
             return
@@ -792,9 +865,9 @@ class MemoryQdrantService:
             else None
         )
 
-        # Priority 1: Find oldest non-active entry
+        # Priority 1: Find oldest non-active entry that is not still loading
         for key in self._cache:
-            if key not in active_keys:
+            if key not in active_keys and key not in self._loading:
                 await self._evict_instance(key)
                 return
 
@@ -803,7 +876,11 @@ class MemoryQdrantService:
         if idle_min > 0:
             now = datetime.now(timezone.utc)
             for key in self._cache:
-                if key == protected_active_key:
+                if (
+                    key in self._loading
+                    or key not in active_keys
+                    or key == protected_active_key
+                ):
                     continue
                 inst = self._cache[key]
                 idle_since = inst.last_search_time or inst.last_accessed
@@ -831,6 +908,7 @@ class MemoryQdrantService:
     async def _evict_instance(self, key: str) -> None:
         """Evict a single instance by cache key. Must hold lock."""
         inst = self._cache.pop(key)
+        self._loading.discard(key)
         await inst.client.close()
         logger.info(
             "instance_evicted",
