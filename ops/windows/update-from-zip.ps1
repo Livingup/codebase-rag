@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$EnvFile,
     [string]$PackageZip,
     [string]$ProgramDir,
@@ -39,7 +39,8 @@ if (Test-Path $oldVersionPath) {
 $oldCurrent = Get-CodebaseRagCurrentDir $resolvedProgramDir
 $oldCurrentTarget = $null
 if (Test-Path $oldCurrent) {
-    $oldCurrentTarget = (Get-Item $oldCurrent).Target
+    $target = (Get-Item $oldCurrent).Target
+    if ($target -is [array]) { $oldCurrentTarget = [string]$target[0] } else { $oldCurrentTarget = [string]$target }
 }
 
 $extractRoot = Join-Path $downloadsDir ([IO.Path]::GetFileNameWithoutExtension($PackageZip))
