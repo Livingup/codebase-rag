@@ -443,7 +443,7 @@ class GitOperationsService:
 
         Returns None if the file does not exist at that ref.
         """
-        clean_path = file_path.replace("\\", "/").strip().lstrip("/")
+        clean_path = normalize_repo_relative_path(repo_path, file_path)
         try:
             stdout = await self._run_git(
                 repo_path, ["ls-tree", ref, "--", clean_path]
@@ -487,7 +487,7 @@ class GitOperationsService:
             GitFileNotFoundError: If the file does not exist in the working directory.
             GitCommandError: If git hash-object fails.
         """
-        clean_path = file_path.replace("\\", "/").strip().lstrip("/")
+        clean_path = normalize_repo_relative_path(repo_path, file_path)
         abs_path = os.path.join(repo_path, clean_path)
         if not os.path.exists(abs_path):
             raise GitFileNotFoundError(clean_path, "working directory")
@@ -629,6 +629,38 @@ class GitOperationsService:
 # =============================================================================
 # Module-level utility
 # =============================================================================
+
+
+def normalize_repo_relative_path(repo_path: str, file_path: str) -> str:
+    """Normalize an incoming file path to a canonical repository-relative POSIX path.
+
+    Handles:
+      - Absolute paths matching repo_path (Windows backslash, POSIX forward slash, mixed, drive-letter case).
+      - Relative paths (with Windows backslash, POSIX forward slash, leading slashes).
+    """
+    if not file_path:
+        return ""
+
+    norm_file = os.path.normpath(file_path)
+    norm_repo = os.path.normpath(repo_path)
+
+    # 1. If file_path is an absolute path within repo_path
+    if os.path.isabs(norm_file):
+        try:
+            rel = os.path.relpath(norm_file, norm_repo)
+            if not rel.startswith(".."):
+                return rel.replace("\\", "/").strip().lstrip("/")
+        except ValueError:
+            # On Windows, relpath across different drives raises ValueError
+            pass
+
+    # 2. Fallback string prefix stripping (handles POSIX paths, case-insensitive drive/path differences)
+    clean_file = file_path.replace("\\", "/").strip()
+    clean_repo = repo_path.replace("\\", "/").strip().rstrip("/")
+    if clean_file.lower().startswith(clean_repo.lower() + "/"):
+        clean_file = clean_file[len(clean_repo) + 1 :]
+
+    return clean_file.replace("\\", "/").strip().lstrip("/")
 
 
 def compute_file_version_id(file_path: str, blob_hash: str) -> str:

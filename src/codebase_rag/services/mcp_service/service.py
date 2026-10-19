@@ -33,6 +33,7 @@ from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.git_operations.service import (
     GitOperationsService,
     compute_file_version_id,
+    normalize_repo_relative_path,
 )
 from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.memory_qdrant.errors import NoActiveInstanceError
@@ -615,18 +616,19 @@ class McpService:
 
         # Normalize input file_paths to canonical POSIX relative paths
         normalized_file_paths = [
-            fp.replace("\\", "/").strip().lstrip("/") for fp in file_paths
+            normalize_repo_relative_path(project_path, fp) for fp in file_paths
         ]
 
-        async def _query_one(fp: str) -> FileKnowledgeResult:
+        async def _query_one(canon_fp: str) -> FileKnowledgeResult:
+            outbound_fp = os.path.normpath(os.path.join(project_path, canon_fp))
             try:
                 blob_hash = await self._git_ops.get_blob_hash(
-                    project_path, head_ref, fp,
+                    project_path, head_ref, canon_fp,
                 )
                 if blob_hash is None:
-                    return FileKnowledgeResult(file_path=fp)
+                    return FileKnowledgeResult(file_path=outbound_fp)
 
-                fvid = compute_file_version_id(fp, blob_hash)
+                fvid = compute_file_version_id(canon_fp, blob_hash)
                 records = await self._qdrant_storage.get_file_points(
                     project_id, fvid,
                 )
@@ -638,15 +640,15 @@ class McpService:
                         descriptions.append(desc)
 
                 return FileKnowledgeResult(
-                    file_path=fp, descriptions=descriptions,
+                    file_path=outbound_fp, descriptions=descriptions,
                 )
             except Exception as e:
                 logger.warning(
                     "get_file_knowledge_error",
-                    file_path=fp,
+                    file_path=canon_fp,
                     error=str(e),
                 )
-                return FileKnowledgeResult(file_path=fp, error=str(e))
+                return FileKnowledgeResult(file_path=outbound_fp, error=str(e))
 
         results = await asyncio.gather(*[_query_one(fp) for fp in normalized_file_paths])
         return list(results)
@@ -684,18 +686,21 @@ class McpService:
         token_limit = self._knowledge_submission_config.point_token_limit
         result = AddKnowledgeResult()
 
+        canon_path = normalize_repo_relative_path(project_path, file_path)
+        outbound_path = os.path.normpath(os.path.join(project_path, canon_path))
+
         try:
             sync_result = await self._process_add_file(
                 project_id,
                 project_path,
-                file_path,
+                canon_path,
                 blob_hash,
                 knowledge_descriptions,
                 token_limit,
             )
             result.succeeded.append(
                 AddFileSuccess(
-                    file_path=file_path,
+                    file_path=outbound_path,
                     points_count=(
                         sync_result.points_count
                         if sync_result.points_count > 0
@@ -706,10 +711,10 @@ class McpService:
         except Exception as e:
             logger.warning(
                 "add_file_knowledge_failed",
-                file_path=file_path,
+                file_path=canon_path,
                 error=str(e),
             )
-            result.failed.append(AddFileFailure(file_path=file_path, error=str(e)))
+            result.failed.append(AddFileFailure(file_path=outbound_path, error=str(e)))
 
         logger.info(
             "add_file_knowledge_done",
@@ -740,25 +745,25 @@ class McpService:
         assert self._knowledge_sync is not None
 
         # Normalize file_path to canonical POSIX relative path
-        file_path = file_path.replace("\\", "/").strip().lstrip("/")
+        canon_path = normalize_repo_relative_path(project_path, file_path)
 
         # Verify the client-provided blob hash against current worktree content
         # before accepting any idempotent skip.
         current_blob_hash = await self._git_ops.get_workdir_blob_hash(
-            project_path, file_path,
+            project_path, canon_path,
         )
         if current_blob_hash != blob_hash:
             raise ValueError(
                 "blob_hash mismatch for "
-                f"{file_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
+                f"{canon_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
                 "Please recompute the Git blob hash for the latest file content."
             )
-        fvid = compute_file_version_id(file_path, blob_hash)
+        fvid = compute_file_version_id(canon_path, blob_hash)
 
         try:
             existing_result = await self._knowledge_sync.try_skip_existing_file_version(
                 project_id=project_id,
-                file_path=file_path,
+                file_path=canon_path,
                 file_version_id=fvid,
                 update_latest=True,
                 update_memory=True,
@@ -767,7 +772,7 @@ class McpService:
             logger.warning(
                 "add_file_knowledge_existing_fast_path_failed",
                 project_id=project_id,
-                file_path=file_path,
+                file_path=canon_path,
                 file_version_id=fvid[:16],
                 error=str(e)[:200],
             )
@@ -776,7 +781,7 @@ class McpService:
                 logger.info(
                     "add_file_knowledge_submitted",
                     project_id=project_id,
-                    file_path=file_path,
+                    file_path=canon_path,
                     file_version_id=fvid[:16],
                     points=len(descriptions),
                     published=existing_result.published,
@@ -801,11 +806,11 @@ class McpService:
         embeddings = await self._embedding.embed(descriptions, is_query=False)
 
         # Build PointData list
-        file_name = os.path.basename(file_path)
+        file_name = os.path.basename(canon_path)
         points: List[PointData] = []
         for desc, emb in zip(descriptions, embeddings):
             points.append(PointData(
-                file_path=file_path,
+                file_path=canon_path,
                 entity_type="file",
                 entity_name=file_name,
                 business_description=desc,
@@ -816,7 +821,7 @@ class McpService:
 
         sync_result = await self._knowledge_sync.submit_points(
             project_id=project_id,
-            file_path=file_path,
+            file_path=canon_path,
             blob_hash=blob_hash,
             file_version_id=fvid,
             points=points,
@@ -829,7 +834,7 @@ class McpService:
         logger.info(
             "add_file_knowledge_submitted",
             project_id=project_id,
-            file_path=file_path,
+            file_path=canon_path,
             file_version_id=fvid[:16],
             points=len(points),
             published=sync_result.published,

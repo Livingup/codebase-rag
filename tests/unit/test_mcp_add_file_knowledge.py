@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from codebase_rag.services.git_operations.service import compute_file_version_id
+from codebase_rag.services.git_operations.service import (
+    compute_file_version_id,
+    normalize_repo_relative_path,
+)
 from codebase_rag.services.knowledge_sync.models import KnowledgeSyncResult
 from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.mcp_service.service import McpService
@@ -235,6 +239,55 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(submit_call["update_latest"])
             self.assertTrue(submit_call["update_memory"])
             self.assertTrue(submit_call["replace_existing_job"])
+
+    def test_normalize_repo_relative_path(self) -> None:
+        repo = "G:/project/agent/agentruntime"
+        cases = [
+            (r"G:/project/agent/agentruntime/src\agent_runtime\focus_context\inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"G:\project\agent\agentruntime\src\agent_runtime\focus_context\inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"G:/project/agent/agentruntime/src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"g:/project/agent/agentruntime/src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"src\agent_runtime\focus_context\inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"/src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+        ]
+        for inp, expected in cases:
+            self.assertEqual(normalize_repo_relative_path(repo, inp), expected)
+
+    async def test_add_file_knowledge_with_absolute_and_mixed_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            abs_file_path = os.path.join(project_path, "src\\example.py")
+            rel_file_path = "src/example.py"
+            blob_hash = "abc123"
+            file_version_id = compute_file_version_id(rel_file_path, blob_hash)
+            fast_result = KnowledgeSyncResult(
+                file_version_id=file_version_id,
+                points_count=1,
+                published=True,
+                skipped_existing=True,
+            )
+            embedding = _Embedding()
+            git_ops = _GitOps(blob_hash)
+            knowledge_sync = _KnowledgeSync(fast_result=fast_result)
+            service = McpService(
+                config_manager=_ConfigManager(),
+                embedding=embedding,
+                memory_qdrant=SimpleNamespace(),
+                agent=SimpleNamespace(),
+                git_ops=git_ops,
+                knowledge_sync=knowledge_sync,
+            )
+
+            result = await service.add_file_knowledge(
+                project_path, abs_file_path, blob_hash, ["some knowledge"],
+            )
+
+            self.assertEqual(len(result.succeeded), 1)
+            self.assertEqual(result.succeeded[0].file_path, os.path.normpath(abs_file_path))
+            self.assertEqual(git_ops.calls, [(project_path, "src/example.py")])
+            self.assertEqual(knowledge_sync.try_skip_calls[0]["file_path"], "src/example.py")
+            self.assertEqual(knowledge_sync.try_skip_calls[0]["file_version_id"], file_version_id)
 
 
 class _Store:
