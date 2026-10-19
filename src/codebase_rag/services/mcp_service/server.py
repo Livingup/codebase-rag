@@ -150,7 +150,7 @@ TOOL_DEFINITIONS: list[Tool] = [
                 "file_paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "文件路径列表，相对于仓库根目录。例如 ['src/main.py', 'lib/utils.ts']",
+                    "description": "文件的绝对路径列表。服务端将根据 git_repo_path 动态计算相对路径。例如 ['G:/project/MyRepo/src/main.py']",
                 },
             },
             "required": ["git_repo_path", "file_paths"],
@@ -174,15 +174,13 @@ TOOL_DEFINITIONS: list[Tool] = [
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "文件路径，相对于仓库根目录",
+                    "description": "文件的绝对路径。服务端将根据 git_repo_path 动态计算相对路径",
                 },
                 "blob_hash": {
                     "type": "string",
                     "description": (
                         "当前工作区文件内容的 Git blob SHA-1（不是 commit/HEAD/path hash）。"
-                        "用 git -C <git_repo_path> hash-object -- <file_path> 计算；"
-                        "<file_path> 必须相对仓库根目录且与本参数 file_path 一致。"
-                        "后端会按当前工作区内容复算校验。"
+                        "后端会根据计算出的相对路径按当前工作区内容复算校验。"
                     ),
                 },
                 "knowledge_descriptions": {
