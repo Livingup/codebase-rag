@@ -83,7 +83,7 @@ class McpSearchTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(memory.active_info_calls, 0)
             self.assertEqual(memory.hybrid_search_calls, 1)
             self.assertEqual(len(results), 1)
-            self.assertEqual(results[0].file_path, os.path.join(project_path, "src/example.py"))
+            self.assertEqual(results[0].file_path, os.path.normpath(os.path.join(project_path, "src/example.py")))
 
     async def test_search_wraps_lazy_rebuild_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

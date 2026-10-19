@@ -222,7 +222,7 @@ class McpService:
             return [
                 SearchResultPoint(
                     score=c.vector_score,
-                    file_path=os.path.join(project_path, c.file_path),
+                    file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                     business_description=c.business_description,
                 )
                 for c in candidates
@@ -254,7 +254,7 @@ class McpService:
             return [
                 SearchResultPoint(
                     score=c.vector_score,
-                    file_path=os.path.join(project_path, c.file_path),
+                    file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                     business_description=c.business_description,
                 )
                 for c in candidates[:top_k]
@@ -272,7 +272,7 @@ class McpService:
                 continue
             results.append(SearchResultPoint(
                 score=round(s.score, 4),
-                file_path=os.path.join(project_path, c.file_path),
+                file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                 business_description=c.business_description,
             ))
 
@@ -613,6 +613,11 @@ class McpService:
         head_info = await self._git_ops.get_head_info(project_path)
         head_ref = head_info.commit_hash
 
+        # Normalize input file_paths to canonical POSIX relative paths
+        normalized_file_paths = [
+            fp.replace("\\", "/").strip().lstrip("/") for fp in file_paths
+        ]
+
         async def _query_one(fp: str) -> FileKnowledgeResult:
             try:
                 blob_hash = await self._git_ops.get_blob_hash(
@@ -643,7 +648,7 @@ class McpService:
                 )
                 return FileKnowledgeResult(file_path=fp, error=str(e))
 
-        results = await asyncio.gather(*[_query_one(fp) for fp in file_paths])
+        results = await asyncio.gather(*[_query_one(fp) for fp in normalized_file_paths])
         return list(results)
 
     # =========================================================================
@@ -733,6 +738,9 @@ class McpService:
         """
         assert self._git_ops is not None
         assert self._knowledge_sync is not None
+
+        # Normalize file_path to canonical POSIX relative path
+        file_path = file_path.replace("\\", "/").strip().lstrip("/")
 
         # Verify the client-provided blob hash against current worktree content
         # before accepting any idempotent skip.

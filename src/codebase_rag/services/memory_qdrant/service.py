@@ -978,9 +978,10 @@ class MemoryQdrantService:
                 match=models.MatchAny(any=filters.entity_types),
             ))
         if filters.file_paths:
+            canon_fps = [fp.replace("\\", "/").strip().lstrip("/") for fp in filters.file_paths]
             conditions.append(models.FieldCondition(
                 key="file_path",
-                match=models.MatchAny(any=filters.file_paths),
+                match=models.MatchAny(any=canon_fps),
             ))
         if filters.entity_names:
             conditions.append(models.FieldCondition(

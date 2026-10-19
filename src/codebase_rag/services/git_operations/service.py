@@ -443,9 +443,10 @@ class GitOperationsService:
 
         Returns None if the file does not exist at that ref.
         """
+        clean_path = file_path.replace("\\", "/").strip().lstrip("/")
         try:
             stdout = await self._run_git(
-                repo_path, ["ls-tree", ref, "--", file_path]
+                repo_path, ["ls-tree", ref, "--", clean_path]
             )
         except GitCommandError:
             return None
@@ -486,17 +487,18 @@ class GitOperationsService:
             GitFileNotFoundError: If the file does not exist in the working directory.
             GitCommandError: If git hash-object fails.
         """
-        abs_path = os.path.join(repo_path, file_path)
+        clean_path = file_path.replace("\\", "/").strip().lstrip("/")
+        abs_path = os.path.join(repo_path, clean_path)
         if not os.path.exists(abs_path):
-            raise GitFileNotFoundError(file_path, "working directory")
+            raise GitFileNotFoundError(clean_path, "working directory")
 
         stdout = await self._run_git(
-            repo_path, ["hash-object", "--", file_path],
+            repo_path, ["hash-object", "--", clean_path],
         )
         blob_hash = stdout.strip()
         if not blob_hash:
             raise GitCommandError(
-                f"git hash-object returned empty for {file_path}", 1, "",
+                f"git hash-object returned empty for {clean_path}", 1, "",
             )
         return blob_hash
 
