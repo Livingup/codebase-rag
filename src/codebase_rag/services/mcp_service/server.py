@@ -36,6 +36,8 @@ from codebase_rag.services.mcp_service.service import McpService
 
 logger = get_logger(__name__)
 
+ToolHandlerResult = list[TextContent] | CallToolResult
+
 
 # =============================================================================
 # MCP Tool definitions (schemas)
@@ -47,7 +49,7 @@ TOOL_DEFINITIONS: list[Tool] = [
         description=(
             "基于 Git 仓库与 Qdrant 向量数据库的 Codebase RAG 语义搜索工具。"
             "通过自然语言查询检索已索引的 Git 仓库代码知识库，"
-            "返回经 AI Reranker 排序的源码文件业务描述。"
+            "返回按相关性排序的源码文件业务描述。"
             "支持单次调用传入多条查询，每条查询可指定一个或多个 Git 仓库。"
             "结果按查询和仓库两层分组返回，单个仓库失败不影响其他仓库。"
             "使用前需确保目标 Git 仓库已通过管理 API 注册并完成索引。"
@@ -86,8 +88,8 @@ TOOL_DEFINITIONS: list[Tool] = [
     Tool(
         name="project_status",
         description=(
-            "查询已注册 Git 仓库的索引状态，"
-            "包括分支、提交、索引状态和知识点数量。"
+            "查询指定仓库在当前服务中的登记情况及正在执行的初始化任务；"
+            "不保证可检索。"
         ),
         inputSchema={
             "type": "object",
@@ -102,7 +104,7 @@ TOOL_DEFINITIONS: list[Tool] = [
     ),
     Tool(
         name="list_projects",
-        description="列出所有已注册的 Git 仓库及其当前索引状态。",
+        description="列出当前服务已登记的 Git 仓库名称与路径。",
         inputSchema={
             "type": "object",
             "properties": {},
@@ -135,9 +137,8 @@ TOOL_DEFINITIONS: list[Tool] = [
     Tool(
         name="get_file_knowledge",
         description=(
-            "批量获取指定文件当前已提交版本的知识点描述。"
-            "返回每个文件的全部知识描述文本列表。"
-            "文件不存在已提交知识点时返回空列表。"
+            "读取指定文件当前已提交版本的可读知识说明。"
+            "逐文件返回说明、空结果或错误文本。"
             "典型用途：修改文件前获取已有知识描述，便于后续更新。"
         ),
         inputSchema={
@@ -164,6 +165,7 @@ TOOL_DEFINITIONS: list[Tool] = [
             "主动提供该文件当前工作区版本的业务知识描述。"
             "调用方必须提供当前文件内容对应的 git blob hash，"
             "后端会校验 blob_hash、生成嵌入向量并通过统一同步协调器落地。"
+            "已受理不代表立即可检索；同一文件版本已有知识时不覆盖已有内容。"
         ),
         inputSchema={
             "type": "object",
@@ -212,7 +214,7 @@ TOOL_DEFINITIONS: list[Tool] = [
             "- 禁止因为“后续搜索更方便”“分析前先注册一下”“自动补全索引”等理由默认调用。\n"
             "\n"
             "入参使用仓库根目录绝对路径（含 .git 的父目录）。注册成功只表示已登记并入队初始化，"
-            "不代表索引已 ready；请再用 project_status / list_projects / codebase_search 验收可用性。"
+            "登记完成不代表检索已就绪。"
         ),
         inputSchema={
             "type": "object",
@@ -246,16 +248,12 @@ async def handle_call_tool(
     mcp_service: McpService,
     management_api: ManagementApiService,
     context_engine: Optional[ContextEngineService] = None,
-) -> list[TextContent]:
-    """Dispatch a tool call to the appropriate handler.
-
-    Returns list[TextContent] — the MCP SDK's @server.call_tool()
-    decorator wraps it into CallToolResult(content=list(results)).
-    """
+) -> ToolHandlerResult:
+    """Dispatch tools, preserving explicit submission failure results."""
     if name == "codebase_search":
         return await handle_codebase_search(arguments, mcp_service)
     elif name == "project_status":
-        return await handle_project_status(arguments, mcp_service)
+        return await handle_project_status(arguments, management_api)
     elif name == "list_projects":
         return await handle_list_projects(management_api)
     elif name == "register_project":
@@ -343,33 +341,21 @@ async def handle_codebase_search(
 
 
 async def handle_project_status(
-    args: dict, mcp_service: McpService,
+    args: dict, management_api: ManagementApiService,
 ) -> list[TextContent]:
-    """Handle project_status tool call."""
+    """Report registration facts without probing or rebuilding an index."""
     git_repo_path = args.get("git_repo_path", "")
-    if not git_repo_path:
+    if not isinstance(git_repo_path, str) or not git_repo_path.strip():
         raise ValueError("Missing required parameter: 'git_repo_path'.")
-
-    info = await mcp_service.get_active_instance_info(git_repo_path)
-
-    repo_name = os.path.basename(git_repo_path.rstrip("/\\"))
-    if info:
-        text = (
-            f"Git 仓库: {repo_name} ({git_repo_path})\n"
-            f"Branch: {info.branch_name}\n"
-            f"Commit: {info.commit_hash[:8]}\n"
-            f"Status: ready\n"
-            f"Knowledge Points: {info.point_count}\n"
-            f"Memory Usage: {info.memory_usage_mb:.1f} MB"
-        )
+    info = await management_api.get_project_registration_status(git_repo_path)
+    lines = [f"仓库：{info.git_repo_path}"]
+    if info.registered:
+        lines.append("登记状态：已登记")
+        if info.initialization_running:
+            lines.append("初始化进行中。")
     else:
-        text = (
-            f"Git 仓库: {repo_name} ({git_repo_path})\n"
-            f"Status: not indexed\n"
-            f"未找到活跃实例。该仓库可能需要先注册或重建索引。"
-        )
-
-    return [TextContent(type="text", text=text)]
+        lines.extend(["登记状态：未登记", "本服务尚未登记此仓库。"])
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def handle_context_analysis(
@@ -399,19 +385,14 @@ async def handle_list_projects(
     management_api: ManagementApiService,
 ) -> list[TextContent]:
     """Handle list_projects tool call."""
-    projects = await management_api.list_projects()
+    projects = await management_api.list_registered_projects()
 
     if not projects:
         return [TextContent(type="text", text="未注册任何 Git 仓库。")]
 
-    lines = [f"已注册 Git 仓库 ({len(projects)}):\n"]
+    lines = [f"已登记 Git 仓库（{len(projects)}）："]
     for p in projects:
-        lines.append(
-            f"- **{p.display_name}** ({p.git_repo_path})\n"
-            f"  Status: {p.status} | "
-            f"Branch: {p.branch or 'N/A'} | "
-            f"Points: {p.knowledge_points}"
-        )
+        lines.append(f"- {p.display_name}：{p.git_repo_path}")
 
     return [TextContent(type="text", text="\n".join(lines))]
 
@@ -444,17 +425,12 @@ async def handle_register_project(
         raise ValueError(str(e)) from e
 
     text = (
-        f"项目已注册并入队异步初始化/索引。\n"
-        f"project_id: {project.project_id}\n"
-        f"display_name: {project.display_name}\n"
-        f"git_repo_path: {project.git_repo_path}\n"
-        f"status: {project.status}\n"
-        f"branch: {project.branch or 'N/A'}\n"
-        f"commit_hash: {project.commit_hash or 'N/A'}\n"
-        f"knowledge_points: {project.knowledge_points}\n"
-        f"\n"
-        f"注意：注册成功只表示已登记并入队初始化，不代表索引已 ready。"
-        f"请再用 project_status / list_projects / codebase_search 验收可用性。"
+        f"项目已登记，初始化已安排。\n"
+        f"名称：{project.display_name}\n"
+        f"仓库：{project.git_repo_path}\n"
+        f"project_id：{project.project_id}\n"
+        f"登记时 HEAD：{project.branch or 'N/A'} @ {project.commit_hash or 'N/A'}\n"
+        f"登记完成不代表检索已就绪。"
     )
     return [TextContent(type="text", text=text)]
 
@@ -482,16 +458,16 @@ async def handle_get_file_knowledge(
         if r.error:
             parts.append(
                 f"## {r.file_path}\n\n"
-                f"⚠ 查询失败: {r.error}\n"
+                f"⚠ 查询失败：{r.error}\n"
             )
         elif not r.descriptions:
             parts.append(
-                f"## {r.file_path} (0 knowledge points)\n\n"
-                f"该文件暂无已提交的知识点。\n"
+                f"## {r.file_path}（返回 0 条知识说明；当前已提交版本）\n\n"
+                f"本次未返回该文件当前已提交版本的可读知识说明。\n"
             )
         else:
             parts.append(
-                f"## {r.file_path} ({len(r.descriptions)} knowledge points)\n"
+                f"## {r.file_path}（返回 {len(r.descriptions)} 条知识说明；当前已提交版本）\n"
             )
             for i, desc in enumerate(r.descriptions, 1):
                 parts.append(f"### [{i}]\n{desc}\n")
@@ -501,7 +477,7 @@ async def handle_get_file_knowledge(
 
 async def handle_add_file_knowledge(
     args: dict, mcp_service: McpService,
-) -> list[TextContent]:
+) -> CallToolResult:
     """Handle add_file_knowledge tool call.
 
     Validates descriptions, generates embeddings, and submits knowledge
@@ -532,36 +508,30 @@ async def handle_add_file_knowledge(
         git_repo_path, file_path, blob_hash, descs,
     )
 
-    parts: List[str] = []
-
-    succeeded_count = len(result.succeeded)
-    failed_count = len(result.failed)
-    total_points = sum(s.points_count for s in result.succeeded)
-
-    if succeeded_count > 0 and failed_count == 0:
-        parts.append(
-            f"已提交 {succeeded_count} 个文件版本共 {total_points} 条知识点，"
-            f"本地可用并已进入统一同步流程。\n"
+    if len(result.succeeded) == 1 and not result.failed:
+        success = result.succeeded[0]
+        if success.outcome == "accepted":
+            text = (
+                f"知识提交已受理。\n文件：{success.file_path}\n"
+                "无需重复提交；不代表立即可检索。"
+            )
+        elif success.outcome == "unchanged":
+            text = (
+                "该文件版本已有知识，本次未覆盖已有内容。\n"
+                f"文件：{success.file_path}"
+            )
+        else:
+            raise McpServiceError("知识提交返回了无法识别的结果，不能确认本次提交。")
+        return CallToolResult(content=[TextContent(type="text", text=text)], isError=False)
+    if len(result.failed) == 1 and not result.succeeded:
+        failure = result.failed[0]
+        return CallToolResult(
+            content=[TextContent(
+                type="text", text=f"提交失败：{failure.error}\n文件：{failure.file_path}",
+            )],
+            isError=True,
         )
-        for s in result.succeeded:
-            parts.append(f"- {s.file_path}: {s.points_count} 条 ✓")
-    elif succeeded_count > 0 and failed_count > 0:
-        parts.append(
-            f"已提交 {succeeded_count} 个文件版本共 {total_points} 条知识点，"
-            f"{failed_count} 个文件失败。\n"
-        )
-        parts.append("成功:")
-        for s in result.succeeded:
-            parts.append(f"- {s.file_path}: {s.points_count} 条 ✓")
-        parts.append("\n失败:")
-        for fail in result.failed:
-            parts.append(f"- {fail.file_path}: {fail.error}")
-    else:
-        parts.append(f"全部 {failed_count} 个文件失败。\n")
-        for fail in result.failed:
-            parts.append(f"- {fail.file_path}: {fail.error}")
-
-    return [TextContent(type="text", text="\n".join(parts))]
+    raise McpServiceError("知识提交返回了不一致的单文件结果，不能确认本次提交。")
 
 
 # =============================================================================
@@ -593,7 +563,7 @@ def create_mcp_server(
         return TOOL_DEFINITIONS
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict) -> ToolHandlerResult:
         return await handle_call_tool(
             name, arguments, mcp_service, management_api, context_engine,
         )
@@ -639,7 +609,10 @@ def _format_grouped_results(groups: List[QuerySearchGroup]) -> str:
 
     if total_results == 0 and total_errors == 0:
         queries_str = "; ".join(f'"{qg.query}"' for qg in groups)
-        return f"No results found for queries: {queries_str}"
+        return (
+            f"本次检索未返回结果。\n查询：{queries_str}\n"
+            "这不表示源码中不存在相关实现。"
+        )
 
     parts: List[str] = []
 
@@ -658,12 +631,12 @@ def _format_grouped_results(groups: List[QuerySearchGroup]) -> str:
 
             count = len(rg.results)
             parts.append(
-                f"## Repo: {repo_name} ({rg.repo_path}) — {count} results\n"
+                f"## Repo: {repo_name} ({rg.repo_path}) — 本次返回 {count} 条\n"
             )
 
             for i, r in enumerate(rg.results, 1):
                 parts.append(
-                    f"### [{i}] {r.file_path} (score: {r.score})\n\n"
+                    f"### [{i}] {r.file_path}\n\n"
                     f"{r.business_description}\n"
                 )
 

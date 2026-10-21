@@ -39,6 +39,7 @@ class KnowledgeSyncResult:
     skipped_existing: bool = False
     cancelled_stale: bool = False
     error: str = ""
+    retry_job_saved: bool = False
 
 
 class KnowledgeSyncError(Exception):

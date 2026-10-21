@@ -71,15 +71,14 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(api.calls[0]["git_repo_path"], "G:/project/demo")
         self.assertEqual(api.calls[0]["display_name"], "demo")
-        self.assertIn("project_id: proj-123", text)
-        self.assertIn("display_name: demo", text)
-        self.assertIn("git_repo_path: G:/project/demo", text)
-        self.assertIn("status: registered", text)
-        self.assertIn("branch: main", text)
-        self.assertIn("commit_hash: abcdef12", text)
-        self.assertIn("knowledge_points: 0", text)
-        self.assertIn("入队异步初始化", text)
-        self.assertIn("不代表索引已 ready", text)
+        self.assertEqual(
+            text,
+            "项目已登记，初始化已安排。\n名称：demo\n仓库：G:/project/demo\n"
+            "project_id：proj-123\n登记时 HEAD：main @ abcdef12\n"
+            "登记完成不代表检索已就绪。",
+        )
+        self.assertNotIn("knowledge_points", text)
+        self.assertNotIn("status:", text)
 
     async def test_missing_git_repo_path_raises_value_error(self) -> None:
         api = _ManagementApi(response=_sample_project())
@@ -109,7 +108,7 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
             mcp_service=SimpleNamespace(),  # type: ignore[arg-type]
             management_api=api,  # type: ignore[arg-type]
         )
-        self.assertIn("display_name: from-dispatch", contents[0].text)
+        self.assertIn("名称：from-dispatch", contents[0].text)
         self.assertEqual(api.calls[0]["display_name"], "from-dispatch")
 
     async def test_empty_display_name_is_forwarded_as_empty_string(self) -> None:

@@ -20,6 +20,7 @@ import os
 import tempfile
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -43,6 +44,7 @@ from codebase_rag.services.management_api.models import (
     ProjectExistsError,
     ProjectNotFoundError,
     ProjectRecord,
+    ProjectRegistrationStatus,
     ProjectResponse,
     ProjectStatusResponse,
     SearchResponse,
@@ -212,7 +214,15 @@ class ManagementApiService:
             display_name=display_name,
         )
         self._projects[project_id] = record
-        self._save_registry()
+        try:
+            self._save_registry(raise_on_error=True)
+        except Exception as e:
+            raise ManagementApiError(
+                f"项目登记未完成：无法保存注册表 {self._config.registry_path}。"
+                "请检查服务数据目录的写权限和可用空间后，使用相同仓库路径重试。"
+                "部分操作可能已执行，未进行完整回滚。"
+                f"原因：{e}"
+            ) from e
 
         # Step 5: Trigger full initialization (via task queue, serial per project)
         branch = head_info.branch_name or "HEAD"
@@ -288,6 +298,39 @@ class ManagementApiService:
             succeeded=succeeded,
             failed=failed,
             results=results,
+        )
+
+    async def list_registered_projects(self) -> List[ProjectRecord]:
+        """Return a detached registration snapshot without probing indexes."""
+        return [replace(record) for record in self._projects.values()]
+
+    @staticmethod
+    def _normalize_registered_path(path: str) -> str:
+        if not isinstance(path, str) or not path.strip() or not os.path.isabs(path):
+            raise InvalidRequestError("git_repo_path 必须为非空的仓库根目录绝对路径。")
+        return os.path.normcase(os.path.realpath(os.path.abspath(os.path.normpath(path))))
+
+    async def get_project_registration_status(
+        self, git_repo_path: str,
+    ) -> ProjectRegistrationStatus:
+        """Report registration and a running initialization, not readiness."""
+        normalized = self._normalize_registered_path(git_repo_path)
+        matches = [
+            record for record in self._projects.values()
+            if self._normalize_registered_path(record.git_repo_path) == normalized
+        ]
+        if not matches:
+            return ProjectRegistrationStatus(git_repo_path=normalized, registered=False)
+        if len(matches) != 1:
+            raise InvalidRequestError(
+                "同一路径存在多个登记记录，无法确认项目；请联系服务维护者检查登记信息。"
+            )
+        record = matches[0]
+        task = self._workflow.get_workflow_status(record.project_id).current_task
+        return ProjectRegistrationStatus(
+            git_repo_path=record.git_repo_path,
+            registered=True,
+            initialization_running=task is not None and task.task_type == "initialization",
         )
 
     async def list_projects(self) -> List[ProjectResponse]:
@@ -1063,8 +1106,8 @@ class ManagementApiService:
     # Persistent project registry
     # =========================================================================
 
-    def _save_registry(self) -> None:
-        """Persist current project registry to disk (atomic write)."""
+    def _save_registry(self, *, raise_on_error: bool = False) -> None:
+        """Persist the registry, optionally propagating write failures."""
         path = self._config.registry_path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
@@ -1085,8 +1128,10 @@ class ManagementApiService:
                 json.dump(entries, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
             logger.debug("registry_saved", count=len(entries))
-        except Exception:
+        except Exception as e:
             logger.exception("registry_save_failed", path=path)
+            if raise_on_error:
+                raise ManagementApiError(f"无法保存注册表 {path}：{e}") from e
 
     def _load_registry(self) -> List[dict]:
         """Load project registry from disk. Returns empty list on any error."""

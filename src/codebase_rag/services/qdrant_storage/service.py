@@ -286,6 +286,7 @@ class QdrantStorageService:
                     await self._client.upsert(
                         collection_name=collection,
                         points=batch,
+                        wait=True,
                     )
 
             logger.info(

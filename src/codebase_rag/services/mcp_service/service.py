@@ -623,7 +623,7 @@ class McpService:
             outbound_fp = os.path.normpath(os.path.join(project_path, canon_fp))
             try:
                 blob_hash = await self._git_ops.get_blob_hash(
-                    project_path, head_ref, canon_fp,
+                    project_path, head_ref, canon_fp, strict=True,
                 )
                 if blob_hash is None:
                     return FileKnowledgeResult(file_path=outbound_fp)
@@ -698,6 +698,35 @@ class McpService:
                 knowledge_descriptions,
                 token_limit,
             )
+            expected_fvid = compute_file_version_id(canon_path, blob_hash)
+            if sync_result.file_version_id != expected_fvid:
+                raise McpServiceError("服务返回的文件版本不一致，无法确认本次知识提交。")
+            published = sync_result.published
+            skipped = sync_result.skipped_existing
+            cancelled = sync_result.cancelled_stale
+            retry_saved = sync_result.retry_job_saved
+            error = sync_result.error
+            if skipped and not (published or cancelled or error or retry_saved):
+                outcome = "unchanged"
+            elif published and not (skipped or cancelled or error or retry_saved):
+                outcome = "accepted"
+            elif (
+                retry_saved and error and not (published or skipped or cancelled)
+                and self._knowledge_sync.can_retry_pending()
+            ):
+                outcome = "accepted"
+            elif cancelled:
+                raise McpServiceError(
+                    "该文件版本已被后续提交替代，请核对当前文件并重新计算 Git blob hash 后提交。"
+                )
+            else:
+                message = (
+                    "服务未能确认可继续处理本次知识，请稍后重试相同文件版本；"
+                    "无需因此重建索引。"
+                )
+                if error:
+                    message += f"原因：{error}"
+                raise McpServiceError(message)
             result.succeeded.append(
                 AddFileSuccess(
                     file_path=outbound_path,
@@ -706,6 +735,7 @@ class McpService:
                         if sync_result.points_count > 0
                         else len(knowledge_descriptions)
                     ),
+                    outcome=outcome,
                 )
             )
         except Exception as e:
@@ -756,7 +786,7 @@ class McpService:
             raise ValueError(
                 "blob_hash mismatch for "
                 f"{canon_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
-                "Please recompute the Git blob hash for the latest file content."
+                "请读取当前文件并重新计算 Git blob hash 后提交。"
             )
         fvid = compute_file_version_id(canon_path, blob_hash)
 
@@ -800,10 +830,13 @@ class McpService:
         if over_limit:
             raise ValueError(
                 "Token limit exceeded: " + "; ".join(over_limit)
+                + "。请缩短所列描述或拆分后重新提交。"
             )
 
         # Generate embeddings (dense + sparse) for all descriptions
         embeddings = await self._embedding.embed(descriptions, is_query=False)
+        if len(embeddings) != len(descriptions):
+            raise McpServiceError("知识描述处理结果不完整，请稍后重试；本次未受理。")
 
         # Build PointData list
         file_name = os.path.basename(canon_path)

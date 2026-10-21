@@ -437,18 +437,17 @@ class GitOperationsService:
     # =========================================================================
 
     async def get_blob_hash(
-        self, repo_path: str, ref: str, file_path: str
+        self, repo_path: str, ref: str, file_path: str, *, strict: bool = False,
     ) -> Optional[str]:
-        """Get blob hash for a specific file at a given ref.
-
-        Returns None if the file does not exist at that ref.
-        """
+        """Get a committed blob; strict callers distinguish read errors from absence."""
         clean_path = normalize_repo_relative_path(repo_path, file_path)
         try:
             stdout = await self._run_git(
                 repo_path, ["ls-tree", ref, "--", clean_path]
             )
         except GitCommandError:
+            if strict:
+                raise
             return None
 
         stdout = stdout.strip()
@@ -457,6 +456,22 @@ class GitOperationsService:
 
         # "<mode> <type> <hash>\t<path>"
         parts = stdout.split("\t", 1)
+        if strict:
+            fields = parts[0].split()
+            if (
+                len(stdout.splitlines()) != 1
+                or len(parts) != 2
+                or not parts[1]
+                or len(fields) != 3
+                or not re.fullmatch(r"[0-7]{6}", fields[0])
+                or fields[1] != "blob"
+                or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", fields[2])
+            ):
+                raise GitCommandError(
+                    command="git ls-tree", returncode=1,
+                    stderr=f"无法解析文件 {clean_path} 的 Git blob 记录，或目标不是文件。",
+                )
+            return fields[2]
         if len(parts) != 2:
             return None
         return parts[0].split()[2]

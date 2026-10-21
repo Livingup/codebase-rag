@@ -95,6 +95,10 @@ class ServiceContainer:
             knowledge_sync=self.knowledge_sync,
         )
 
+        self.knowledge_sync.set_retry_availability_provider(
+            self.workflow.is_compensation_running,
+        )
+
         # --- Layer 3: top-level entry services ---
         self.management_api = ManagementApiService(
             config_manager=cm,

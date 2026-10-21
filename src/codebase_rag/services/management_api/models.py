@@ -27,6 +27,15 @@ class ProjectRecord:
     registered_at: datetime = field(default_factory=datetime.utcnow)
 
 
+@dataclass
+class ProjectRegistrationStatus:
+    """Registration facts for MCP callers, not a search-readiness probe."""
+
+    git_repo_path: str
+    registered: bool
+    initialization_running: bool = False
+
+
 # =============================================================================
 # Request models
 # =============================================================================

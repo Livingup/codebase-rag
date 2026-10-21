@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import uuid
 from collections import defaultdict
-from typing import DefaultDict, List, Optional
+from typing import Callable, DefaultDict, List, Optional
 
 from qdrant_client import models
 
@@ -37,6 +37,7 @@ class KnowledgeSyncService:
         self._memory = memory_qdrant
         self._version_locks: DefaultDict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._file_locks: DefaultDict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._retry_availability_provider: Optional[Callable[[], bool]] = None
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -47,6 +48,18 @@ class KnowledgeSyncService:
     async def shutdown(self) -> None:
         self._initialized = False
         logger.info("knowledge_sync_service_shutdown")
+
+    def set_retry_availability_provider(self, provider: Callable[[], bool]) -> None:
+        self._retry_availability_provider = provider
+
+    def can_retry_pending(self) -> bool:
+        if not self._initialized or self._retry_availability_provider is None:
+            return False
+        try:
+            return self._retry_availability_provider() is True
+        except Exception:
+            logger.exception("knowledge_sync_retry_availability_failed")
+            return False
 
     async def submit_points(
         self,
@@ -85,11 +98,9 @@ class KnowledgeSyncService:
                         update_memory=update_memory,
                     )
                     if result.error and update_memory:
-                        await self.upsert_memory_points(
-                            project_id,
-                            file_version_id,
-                            current.points,
-                            current.old_file_version_id,
+                        await self._refresh_memory_best_effort(
+                            project_id, file_version_id, current.old_file_version_id,
+                            points=current.points,
                         )
                     return result
 
@@ -105,8 +116,8 @@ class KnowledgeSyncService:
                 self._store.put_job(job)
                 result = await self._publish_locked(job, update_memory=update_memory)
                 if result.error and update_memory:
-                    await self.upsert_memory_points(
-                        project_id, file_version_id, points, old_file_version_id,
+                    await self._refresh_memory_best_effort(
+                        project_id, file_version_id, old_file_version_id, points=points,
                     )
                 return result
 
@@ -121,9 +132,9 @@ class KnowledgeSyncService:
         async with self._version_locks[lock_key]:
             existing = await self._qdrant.check_existence(project_id, [file_version_id])
             if existing.get(file_version_id, False):
-                self._store.remove_job(project_id, file_version_id)
+                self._remove_job_best_effort(project_id, file_version_id)
                 if update_memory:
-                    await self.upsert_memory_from_qdrant(project_id, file_version_id)
+                    await self._refresh_memory_best_effort(project_id, file_version_id)
                 return KnowledgeSyncResult(
                     file_version_id=file_version_id,
                     points_count=0,
@@ -140,11 +151,9 @@ class KnowledgeSyncService:
                 )
             result = await self._publish_locked(job, update_memory=update_memory)
             if result.error and update_memory:
-                await self.upsert_memory_points(
-                    project_id,
-                    file_version_id,
-                    job.points,
-                    job.old_file_version_id,
+                await self._refresh_memory_best_effort(
+                    project_id, file_version_id, job.old_file_version_id,
+                    points=job.points,
                 )
             return result
 
@@ -178,9 +187,9 @@ class KnowledgeSyncService:
                     self._store.cancel_stale_file_jobs(
                         project_id, file_path, file_version_id,
                     )
-                self._store.remove_job(project_id, file_version_id)
+                self._remove_job_best_effort(project_id, file_version_id)
                 if update_memory:
-                    await self.upsert_memory_from_qdrant(
+                    await self._refresh_memory_best_effort(
                         project_id, file_version_id, old_file_version_id,
                     )
                 return KnowledgeSyncResult(
@@ -205,15 +214,12 @@ class KnowledgeSyncService:
         succeeded = 0
         failed = 0
         for job in ready:
-            latest = self._store.get_latest(job.project_id, job.file_path)
-            if latest is not None and latest != job.file_version_id:
-                job.status = "cancelled"
-                job.last_error = "cancelled_by_newer_file_version"
-                self._store.put_job(job)
-                continue
             lock_key = self._version_lock_key(job.project_id, job.file_version_id)
             async with self._version_locks[lock_key]:
-                result = await self._publish_locked(job, update_memory=False)
+                current = self._store.get_job(job.project_id, job.file_version_id)
+                if current is None or current.status != "ready":
+                    continue
+                result = await self._publish_locked(current, update_memory=False)
             if result.published or result.skipped_existing:
                 succeeded += 1
             elif result.error:
@@ -311,46 +317,17 @@ class KnowledgeSyncService:
             existing = await self._qdrant.check_existence(
                 job.project_id, [job.file_version_id],
             )
-            if existing.get(job.file_version_id, False):
-                self._store.remove_job(job.project_id, job.file_version_id)
-                if update_memory:
-                    await self.upsert_memory_from_qdrant(
-                        job.project_id,
-                        job.file_version_id,
-                        job.old_file_version_id,
-                    )
-                return KnowledgeSyncResult(
-                    file_version_id=job.file_version_id,
-                    points_count=0,
-                    published=False,
-                    skipped_existing=True,
+            skipped_existing = existing.get(job.file_version_id, False)
+            if not skipped_existing:
+                confirmed = await self._qdrant.upsert_file_points(
+                    job.project_id, job.file_version_id, job.points,
                 )
-            await self._qdrant.upsert_file_points(
-                job.project_id, job.file_version_id, job.points,
-            )
-            self._store.remove_job(job.project_id, job.file_version_id)
-            if update_memory:
-                await self.upsert_memory_from_qdrant(
-                    job.project_id,
-                    job.file_version_id,
-                    job.old_file_version_id,
-                )
-            logger.info(
-                "knowledge_sync_publish_success",
-                project_id=job.project_id,
-                file_path=job.file_path,
-                file_version_id=job.file_version_id[:16],
-                points=len(job.points),
-                source=job.source,
-            )
-            return KnowledgeSyncResult(
-                file_version_id=job.file_version_id,
-                points_count=len(job.points),
-                published=True,
-            )
+                if confirmed is not True:
+                    raise RuntimeError("Knowledge write was not confirmed.")
         except Exception as e:
             job.retry_count += 1
             job.last_error = str(e)[:500]
+            job.status = "ready"
             self._store.put_job(job)
             logger.warning(
                 "knowledge_sync_publish_failed",
@@ -365,6 +342,62 @@ class KnowledgeSyncService:
                 points_count=0,
                 published=False,
                 error=str(e),
+                retry_job_saved=True,
+            )
+
+        self._remove_job_best_effort(job.project_id, job.file_version_id)
+        if update_memory:
+            await self._refresh_memory_best_effort(
+                job.project_id, job.file_version_id, job.old_file_version_id,
+            )
+        if not skipped_existing:
+            logger.info(
+                "knowledge_sync_publish_success",
+                project_id=job.project_id,
+                file_path=job.file_path,
+                file_version_id=job.file_version_id[:16],
+                points=len(job.points),
+                source=job.source,
+            )
+        return KnowledgeSyncResult(
+            file_version_id=job.file_version_id,
+            points_count=0 if skipped_existing else len(job.points),
+            published=not skipped_existing,
+            skipped_existing=skipped_existing,
+        )
+
+    def _remove_job_best_effort(self, project_id: str, file_version_id: str) -> None:
+        """Cleanup failure does not invalidate a confirmed persistent result."""
+        try:
+            self._store.remove_job(project_id, file_version_id)
+        except Exception:
+            logger.exception(
+                "knowledge_sync_job_cleanup_failed",
+                project_id=project_id, file_version_id=file_version_id,
+            )
+
+    async def _refresh_memory_best_effort(
+        self,
+        project_id: str,
+        file_version_id: str,
+        old_file_version_id: Optional[str] = None,
+        *,
+        points: Optional[List[PointData]] = None,
+    ) -> None:
+        """Refresh existing memory only; preserve receipts and cancellation."""
+        try:
+            if points is None:
+                await self.upsert_memory_from_qdrant(
+                    project_id, file_version_id, old_file_version_id,
+                )
+            else:
+                await self.upsert_memory_points(
+                    project_id, file_version_id, points, old_file_version_id,
+                )
+        except Exception:
+            logger.exception(
+                "knowledge_sync_memory_refresh_failed",
+                project_id=project_id, file_version_id=file_version_id,
             )
 
     def _point_data_to_point_structs(

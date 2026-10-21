@@ -153,6 +153,17 @@ class WorkflowOrchestratorService:
         self._config_manager.register_reconciler("workflow", self.reconcile)
         logger.info("workflow_service_initialized")
 
+    def is_compensation_running(self) -> bool:
+        """Observe the existing retry worker without starting or changing it."""
+        task = self._comp_task
+        return bool(
+            self._initialized
+            and self._config.compensation.enabled
+            and task is not None
+            and not task.done()
+            and task.cancelling() == 0
+        )
+
     async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
         """Reconcile agent definitions, routing queues, and compensation loop."""
         logger.info("workflow_service_reconciling")

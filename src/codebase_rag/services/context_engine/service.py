@@ -205,10 +205,7 @@ class ContextEngineService:
                 elapsed_s=round(elapsed, 1),
                 visited_files=len(state.visited_files),
             )
-            return (
-                f"⚠️ 分析过程异常：{last_error}\n"
-                f"已分析 {len(state.visited_files)} 个文件。"
-            )
+            return f"⚠️ 分析过程异常：{last_error}"
 
         elapsed = time.monotonic() - start
 
@@ -226,10 +223,7 @@ class ContextEngineService:
                 elapsed_s=round(elapsed, 1),
                 visited_files=len(state.visited_files),
             )
-            return (
-                f"⚠️ 分析未完成（Agent 未调用 submit_report），"
-                f"已分析 {len(state.visited_files)} 个文件。"
-            )
+            return "⚠️ 分析未完成：未生成最终报告，不能据此确认任务结论。"
 
     # =========================================================================
     # Internal

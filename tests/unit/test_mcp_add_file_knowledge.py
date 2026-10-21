@@ -65,6 +65,10 @@ class _KnowledgeSync:
         self.submit_result = submit_result
         self.try_skip_calls: list[dict] = []
         self.submit_calls: list[dict] = []
+        self.retry_available = True
+
+    def can_retry_pending(self) -> bool:
+        return self.retry_available
 
     async def try_skip_existing_file_version(
         self,
@@ -161,6 +165,7 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result.succeeded), 1)
             self.assertEqual(len(result.failed), 0)
             self.assertEqual(result.succeeded[0].points_count, 1)
+            self.assertEqual(result.succeeded[0].outcome, "unchanged")
             self.assertEqual(embedding.count_tokens_calls, 0)
             self.assertEqual(embedding.embed_calls, 0)
             self.assertEqual(len(knowledge_sync.submit_calls), 0)
@@ -229,6 +234,7 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result.succeeded), 1)
             self.assertEqual(len(result.failed), 0)
             self.assertEqual(result.succeeded[0].points_count, 1)
+            self.assertEqual(result.succeeded[0].outcome, "accepted")
             self.assertEqual(embedding.count_tokens_calls, 1)
             self.assertEqual(embedding.embed_calls, 1)
             self.assertEqual(len(knowledge_sync.try_skip_calls), 1)
@@ -239,6 +245,66 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(submit_call["update_latest"])
             self.assertTrue(submit_call["update_memory"])
             self.assertTrue(submit_call["replace_existing_job"])
+
+    async def test_acceptance_requires_consistent_evidence_and_running_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            fvid = compute_file_version_id("src/example.py", "blob")
+            cases = [
+                ({"published": True}, True, "accepted"),
+                ({"published": False, "skipped_existing": True}, False, "unchanged"),
+                ({"published": False, "error": "offline", "retry_job_saved": True}, True, "accepted"),
+                ({"published": False, "error": "offline", "retry_job_saved": True}, False, None),
+                ({"published": False, "error": "offline"}, True, None),
+                ({"published": False}, True, None),
+                ({"published": False, "cancelled_stale": True}, True, None),
+                ({"published": True, "skipped_existing": True}, True, None),
+                ({"published": True, "error": "contradictory"}, True, None),
+                ({"published": True, "retry_job_saved": True}, True, None),
+            ]
+            for fields, retry_available, expected in cases:
+                with self.subTest(fields=fields, retry_available=retry_available):
+                    sync = _KnowledgeSync(submit_result=KnowledgeSyncResult(
+                        file_version_id=fvid, points_count=123, **fields,
+                    ))
+                    sync.retry_available = retry_available
+                    service = McpService(_ConfigManager(), _Embedding(), SimpleNamespace(), SimpleNamespace(),
+                                         git_ops=_GitOps("blob"), knowledge_sync=sync)
+                    result = await service.add_file_knowledge(project_path,"src/example.py","blob",["description"])
+                    if expected:
+                        self.assertEqual(result.succeeded[0].outcome, expected)
+                        self.assertEqual(result.failed, [])
+                    else:
+                        self.assertEqual(result.succeeded, [])
+                        self.assertEqual(len(result.failed), 1)
+            sync = _KnowledgeSync(submit_result=KnowledgeSyncResult('wrong-version',1,True))
+            service = McpService(_ConfigManager(), _Embedding(), SimpleNamespace(), SimpleNamespace(),
+                                 git_ops=_GitOps('blob'), knowledge_sync=sync)
+            result = await service.add_file_knowledge(project_path,'src/example.py','blob',['description'])
+            self.assertIn('文件版本不一致', result.failed[0].error)
+
+    async def test_incomplete_embeddings_and_token_limit_never_submit_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            for mode in ['short_embeddings', 'token_limit']:
+                with self.subTest(mode=mode):
+                    sync, embedding, config = _KnowledgeSync(), _Embedding(), _ConfigManager()
+                    if mode == 'short_embeddings':
+                        async def incomplete(texts, is_query):
+                            return []
+                        embedding.embed = incomplete
+                    else:
+                        config.config.mcp.knowledge_submission.point_token_limit = 1
+                    service = McpService(config, embedding, SimpleNamespace(), SimpleNamespace(),
+                                         git_ops=_GitOps('blob'), knowledge_sync=sync)
+                    result = await service.add_file_knowledge(project_path,'src/example.py','blob',['two words'])
+                    self.assertEqual(len(result.failed), 1)
+                    self.assertEqual(sync.submit_calls, [])
+                    if mode == 'token_limit':
+                        self.assertIn('2 tokens > 1 limit', result.failed[0].error)
+                        self.assertIn('拆分', result.failed[0].error)
+                    else:
+                        self.assertIn('处理结果不完整', result.failed[0].error)
 
     def test_normalize_repo_relative_path(self) -> None:
         repo = "G:/project/agent/agentruntime"
@@ -264,7 +330,7 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             fast_result = KnowledgeSyncResult(
                 file_version_id=file_version_id,
                 points_count=1,
-                published=True,
+                published=False,
                 skipped_existing=True,
             )
             embedding = _Embedding()
