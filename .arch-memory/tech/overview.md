@@ -10,3 +10,10 @@
 - 错误：各服务使用自己的异常体系，MemoryQdrant 使用 MemoryQdrantError 子类，异常逐层包装。
 - 日志：使用 structlog，事件名使用 snake_case。
 - 测试：异步单元测试使用 unittest.IsolatedAsyncioTestCase，以 SimpleNamespace 伪造依赖；pytest 运行，asyncio_mode=auto。
+
+## 技术机制清单
+
+| 机制 | 解决的问题 | 使用域 | 文件 |
+|---|---|---|---|
+| key-pool | 多 Key 轮换调度与故障隔离 | agent、embedding、mcp_service | mechanisms/key-pool.md |
+| config-reconcile | 配置热重载的增量协调与不可变参数感知 | agent、embedding、event_detection、workflow、qdrant_storage、mcp_client | mechanisms/config-reconcile.md |
