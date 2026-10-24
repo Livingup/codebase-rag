@@ -150,6 +150,12 @@ class ServiceContainer:
         # Wire lazy rebuild: memory_qdrant → workflow
         self.memory_qdrant.set_rebuild_handler(self.workflow.rebuild_memory_instance)
 
+        # Wire moved-repo auto-heal: mcp_service → management_api.
+        # MCP read paths always carry the caller's current Git repo root;
+        # the handler re-registers when that root's identity matches a
+        # registration whose path no longer exists (repository moved).
+        self.mcp_service.set_move_heal_handler(self.management_api.heal_moved_project)
+
         # Layer 3
         await self.management_api.initialize()
         await self.mcp_service.initialize()

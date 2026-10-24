@@ -45,6 +45,7 @@ from codebase_rag.services.mcp_service.models import (
     AddKnowledgeResult,
     CandidatePoint,
     FileKnowledgeResult,
+    InvalidGitRepoPathError,
     McpServiceError,
     ProjectNotIndexedError,
     ProjectNotRegisteredError,
@@ -106,6 +107,23 @@ class McpService:
         self._registered_agents: Dict[int, str] = {}
         self._initialized = False
 
+        # Moved-repo auto-heal callback, injected by the app container:
+        # async def handler(project_id: str, incoming_path: str) -> bool
+        self._move_heal_handler: Optional[object] = None
+        # Strong references to fire-and-forget heal tasks (GC safety)
+        self._heal_tasks: set = set()
+
+    def set_move_heal_handler(self, handler) -> None:
+        """Register the moved-repository auto-heal callback.
+
+        The handler receives ``(project_id, incoming_path)`` — the identity
+        resolved from the caller's path plus the path itself — and returns
+        True when a re-registration was performed.  It must be conservative:
+        verify identity from the repository's root commit and only heal when
+        the registered path differs and no longer exists on disk.
+        """
+        self._move_heal_handler = handler
+
     @property
     def _reranker_config(self) -> MCPRerankerConfig:
         return self._config_manager.config.mcp.reranker
@@ -155,7 +173,8 @@ class McpService:
             List of SearchResultPoint sorted by reranker score descending.
         """
         # Step 0: Resolve project_id from .git/codebase-rag/project_id
-        project_id = self._read_project_id(project_path)
+        # (also schedules a background moved-repo heal when needed)
+        project_id = self._resolve_project_id(project_path)
 
         # ---- Stage 1: Vector recall ----
         recall_limit = self._reranker_config.recall_limit
@@ -184,10 +203,31 @@ class McpService:
                 top_k=recall_limit,
             )
         except NoActiveInstanceError as e:
-            raise ProjectNotIndexedError(
-                f"Project at '{project_path}' has no active index and lazy rebuild failed. "
-                f"Ensure the project is registered and indexed via the management API."
-            ) from e
+            # One-time synchronous heal before failing: a moved repository
+            # (restarted service, pruned registry entry, evicted instance)
+            # surfaces here first.  After a successful heal the registration
+            # points at the caller's path, so the retry's lazy rebuild can
+            # load persisted points for it.
+            healed = await self._heal_moved_project_quietly(
+                project_id, project_path,
+            )
+            if not healed:
+                raise ProjectNotIndexedError(
+                    f"Project at '{project_path}' has no active index and lazy rebuild failed. "
+                    f"Ensure the project is registered and indexed via the management API."
+                ) from e
+            try:
+                candidates_raw = await self._memory.hybrid_search(
+                    project_id=project_id,
+                    query_dense=emb.dense_vector,
+                    query_sparse=emb.sparse_vector,
+                    top_k=recall_limit,
+                )
+            except NoActiveInstanceError as e2:
+                raise ProjectNotIndexedError(
+                    f"Project at '{project_path}' has no active index and lazy rebuild failed. "
+                    f"Ensure the project is registered and indexed via the management API."
+                ) from e2
 
         if not candidates_raw:
             logger.info("mcp_search_no_candidates", project_id=project_id)
@@ -581,7 +621,7 @@ class McpService:
         self, project_path: str,
     ) -> Optional[ActiveInstanceInfo]:
         """Get active instance info for a project path."""
-        project_id = self._read_project_id(project_path)
+        project_id = self._resolve_project_id(project_path)
         return await self._memory.get_active_instance_info(project_id)
 
     # =========================================================================
@@ -608,7 +648,7 @@ class McpService:
         assert self._git_ops is not None, "git_ops dependency required"
         assert self._qdrant_storage is not None, "qdrant_storage dependency required"
 
-        project_id = self._read_project_id(project_path)
+        project_id = self._resolve_project_id(project_path)
 
         # Get HEAD ref
         head_info = await self._git_ops.get_head_info(project_path)
@@ -682,7 +722,7 @@ class McpService:
         assert self._git_ops is not None, "git_ops dependency required"
         assert self._knowledge_sync is not None, "knowledge_sync dependency required"
 
-        project_id = self._read_project_id(project_path)
+        project_id = self._resolve_project_id(project_path)
         token_limit = self._knowledge_submission_config.point_token_limit
         result = AddKnowledgeResult()
 
@@ -889,9 +929,24 @@ class McpService:
         per-call hot path stays fast.  Stale cache values are healed
         automatically the next time the project is registered.
 
-        Raises ProjectNotRegisteredError if the cache file is missing or
-        empty (project has never been registered).
+        Contract enforcement: ``git_repo_path`` must be the Git repository
+        root (the parent of ``.git/``).  Any other path fails fast with
+        ``InvalidGitRepoPathError`` — the service never guesses the
+        intended root (no ascension from subdirectories).
+
+        Raises InvalidGitRepoPathError if the path has no ``.git`` entry;
+        ProjectNotRegisteredError if the cache file is missing or empty
+        (project has never been registered).
         """
+        # ``.git`` may be a directory (normal clone) or a file (worktree);
+        # os.path.exists accepts both.
+        if not os.path.exists(os.path.join(project_path, ".git")):
+            raise InvalidGitRepoPathError(
+                f"路径 '{project_path}' 不是 Git 仓库根目录。"
+                "git_repo_path 必须为 .git 所在父目录（Git 仓库根目录）的"
+                "绝对路径；请修正参数后重试，服务端不会自动上溯推测仓库根。"
+            )
+
         id_file = os.path.join(
             project_path, ".git", _PROJECT_META_DIR, _PROJECT_ID_FILE,
         )
@@ -911,3 +966,64 @@ class McpService:
             )
 
         return project_id
+
+    def _resolve_project_id(self, project_path: str) -> str:
+        """Read-side project resolution with moved-repo heal kick-off.
+
+        Wraps ``_read_project_id`` and, when a heal handler is wired,
+        opportunistically schedules a background moved-repository heal so
+        the registered path converges to the caller's current path without
+        blocking this call.  The heal is conservative and single-flight on
+        the management side; on the hot path (registered path already
+        matches) it is a no-op after a registry lookup.
+        """
+        project_id = self._read_project_id(project_path)
+        self._schedule_move_heal(project_id, project_path)
+        return project_id
+
+    def _schedule_move_heal(self, project_id: str, project_path: str) -> None:
+        """Fire-and-forget the moved-repo heal; never blocks the caller."""
+        handler = self._move_heal_handler
+        if handler is None:
+            return
+        task = asyncio.create_task(
+            self._run_move_heal(handler, project_id, project_path),
+            name=f"move_heal_kick:{project_id}",
+        )
+        self._heal_tasks.add(task)
+        task.add_done_callback(self._heal_tasks.discard)
+
+    async def _run_move_heal(self, handler, project_id: str, project_path: str) -> None:
+        """Execute the background heal, logging instead of raising."""
+        try:
+            healed = await handler(project_id, project_path)
+        except Exception:
+            logger.exception(
+                "move_heal_kickoff_failed",
+                project_id=project_id,
+                repo=project_path,
+            )
+            return
+        if healed:
+            logger.info(
+                "moved_repo_healed_on_read",
+                project_id=project_id,
+                repo=project_path,
+            )
+
+    async def _heal_moved_project_quietly(
+        self, project_id: str, project_path: str,
+    ) -> bool:
+        """Await the moved-repo heal; report failures as "not healed"."""
+        handler = self._move_heal_handler
+        if handler is None:
+            return False
+        try:
+            return bool(await handler(project_id, project_path))
+        except Exception:
+            logger.exception(
+                "move_heal_failed",
+                project_id=project_id,
+                repo=project_path,
+            )
+            return False

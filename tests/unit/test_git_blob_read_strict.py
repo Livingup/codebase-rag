@@ -48,6 +48,8 @@ class GitBlobReadStrictTest(unittest.IsolatedAsyncioTestCase):
     async def test_knowledge_query_separates_absence_and_per_file_git_failure(self):
         service = object.__new__(McpService)
         service._read_project_id = lambda path: 'project'
+        service._move_heal_handler = None
+        service._heal_tasks = set()
         git = object.__new__(GitOperationsService)
         git.get_head_info = AsyncMock(return_value=SimpleNamespace(commit_hash='head'))
         async def run_git(repo, args):

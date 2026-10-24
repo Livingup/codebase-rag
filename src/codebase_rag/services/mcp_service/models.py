@@ -48,6 +48,10 @@ class McpServiceError(Exception):
     """Base exception for MCP service."""
 
 
+class InvalidGitRepoPathError(McpServiceError):
+    """project_path is not a Git repository root (no .git entry)."""
+
+
 class ProjectNotRegisteredError(McpServiceError):
     """project_id file not found at the given project_path."""
 

@@ -88,6 +88,12 @@ def _derive_project_id_from_root_commit(root_commit: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, derivation_input))
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """Retrieve an unobserved task exception to suppress asyncio warnings."""
+    if not task.cancelled():
+        task.exception()
+
+
 class ManagementApiService:
     """Top-level API service coordinating all downstream services.
 
@@ -126,6 +132,9 @@ class ManagementApiService:
         # In-memory project registry: project_id → ProjectRecord
         self._projects: Dict[str, ProjectRecord] = {}
 
+        # One shared moved-repo heal task per project_id (single-flight)
+        self._in_flight_heals: Dict[str, asyncio.Task] = {}
+
         self._initialized = False
         self._start_time: float = 0.0
 
@@ -152,6 +161,13 @@ class ManagementApiService:
         """Graceful shutdown."""
         logger.info("management_api_service_shutting_down")
         self._projects.clear()
+
+        # Cancel in-flight moved-repo heals; shielded waiters already
+        # received their result or cancellation.
+        for task in list(self._in_flight_heals.values()):
+            task.cancel()
+        self._in_flight_heals.clear()
+
         self._initialized = False
         logger.info("management_api_service_shutdown")
 
@@ -332,6 +348,153 @@ class ManagementApiService:
             registered=True,
             initialization_running=task is not None and task.task_type == "initialization",
         )
+
+    # =========================================================================
+    # 2.2 Moved-repository auto-heal
+    # =========================================================================
+
+    async def heal_moved_project(self, project_id: str, incoming_path: str) -> bool:
+        """Re-register a project whose repository moved to a new path.
+
+        MCP read paths always receive the caller's current Git repo root.
+        When that root carries this project's identity while the registered
+        path differs and no longer exists on disk, the repository was moved
+        and the registration is healed here automatically — reusing the
+        normal ``register_project`` flow so the registry path, event
+        detection, hooks and workflow state all converge, and missed
+        commits are caught up.
+
+        Conservative by design — healing only runs when ALL hold:
+          1. ``incoming_path`` is a Git repo root (contract check; the
+             service never ascends from subdirectories to guess a root).
+          2. The project_id derived from ``incoming_path``'s root commit
+             equals ``project_id`` — identity is verified from repository
+             content, never from the caller's claim or the ``.git`` cache
+             file alone.
+          3. Either:
+             a. the project is registered with a different path AND the
+                old path's ``.git`` no longer exists (a move, not a copy —
+                two live clones must be switched via manual registration),
+                or
+             b. the project is not registered at all (the entry was pruned
+                by a restart-restore while the ``.git`` cache file still
+                travels with the repository).
+
+        Single-flight per project_id: concurrent callers join the same
+        heal task.  The pre-check is cheap (registry lookup + existence
+        checks, no git subprocess) so read paths can call this on every
+        request.
+
+        Returns:
+            True when a re-registration was performed by this call (or a
+            joined in-flight heal); False when no heal was applicable.
+        """
+        if not self._initialized or not incoming_path:
+            return False
+
+        # Cheap pre-check (no git subprocess) so the hot path — registered
+        # path already matches the caller's path — returns immediately.
+        if not self._move_heal_precheck(project_id, incoming_path):
+            return False
+
+        task = self._in_flight_heals.get(project_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._run_move_heal(project_id, incoming_path),
+                name=f"move_heal:{project_id}",
+            )
+            task.add_done_callback(_consume_task_exception)
+            self._in_flight_heals[project_id] = task
+        else:
+            logger.info("move_heal_joined", project_id=project_id)
+
+        # shield: a cancelled caller must not abort an in-flight heal
+        return await asyncio.shield(task)
+
+    def _move_heal_precheck(self, project_id: str, incoming_path: str) -> bool:
+        """Synchronous gate deciding whether a heal task should start."""
+        try:
+            normalized_incoming = self._normalize_registered_path(incoming_path)
+        except InvalidRequestError:
+            return False
+
+        record = self._projects.get(project_id)
+        if record is not None:
+            try:
+                normalized_registered = self._normalize_registered_path(
+                    record.git_repo_path,
+                )
+            except InvalidRequestError:
+                normalized_registered = None
+            if normalized_registered == normalized_incoming:
+                # Hot path: registration already matches the caller's path.
+                return False
+            if os.path.exists(os.path.join(record.git_repo_path, ".git")):
+                # Old path still live: copy / two-clone scenario — switching
+                # must be an explicit decision, never automatic.
+                return False
+
+        # Contract check: the caller's path must itself be a Git repo root
+        # (.git may be a directory or a worktree file).
+        return os.path.exists(os.path.join(incoming_path, ".git"))
+
+    async def _run_move_heal(self, project_id: str, incoming_path: str) -> bool:
+        """Run one project's heal and release its single-flight slot."""
+        try:
+            return await self._do_heal_moved_project(project_id, incoming_path)
+        finally:
+            if self._in_flight_heals.get(project_id) is asyncio.current_task():
+                del self._in_flight_heals[project_id]
+
+    async def _do_heal_moved_project(self, project_id: str, incoming_path: str) -> bool:
+        """Validated heal path: re-check state, verify identity, register."""
+        # Re-validate under the single-flight task — state may have changed
+        # while waiting to join.
+        if not self._move_heal_precheck(project_id, incoming_path):
+            return False
+
+        # Identity verification: derive from repository content (root
+        # commit).  The .git cache file and the caller's claim are never
+        # trusted on their own — a mismatch means no heal, leaving the
+        # normal error paths to surface the inconsistency.
+        try:
+            root_commit = await self._git_ops.get_root_commit(incoming_path)
+        except Exception:
+            logger.warning(
+                "move_heal_root_commit_failed",
+                repo_path=incoming_path,
+            )
+            return False
+        if not root_commit:
+            return False
+        derived_id = _derive_project_id_from_root_commit(root_commit)
+        if derived_id != project_id:
+            logger.warning(
+                "move_heal_identity_mismatch",
+                derived_project_id=derived_id,
+                expected_project_id=project_id,
+                repo_path=incoming_path,
+            )
+            return False
+
+        old_record = self._projects.get(project_id)
+        old_path = old_record.git_repo_path if old_record is not None else None
+        try:
+            await self.register_project(incoming_path)
+        except Exception:
+            logger.exception(
+                "move_heal_register_failed",
+                repo_path=incoming_path,
+            )
+            return False
+
+        logger.info(
+            "moved_project_healed",
+            project_id=project_id,
+            old_path=old_path,
+            new_path=incoming_path,
+        )
+        return True
 
     async def list_projects(self) -> List[ProjectResponse]:
         """List all registered projects."""
