@@ -17,3 +17,4 @@
 |---|---|---|---|
 | key-pool | 多 Key 轮换调度与故障隔离 | agent、embedding、mcp_service | mechanisms/key-pool.md |
 | config-reconcile | 配置热重载的增量协调与不可变参数感知 | agent、embedding、event_detection、workflow、qdrant_storage、mcp_client | mechanisms/config-reconcile.md |
+| moved-repo-heal | 仓库移动后的登记路径自动恢复 | mcp_service、management_api | mechanisms/moved-repo-heal.md |

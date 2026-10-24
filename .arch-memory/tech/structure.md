@@ -36,8 +36,8 @@
 - `src/codebase_rag/services/memory_qdrant/service.py` MEMORY_QDRANT-01、MEMORY_QDRANT-02、MEMORY_QDRANT-03、MEMORY_QDRANT-04、MEMORY_QDRANT-05
 - `src/codebase_rag/__main__.py` [公共·服务组装与回调接线]
 - `src/codebase_rag/services/mcp_service/server.py` [mcp_service·工具响应适配]
-- `src/codebase_rag/services/mcp_service/service.py` MCP_SERVICE-03
-- `src/codebase_rag/services/management_api/service.py` MCP_SERVICE-04
+- `src/codebase_rag/services/mcp_service/service.py` MCP_SERVICE-03、MCP_SERVICE-07、→ mechanisms/moved-repo-heal
+- `src/codebase_rag/services/management_api/service.py` MCP_SERVICE-04、→ mechanisms/moved-repo-heal
 - `src/codebase_rag/common/keypool.py` → mechanisms/key-pool
 - `src/codebase_rag/config/loader.py` → mechanisms/config-reconcile
 - `src/codebase_rag/services/mcp_service/jev_client.py` [mcp_service·Jev 重排序客户端]

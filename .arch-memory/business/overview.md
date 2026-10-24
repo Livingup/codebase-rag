@@ -24,7 +24,7 @@
 - event_detection → workflow：事件，GitEvent 发布给编排层。
 - workflow → git_operations / agent / embedding / knowledge_sync / qdrant_storage / memory_qdrant：同步，编排知识生产与内存视图更新。
 - mcp_service → memory_qdrant：同步，代码知识检索使用项目内存索引；实例生命周期由 memory_qdrant 管理。
-- mcp_service → embedding / git_operations / knowledge_sync / management_api / context_engine：同步，分别用于查询向量化与描述 token 校验、blob 与版本身份、知识提交、登记状态视图、上下文分析委托。
+- mcp_service → embedding / git_operations / knowledge_sync / management_api / context_engine：同步，分别用于查询向量化与描述 token 校验、blob 与版本身份、知识提交、登记状态视图与仓库移动自愈、上下文分析委托。
 - context_engine → agent / mcp_client：同步，分析 agent 执行与外部工具接入。
 - knowledge_sync → qdrant_storage / memory_qdrant：同步，持久化发布与内存视图刷新。
 - management_api → event_detection / workflow / memory_qdrant / qdrant_storage / embedding / agent / knowledge_sync：同步，登记监控注册、任务触发与状态聚合。
