@@ -2,22 +2,10 @@
 
 from __future__ import annotations
 
-import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from codebase_rag.services.agent.models import LLMResponse, Message, ToolSchema
-
-
-async def close_stream(stream: Any) -> None:
-    for method_name in ("close", "aclose"):
-        method = getattr(stream, method_name, None)
-        if not method:
-            continue
-        result = method()
-        if inspect.isawaitable(result):
-            await result
-        return
 
 
 class LLMProvider(ABC):
@@ -40,11 +28,6 @@ class LLMProvider(ABC):
         prompt_cache_key: Optional[str] = None,
     ) -> LLMResponse:
         """Execute a single chat completion call."""
-        ...
-
-    @abstractmethod
-    async def health_check(self, api_key: str) -> bool:
-        """Check if a key is valid and the provider is reachable."""
         ...
 
     async def probe_stream(

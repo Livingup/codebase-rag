@@ -1,31 +1,23 @@
-"""Gemini dense embedding provider.
-
-API Reference:
-  - Embeddings: https://ai.google.dev/api/embeddings
-  - Tokens: https://ai.google.dev/api/tokens
-
-Endpoints:
-  - POST /v1beta/models/{model}:batchEmbedContents?key={API_KEY}
-  - POST /v1beta/models/{model}:countTokens?key={API_KEY}
-"""
+"""Gemini dense embedding provider — delegates protocol handling to llm-sdk."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-import httpx
+from pythonsdk import GeminiEmbeddingClient
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.services.agent.providers.llm_sdk_common import make_client_config
 from codebase_rag.services.embedding.providers.base import DenseEmbeddingProvider
 
 logger = get_logger(__name__)
 
 
 class GeminiDenseProvider(DenseEmbeddingProvider):
-    """Gemini dense embedding provider using batchEmbedContents API.
+    """Gemini dense embedding via llm-sdk batchEmbedContents.
 
     Args:
-        api_base_url: Gemini API base URL.
+        api_base_url: Gemini API origin (``/v1beta`` is added by llm-sdk).
         model_name: Model name (e.g. "gemini-embedding-001").
         dimension: Output vector dimension (None = model default).
         batch_size: Max texts per API call.
@@ -45,36 +37,24 @@ class GeminiDenseProvider(DenseEmbeddingProvider):
         self._dimension = dimension
         self._batch_size = batch_size
         self._timeout = request_timeout
-        self._client = httpx.AsyncClient(timeout=request_timeout)
 
     @property
     def batch_size(self) -> int:
         return self._batch_size
 
-    async def embed_batch(self, api_key: str, texts: List[str]) -> List[List[float]]:
-        """Generate dense vectors via Gemini batchEmbedContents API.
-
-        Request format:
-        {
-          "requests": [
-            {
-              "model": "models/{model_name}",
-              "content": { "parts": [{ "text": "..." }] },
-              "outputDimensionality": null,
-              "taskType": "RETRIEVAL_DOCUMENT"
-            }
-          ]
-        }
-        """
-        url = (
-            f"{self._api_base_url}/v1beta/models/{self._model_name}"
-            f":batchEmbedContents"
+    def _make_client(self, api_key: str) -> GeminiEmbeddingClient:
+        return GeminiEmbeddingClient(
+            make_client_config(api_key, self._api_base_url, self._timeout),
+            model=self._model_name,
         )
 
-        requests_payload: List[Dict[str, Any]] = []
+    async def embed_batch(self, api_key: str, texts: List[str]) -> List[List[float]]:
+        """Generate dense vectors via Gemini batchEmbedContents API."""
+        client = self._make_client(api_key)
+
+        requests_payload: List[dict] = []
         for text in texts:
-            req: Dict[str, Any] = {
-                "model": f"models/{self._model_name}",
+            req: dict = {
                 "content": {"parts": [{"text": text}]},
                 "taskType": "RETRIEVAL_DOCUMENT",
             }
@@ -82,20 +62,9 @@ class GeminiDenseProvider(DenseEmbeddingProvider):
                 req["outputDimensionality"] = self._dimension
             requests_payload.append(req)
 
-        body = {"requests": requests_payload}
+        response = await client.batch_embed_contents(requests_payload)
+        embeddings = response.get("embeddings", [])
 
-        response = await self._client.post(
-            url,
-            json=body,
-            headers={
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        embeddings = data.get("embeddings", [])
         if len(embeddings) != len(texts):
             raise ValueError(
                 f"Gemini returned {len(embeddings)} embeddings "
@@ -105,33 +74,8 @@ class GeminiDenseProvider(DenseEmbeddingProvider):
         return [emb["values"] for emb in embeddings]
 
     async def count_tokens(self, api_key: str, text: str) -> int:
-        """Count tokens via Gemini countTokens API.
-
-        Request format:
-        {
-          "contents": [{ "parts": [{ "text": "..." }] }]
-        }
-        """
-        url = (
-            f"{self._api_base_url}/v1beta/models/{self._model_name}"
-            f":countTokens"
-        )
-
-        body = {
-            "contents": [{"parts": [{"text": text}]}],
-        }
-
-        response = await self._client.post(
-            url,
-            json=body,
-            headers={
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("totalTokens", 0)
+        """Count tokens via Gemini countTokens API."""
+        return await self._make_client(api_key).count_tokens(text)
 
     async def health_check(self, api_key: str) -> bool:
         """Verify key by counting tokens on a short test string."""
@@ -143,5 +87,5 @@ class GeminiDenseProvider(DenseEmbeddingProvider):
             return False
 
     async def close(self) -> None:
-        """Close the underlying HTTP client."""
-        await self._client.aclose()
+        """Kept for interface compatibility (llm-sdk holds no persistent client)."""
+        return None

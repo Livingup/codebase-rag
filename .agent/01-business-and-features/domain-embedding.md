@@ -15,10 +15,11 @@
   2. [并发隔离]：dense 与 sparse 各自独立 Semaphore（`embedding.max_concurrency`，默认 3）——Gemini（海外代理链路）与 DashScope（国内直连）两条链路互不争抢容量，不合并为单一全局信号量。
   3. [密钥健康校验]：_validate_keys 启动时逐 Key health_check；失败 Key mark_unhealthy；**部分成功可启动，全部不健康抛 RuntimeError 阻断启动**。
   4. [sparse 维度]：默认 2048。
+  5. [SDK 委托]：dense 由 `GeminiEmbeddingClient.batch_embed_contents`、sparse 由 `DashScopeSparseEmbeddingClient.embed_texts/embed_query` 完成协议与错误分类（见 `.agent/04-tech-decisions/tech-llm-sdk-adoption.md`）；health_check 以真实接口调用（Gemini `countTokens`、DashScope sparse 一条短文本）判定 Key 健康。
 - **级联依赖功能单元（Cascade Links）**：FEAT-COMMON-01（KeyPool）、FEAT-COMMON-04（reconciler 注册）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
-  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`
+  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
   - 域服务门面（services/embedding/service.py）：`src/codebase_rag/services/embedding/service.py`（初始化段）
   - 服务商适配器（services/embedding/providers/base.py）：`src/codebase_rag/services/embedding/providers/base.py`
@@ -31,14 +32,15 @@
   2. [sparse 门禁]：只校验 batch_size，不校验 token。
   3. [双模规则]：embed_sparse(texts, is_query)——is_query=True 且 DashScope 时走 embed_batch_for_query（text_type=query 检索模式），否则 embed_batch（document 索引模式）；索引与检索使用不同模式。
   4. [合成接口]：embed 并行 gather dense+sparse 合成 EmbeddingResult；count_tokens 对外提供 token 计数。
-  5. [重试规则]：总尝试数 = keypool.total_keys × max_retries；按 provider_name 是否含 "dense" 选信号量；429 判定（status_code==429 / "429" / RESOURCE_EXHAUSTED / Too Many Requests）→ 不 report_failure 仅退避（delay=max(base_delay×backoff^(attempt%max_retries), 1.5)）；非 429 → report_failure 计入熔断。
+  5. [重试规则]：总尝试数 = keypool.total_keys × max_retries；按 provider_name 是否含 "dense" 选信号量；429 判定（llm-sdk `LLMClientError.kind ∈ {RATE_LIMIT, OVERLOADED}` / status_code==429 / "429" / RESOURCE_EXHAUSTED / Too Many Requests）→ 不 report_failure 仅退避（delay=max(base_delay×backoff^(attempt%max_retries), 1.5)）；非 429 → report_failure 计入熔断。
   6. [热更新]：max_concurrency 变化重建双信号量；active_provider 切换则 close 旧实例重建 provider+KeyPool；同 provider 仅 Key 变化则 update_keys 保态。
 - **级联依赖功能单元（Cascade Links）**：FEAT-COMMON-01（KeyPool）、FEAT-COMMON-02（TokenCounter）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
-  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`
+  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
   - 域服务门面（services/embedding/service.py）：`src/codebase_rag/services/embedding/service.py`（embed 方法族与重试段）*(同类参考样板：门禁阻断式批处理)*
+  - 服务商适配器（services/embedding/providers/<name>.py）：`src/codebase_rag/services/embedding/providers/gemini.py`、`src/codebase_rag/services/embedding/providers/dashscope.py`
 
 ## 三、域内量化参数速查
 

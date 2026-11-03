@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional
 
+from pythonsdk import ErrorKind, LLMClientError
+
 from codebase_rag.common.keypool import KeyPool
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.types import EmbeddingResult, SparseVector
@@ -620,7 +622,11 @@ class EmbeddingService:
                 err_str = str(e)
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
                 is_rate_limit = (
-                    status_code == 429
+                    (
+                        isinstance(e, LLMClientError)
+                        and e.kind in (ErrorKind.RATE_LIMIT, ErrorKind.OVERLOADED)
+                    )
+                    or status_code == 429
                     or "429" in err_str
                     or "RESOURCE_EXHAUSTED" in err_str
                     or "Too Many Requests" in err_str

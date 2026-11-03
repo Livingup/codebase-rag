@@ -1,63 +1,63 @@
-"""Anthropic (Claude) API provider — uses official anthropic SDK."""
+"""Anthropic (Claude) provider — delegates protocol handling to llm-sdk.
+
+The prompt-caching breakpoint strategy is business logic and stays here; all
+HTTP/SSE parsing, retry and error classification come from llm-sdk.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import anthropic
-from anthropic.types import (
-    CacheControlEphemeralParam,
-    MessageParam,
-    TextBlockParam,
-    ToolParam,
-    ToolResultBlockParam,
-    ToolUseBlockParam,
+from pythonsdk import (
+    ClaudeCountTokensClient,
+    ClaudeCountTokensRequest,
+    ClaudeMessagesClient,
+    ClaudeMessagesRequest,
 )
 
 from codebase_rag.common.logging import get_logger
-from codebase_rag.services.agent.errors import LLMAPIError, LLMAuthError, LLMRateLimitError
-from codebase_rag.services.agent.models import (
-    LLMResponse,
-    Message,
-    TokenUsage,
-    ToolCall,
-    ToolSchema,
-)
+from codebase_rag.services.agent.models import LLMResponse, Message, ToolSchema
 from codebase_rag.services.agent.providers.base import LLMProvider
+from codebase_rag.services.agent.providers.llm_sdk_common import (
+    collect_stream,
+    make_client_config,
+    make_request_options,
+    with_api_version,
+)
 
 logger = get_logger(__name__)
 
 _CACHE_BREAKPOINT_BLOCK_GAP_THRESHOLD = 20
-_CACHE_CONTROL_SYSTEM = CacheControlEphemeralParam(type="ephemeral", ttl="1h")
-_CACHE_CONTROL_EPHEMERAL = CacheControlEphemeralParam(type="ephemeral")
+_CACHE_CONTROL_SYSTEM = {"type": "ephemeral", "ttl": "1h"}
+_CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
+_PROMPT_CACHING_BETA = "prompt-caching-2024-07-31"
 
 
 @dataclass
 class _CacheAnchorState:
     """Tracks the last cache breakpoint position for incremental prompt caching."""
+
     message_count: int
     anchor_message_index: int
     anchor_message_hash: str
 
 
 class AnthropicProvider(LLMProvider):
-    """Anthropic Messages API via official SDK."""
+    """Anthropic Messages API via llm-sdk."""
 
     def __init__(self, api_base_url: str, request_timeout: int = 120) -> None:
-        self._api_base_url = api_base_url.rstrip("/")
+        self._api_base_url = with_api_version(api_base_url.rstrip("/"), "v1")
         self._timeout = request_timeout
         self._session_anchors: Dict[str, _CacheAnchorState] = {}
         self._pending_anchors: Dict[str, _CacheAnchorState] = {}
 
-    def _make_client(self, api_key: str) -> anthropic.AsyncAnthropic:
-        return anthropic.AsyncAnthropic(
-            api_key=api_key,
-            base_url=self._api_base_url,
-            timeout=self._timeout,
+    def _make_client(self, api_key: str) -> ClaudeMessagesClient:
+        return ClaudeMessagesClient(
+            make_client_config(api_key, self._api_base_url, self._timeout),
+            anthropic_beta=[_PROMPT_CACHING_BETA],
         )
 
     async def chat_completion(
@@ -76,10 +76,6 @@ class AnthropicProvider(LLMProvider):
         prompt_cache_key: Optional[str] = None,
     ) -> LLMResponse:
         client = self._make_client(api_key)
-        headers = dict(custom_headers or {})
-        if session_id:
-            headers["X-Relay-Session-Id"] = session_id
-        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
 
         # Extract system prompt
         system_text = None
@@ -95,11 +91,9 @@ class AnthropicProvider(LLMProvider):
         # Apply prompt caching: cache_control on system + message breakpoints
         cached_system = None
         if system_text:
-            cached_system = [TextBlockParam(
-                type="text",
-                text=system_text,
-                cache_control=_CACHE_CONTROL_SYSTEM,
-            )]
+            cached_system = [
+                {"type": "text", "text": system_text, "cache_control": _CACHE_CONTROL_SYSTEM}
+            ]
 
         last_anchor = self._session_anchors.get(session_id) if session_id else None
         built_messages, new_anchor = self._apply_message_cache_control(
@@ -108,138 +102,103 @@ class AnthropicProvider(LLMProvider):
         if session_id and new_anchor:
             self._pending_anchors[session_id] = new_anchor
 
-        kwargs: Dict = {
-            "model": model,
-            "messages": built_messages,
-            "temperature": temperature,
-            "max_tokens": max_output_tokens or 128000,
-        }
-
-        if cached_system:
-            kwargs["system"] = cached_system
-        elif system_text:
-            kwargs["system"] = system_text
-
-        # Thinking — override via extra_body (SDK custom field)
-        extra_body = thinking_config if thinking_config else None
-
         has_forced_schema = False
+        claude_tools: Optional[List[Dict[str, Any]]] = None
+        claude_tool_choice: Optional[Dict[str, Any]] = None
+
         if tools:
-            kwargs["tools"] = [
-                ToolParam(
-                    name=t.name,
-                    description=t.description,
-                    input_schema=t.parameters,
-                )
+            claude_tools = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                }
                 for t in tools
             ]
-            # Tool choice: "auto" | "any" | "none" or {"type": "tool", "name": "xxx"}
+            # Tool choice: "auto" | "any" | "none" | {"type": "tool", "name": ...}
+            _TC_MAP = {"auto": {"type": "auto"}, "required": {"type": "any"}, "none": {"type": "auto"}}
             if tool_choice:
-                _TC_MAP = {"auto": {"type": "auto"}, "required": {"type": "any"}, "none": {"type": "auto"}}
-                kwargs["tool_choice"] = _TC_MAP.get(tool_choice, {"type": "auto"})
+                claude_tool_choice = _TC_MAP.get(tool_choice, {"type": "auto"})
 
         # Structured output via forced tool_use
         if output_schema and not tools:
-            kwargs["tools"] = [ToolParam(
-                name="structured_output",
-                description="Output structured data",
-                input_schema=output_schema,
-            )]
-            kwargs["tool_choice"] = {"type": "tool", "name": "structured_output"}
+            claude_tools = [
+                {
+                    "name": "structured_output",
+                    "description": "Output structured data",
+                    "input_schema": output_schema,
+                }
+            ]
+            claude_tool_choice = {"type": "tool", "name": "structured_output"}
             has_forced_schema = True
 
+        request = ClaudeMessagesRequest(
+            model=model,
+            max_tokens=max_output_tokens or 128000,
+            messages=built_messages,
+            system=cached_system or system_text,
+            temperature=temperature,
+            tools=claude_tools,
+            tool_choice=claude_tool_choice,
+            extra_fields=thinking_config or {},
+        )
+
         try:
-            # Use streaming mode — many proxies only support stream=true
-            async with client.messages.stream(
-                **kwargs, extra_headers=headers,
-                extra_body=extra_body,
-            ) as stream:
-                response = await stream.get_final_message()
-        except anthropic.AuthenticationError as e:
+            response = await collect_stream(
+                client.stream(
+                    request,
+                    make_request_options(custom_headers, session_id),
+                ),
+                provider_label="Anthropic",
+                forced_tool_name="structured_output" if has_forced_schema else None,
+                extract_thinking_tags=True,
+            )
+        except BaseException:
             if session_id:
                 self._pending_anchors.pop(session_id, None)
-            raise LLMAuthError(f"Anthropic auth error: {e}") from e
-        except anthropic.RateLimitError as e:
-            if session_id:
-                self._pending_anchors.pop(session_id, None)
-            raise LLMRateLimitError(f"Anthropic rate limit: {e}") from e
-        except anthropic.APIError as e:
-            if session_id:
-                self._pending_anchors.pop(session_id, None)
-            raise LLMAPIError(f"Anthropic API error: {e}") from e
+            raise
 
         # Commit pending anchor on success
         if session_id and session_id in self._pending_anchors:
             self._session_anchors[session_id] = self._pending_anchors.pop(session_id)
 
-        return self._parse_response(response, has_output_schema=has_forced_schema)
+        if has_forced_schema and response.tool_calls:
+            response.tool_calls = None
+        if has_forced_schema and response.structured_output:
+            response.finish_reason = "stop"
+        return response
 
     def cleanup_session(self, session_id: str) -> None:
         """Remove cached anchor state for a completed session."""
         self._session_anchors.pop(session_id, None)
         self._pending_anchors.pop(session_id, None)
 
-    async def health_check(self, api_key: str) -> bool:
-        try:
-            client = self._make_client(api_key)
-            await client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1,
-                messages=[MessageParam(role="user", content="hi")],
-            )
-            return True
-        except Exception:
-            return False
-
-    async def probe_stream(
-        self,
-        api_key: str,
-        model: str,
-        custom_headers: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        client = self._make_client(api_key)
-        headers = dict(custom_headers or {})
-        try:
-            async with client.messages.stream(
-                model=model,
-                max_tokens=1,
-                temperature=0.0,
-                messages=[MessageParam(role="user", content=".")],
-                extra_headers=headers,
-            ) as stream:
-                async for text in stream.text_stream:
-                    if text:
-                        return True
-            return False
-        except anthropic.AuthenticationError as e:
-            raise LLMAuthError(f"Anthropic auth error: {e}") from e
-        except anthropic.RateLimitError as e:
-            raise LLMRateLimitError(f"Anthropic rate limit: {e}") from e
-        except anthropic.APIError as e:
-            raise LLMAPIError(f"Anthropic API error: {e}") from e
-
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
-        """Count tokens via Anthropic SDK count_tokens API."""
+        """Count tokens via Anthropic count_tokens API."""
         if not api_key:
             raise ValueError("api_key required for Anthropic count_tokens")
-        client = self._make_client(api_key)
-        response = await client.messages.count_tokens(
-            model=model,
-            messages=[MessageParam(role="user", content=text)],
+        client = ClaudeCountTokensClient(
+            make_client_config(api_key, self._api_base_url, self._timeout),
+            anthropic_beta=[_PROMPT_CACHING_BETA],
         )
-        return response.input_tokens
+        return await client.count_tokens(
+            ClaudeCountTokensRequest(
+                model=model,
+                messages=[{"role": "user", "content": text}],
+            )
+        )
 
     # -----------------------------------------------------------------------
     # Prompt caching helpers
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _message_hash(msg: MessageParam) -> str:
+    def _message_hash(msg: Dict[str, Any]) -> str:
         """Stable hash of a built message dict for anchor validation."""
         return hashlib.md5(json.dumps(msg, sort_keys=True, default=str).encode()).hexdigest()
 
     @staticmethod
-    def _add_cache_control_to_message(msg: MessageParam) -> MessageParam:
+    def _add_cache_control_to_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         """Add cache_control (ephemeral) to the last content block of a message (mutates)."""
         content = msg.get("content")
         if isinstance(content, list) and content:
@@ -247,15 +206,13 @@ class AnthropicProvider(LLMProvider):
             if isinstance(last_block, dict):
                 last_block["cache_control"] = _CACHE_CONTROL_EPHEMERAL
         elif isinstance(content, str):
-            msg["content"] = [TextBlockParam(
-                type="text",
-                text=content,
-                cache_control=_CACHE_CONTROL_EPHEMERAL,
-            )]
+            msg["content"] = [
+                {"type": "text", "text": content, "cache_control": _CACHE_CONTROL_EPHEMERAL}
+            ]
         return msg
 
     @staticmethod
-    def _count_blocks_in_range(messages: List[MessageParam], start_idx: int, end_idx: int) -> int:
+    def _count_blocks_in_range(messages: List[Dict[str, Any]], start_idx: int, end_idx: int) -> int:
         """Count total content blocks in messages[start_idx:end_idx].
 
         Anthropic counts each item in a message's content array as one block.
@@ -273,9 +230,9 @@ class AnthropicProvider(LLMProvider):
     @classmethod
     def _apply_message_cache_control(
         cls,
-        messages: List[MessageParam],
+        messages: List[Dict[str, Any]],
         previous_anchor: Optional[_CacheAnchorState],
-    ) -> Tuple[List[MessageParam], Optional[_CacheAnchorState]]:
+    ) -> Tuple[List[Dict[str, Any]], Optional[_CacheAnchorState]]:
         """Apply cache_control breakpoints to message list.
 
         Anthropic server searches from the BOTTOM of messages upward for
@@ -327,15 +284,15 @@ class AnthropicProvider(LLMProvider):
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _build_messages(messages: List[Message]) -> List[MessageParam]:
-        result: List[MessageParam] = []
+    def _build_messages(messages: List[Message]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
         for msg in messages:
             if msg.role == "tool" and msg.tool_call_id:
-                tool_block = ToolResultBlockParam(
-                    type="tool_result",
-                    tool_use_id=msg.tool_call_id,
-                    content=[TextBlockParam(type="text", text=msg.content or "")],
-                )
+                tool_block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": [{"type": "text", "text": msg.content or ""}],
+                }
                 # Merge consecutive tool_result into one user message
                 # (Anthropic API forbids consecutive messages with the same role)
                 if result and result[-1]["role"] == "user" and isinstance(result[-1]["content"], list):
@@ -343,107 +300,26 @@ class AnthropicProvider(LLMProvider):
                     if last_content and isinstance(last_content[0], dict) and last_content[0].get("type") == "tool_result":
                         last_content.append(tool_block)
                         continue
-                result.append(MessageParam(role="user", content=[tool_block]))
+                result.append({"role": "user", "content": [tool_block]})
             elif msg.tool_calls:
                 content_blocks: list = []
                 # NOTE: thinking blocks require a 'signature' field for multi-turn.
                 # Proxies strip signatures, so we omit thinking blocks entirely.
-                # Anthropic docs allow omitting them (model loses some context).
                 if msg.content:
-                    content_blocks.append(TextBlockParam(type="text", text=msg.content))
+                    content_blocks.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
-                    content_blocks.append(ToolUseBlockParam(
-                        type="tool_use",
-                        id=tc.id,
-                        name=tc.name,
-                        input=tc.arguments,
-                    ))
-                result.append(MessageParam(role="assistant", content=content_blocks))
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }
+                    )
+                result.append({"role": "assistant", "content": content_blocks})
             elif msg.role == "assistant" and msg.thinking_content:
                 # Omit thinking blocks (no signature available)
-                result.append(MessageParam(
-                    role="assistant",
-                    content=msg.content or "",
-                ))
+                result.append({"role": "assistant", "content": msg.content or ""})
             else:
-                result.append(MessageParam(
-                    role=msg.role,  # type: ignore[arg-type]
-                    content=msg.content or "",
-                ))
+                result.append({"role": msg.role, "content": msg.content or ""})
         return result
-
-    @staticmethod
-    def _parse_response(response, has_output_schema: bool = False) -> LLMResponse:
-        content_blocks = response.content or []
-        stop_reason = response.stop_reason or "end_turn"
-
-        text_parts = []
-        thinking_parts = []
-        tool_calls = []
-        structured_output = None
-
-        for block in content_blocks:
-            if block.type == "thinking":
-                thinking_parts.append(block.thinking)
-            elif block.type == "text":
-                # Some proxies embed thinking as <thinking> tags in text blocks
-                # instead of returning proper thinking content blocks.
-                raw = block.text or ""
-                m = re.search(r"<thinking>(.*?)</thinking>", raw, re.DOTALL)
-                if m:
-                    thinking_parts.append(m.group(1).strip())
-                    cleaned = re.sub(r"\s*<thinking>.*?</thinking>\s*", "", raw, flags=re.DOTALL).strip()
-                    if cleaned:
-                        text_parts.append(cleaned)
-                else:
-                    text_parts.append(raw)
-            elif block.type == "tool_use":
-                if has_output_schema and block.name == "structured_output":
-                    structured_output = block.input
-                else:
-                    tool_calls.append(ToolCall(
-                        id=block.id or "",
-                        name=block.name or "",
-                        arguments=block.input or {},
-                    ))
-
-        content = "\n".join(text_parts) if text_parts else None
-        thinking_content = "\n".join(thinking_parts) if thinking_parts else None
-
-        if content and not structured_output:
-            try:
-                structured_output = json.loads(content)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        if tool_calls:
-            finish_reason = "tool_calls"
-        elif stop_reason == "max_tokens":
-            finish_reason = "length"
-        else:
-            finish_reason = "stop"
-
-        # Forced schema via tool_use → treat as stop
-        if has_output_schema and structured_output and not tool_calls:
-            finish_reason = "stop"
-
-        usage = TokenUsage()
-        if response.usage:
-            cache_creation = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
-            cache_read = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
-            usage = TokenUsage(
-                prompt_tokens=response.usage.input_tokens or 0,
-                completion_tokens=response.usage.output_tokens or 0,
-                total_tokens=(response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
-                cache_creation_tokens=cache_creation,
-                cache_read_tokens=cache_read,
-            )
-
-        return LLMResponse(
-            content=content,
-            thinking_content=thinking_content,
-            tool_calls=tool_calls if tool_calls else None,
-            structured_output=structured_output,
-            finish_reason=finish_reason,
-            usage=usage,
-        )

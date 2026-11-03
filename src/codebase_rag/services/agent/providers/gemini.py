@@ -1,33 +1,46 @@
-"""Gemini LLM provider — uses official google-genai SDK."""
+"""Gemini provider — delegates protocol handling to llm-sdk."""
 
 from __future__ import annotations
 
-import json
-from typing import Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional
 
-from google import genai
-from google.genai import types as genai_types
+from pythonsdk import (
+    GeminiEmbeddingClient,
+    GeminiStreamClient,
+    GeminiStreamRequest,
+)
 
 from codebase_rag.common.logging import get_logger
-from codebase_rag.services.agent.errors import LLMAPIError, LLMAuthError, LLMRateLimitError
-from codebase_rag.services.agent.models import (
-    LLMResponse,
-    Message,
-    TokenUsage,
-    ToolCall,
-    ToolSchema,
+from codebase_rag.services.agent.models import LLMResponse, Message, ToolSchema
+from codebase_rag.services.agent.providers.base import LLMProvider
+from codebase_rag.services.agent.providers.llm_sdk_common import (
+    collect_stream,
+    make_client_config,
+    make_request_options,
+    with_api_version,
 )
-from codebase_rag.services.agent.providers.base import LLMProvider, close_stream
 
 logger = get_logger(__name__)
 
+_TOOL_CHOICE_MODES = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
+
 
 class GeminiLLMProvider(LLMProvider):
-    """Google Gemini API provider via google-genai SDK."""
+    """Google Gemini API provider via llm-sdk."""
 
     def __init__(self, api_base_url: str, request_timeout: int = 120) -> None:
-        self._api_base_url = api_base_url
+        self._api_base_url = (api_base_url or "").rstrip("/")
         self._timeout = request_timeout
+
+    def _make_client(self, api_key: str) -> GeminiStreamClient:
+        return GeminiStreamClient(
+            make_client_config(
+                api_key,
+                with_api_version(self._api_base_url, "v1beta"),
+                self._timeout,
+            )
+        )
 
     async def chat_completion(
         self,
@@ -44,260 +57,107 @@ class GeminiLLMProvider(LLMProvider):
         session_id: Optional[str] = None,
         prompt_cache_key: Optional[str] = None,
     ) -> LLMResponse:
-        headers = dict(custom_headers or {})
-        if session_id:
-            headers["X-Relay-Session-Id"] = session_id
-        http_opts_kwargs: dict = {}
-        if self._api_base_url:
-            http_opts_kwargs["baseUrl"] = self._api_base_url
-        if headers:
-            http_opts_kwargs["headers"] = headers
-        client_kwargs: dict = {"api_key": api_key}
-        if http_opts_kwargs:
-            client_kwargs["http_options"] = genai_types.HttpOptions(**http_opts_kwargs)
-        client = genai.Client(**client_kwargs)
+        client = self._make_client(api_key)
 
-        # Build contents
         contents = self._build_contents(messages)
 
-        # Generation config
-        gen_config = genai_types.GenerateContentConfig(
-            temperature=temperature,
-        )
+        gen_config: Dict[str, Any] = {"temperature": temperature}
         if max_output_tokens:
-            gen_config.max_output_tokens = max_output_tokens
+            gen_config["maxOutputTokens"] = max_output_tokens
 
-        # System instruction
-        system_msgs = [m for m in messages if m.role == "system"]
-        if system_msgs:
-            gen_config.system_instruction = system_msgs[0].content
-
-        # Thinking — extract thinkingConfig from raw nested structure
+        # Thinking — raw nested generationConfig.thinkingConfig from configuration
         if thinking_config:
-            tc = thinking_config.get("generationConfig", {}).get("thinkingConfig", {})
-            if tc:
-                gen_config.thinking_config = genai_types.ThinkingConfig(**tc)
+            gen_config.update(thinking_config.get("generationConfig", {}))
 
-        # Structured output
         if output_schema:
-            gen_config.response_mime_type = "application/json"
-            gen_config.response_schema = output_schema
+            gen_config["responseMimeType"] = "application/json"
+            gen_config["responseSchema"] = output_schema
 
-        # Tools
+        system_msgs = [m for m in messages if m.role == "system"]
+        system_instruction = None
+        if system_msgs:
+            system_instruction = {"parts": [{"text": system_msgs[0].content or ""}]}
+
+        gemini_tools = None
+        tool_config = None
         if tools:
-            declarations = []
-            for t in tools:
-                declarations.append(genai_types.FunctionDeclaration(
-                    name=t.name,
-                    description=t.description,
-                    parameters=t.parameters,
-                ))
-            gen_config.tools = [genai_types.Tool(function_declarations=declarations)]
+            gemini_tools = [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                        for t in tools
+                    ]
+                }
+            ]
+            mode = _TOOL_CHOICE_MODES.get(tool_choice or "")
+            if mode:
+                tool_config = {"functionCallingConfig": {"mode": mode}}
 
-            # Tool choice
-            _MODE_MAP = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
-            if tool_choice and tool_choice in _MODE_MAP:
-                gen_config.tool_config = genai_types.ToolConfig(
-                    function_calling_config=genai_types.FunctionCallingConfig(
-                        mode=_MODE_MAP[tool_choice],
-                    ),
-                )
-
-        try:
-            # Use streaming — force stream for all agent calls
-            text_parts = []
-            thinking_parts = []
-            tool_calls = []
-            finish_reason_raw = "STOP"
-            usage_metadata = None
-
-            stream = await client.aio.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                config=gen_config,
-            )
-            async for chunk in stream:
-                if chunk.candidates:
-                    candidate = chunk.candidates[0]
-                    if candidate.finish_reason:
-                        finish_reason_raw = candidate.finish_reason
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            if getattr(part, 'thought', False) and part.text:
-                                thinking_parts.append(part.text)
-                            elif part.text:
-                                text_parts.append(part.text)
-                            if part.function_call:
-                                fc = part.function_call
-                                tool_calls.append(ToolCall(
-                                    id=fc.name,
-                                    name=fc.name,
-                                    arguments=dict(fc.args) if fc.args else {},
-                                ))
-                if chunk.usage_metadata:
-                    usage_metadata = chunk.usage_metadata
-
-        except Exception as e:
-            err_str = str(e).lower()
-            if "401" in err_str or "403" in err_str or "api key" in err_str:
-                raise LLMAuthError(f"Gemini auth error: {e}") from e
-            if "429" in err_str or "rate" in err_str or "quota" in err_str:
-                raise LLMRateLimitError(f"Gemini rate limit: {e}") from e
-            raise LLMAPIError(f"Gemini API error: {e}") from e
-
-        return self._build_response_from_stream(
-            text_parts, thinking_parts, tool_calls,
-            finish_reason_raw, usage_metadata,
+        request = GeminiStreamRequest(
+            model=model,
+            contents=contents,
+            systemInstruction=system_instruction,
+            tools=gemini_tools,
+            toolConfig=tool_config,
+            generationConfig=gen_config,
         )
 
-    async def health_check(self, api_key: str) -> bool:
-        try:
-            client = genai.Client(api_key=api_key)
-            async for _ in client.aio.models.list():
-                return True
-            return True
-        except Exception:
-            return False
-
-    async def probe_stream(
-        self,
-        api_key: str,
-        model: str,
-        custom_headers: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        headers = dict(custom_headers or {})
-        http_opts_kwargs: dict = {}
-        if self._api_base_url:
-            http_opts_kwargs["baseUrl"] = self._api_base_url
-        if headers:
-            http_opts_kwargs["headers"] = headers
-        client_kwargs: dict = {"api_key": api_key}
-        if http_opts_kwargs:
-            client_kwargs["http_options"] = genai_types.HttpOptions(**http_opts_kwargs)
-        client = genai.Client(**client_kwargs)
-        contents = [
-            genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=".")])
-        ]
-        gen_config = genai_types.GenerateContentConfig(
-            temperature=0.0,
-            max_output_tokens=1,
+        return await collect_stream(
+            client.stream(request, make_request_options(custom_headers, session_id)),
+            provider_label="Gemini",
         )
-        stream = None
-        try:
-            stream = await client.aio.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                config=gen_config,
-            )
-            async for chunk in stream:
-                if not chunk.candidates:
-                    continue
-                candidate = chunk.candidates[0]
-                if not candidate.content or not candidate.content.parts:
-                    continue
-                for part in candidate.content.parts:
-                    if part.text or part.function_call:
-                        return True
-            return False
-        except Exception as e:
-            err_str = str(e).lower()
-            if "401" in err_str or "403" in err_str or "api key" in err_str:
-                raise LLMAuthError(f"Gemini auth error: {e}") from e
-            if "429" in err_str or "rate" in err_str or "quota" in err_str:
-                raise LLMRateLimitError(f"Gemini rate limit: {e}") from e
-            raise LLMAPIError(f"Gemini API error: {e}") from e
-        finally:
-            if stream is not None:
-                await close_stream(stream)
 
     async def count_tokens(self, text: str, model: str, api_key: str = "") -> int:
         """Count tokens via Gemini countTokens API."""
         if not api_key:
             raise ValueError("api_key required for Gemini count_tokens")
-        client = genai.Client(api_key=api_key)
-        response = await client.aio.models.count_tokens(
-            model=model, contents=text,
+        origin = re.sub(r"/v1beta$", "", self._api_base_url)
+        client = GeminiEmbeddingClient(
+            make_client_config(api_key, origin or None, self._timeout),
+            model=model,
         )
-        return response.total_tokens or 0
+        return await client.count_tokens(text)
 
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _build_contents(messages: List[Message]) -> list:
-        """Convert Message list to genai Content objects."""
-        contents = []
+    def _build_contents(messages: List[Message]) -> List[Dict[str, Any]]:
+        """Convert Message list to Gemini ``contents`` objects."""
+        contents: List[Dict[str, Any]] = []
         for msg in messages:
             if msg.role == "system":
                 continue
 
             role = "user" if msg.role in ("user", "tool") else "model"
-            parts = []
+            parts: List[Dict[str, Any]] = []
 
             if msg.role == "tool" and msg.tool_call_id:
-                parts.append(genai_types.Part.from_function_response(
-                    name=msg.name or "",
-                    response={"result": msg.content or ""},
-                ))
+                parts.append(
+                    {
+                        "functionResponse": {
+                            "name": msg.name or "",
+                            "response": {"result": msg.content or ""},
+                        }
+                    }
+                )
             elif msg.tool_calls:
                 if msg.thinking_content:
-                    parts.append(genai_types.Part(text=msg.thinking_content, thought=True))
+                    parts.append({"text": msg.thinking_content, "thought": True})
                 for tc in msg.tool_calls:
-                    parts.append(genai_types.Part.from_function_call(
-                        name=tc.name,
-                        args=tc.arguments,
-                    ))
+                    parts.append(
+                        {"functionCall": {"name": tc.name, "args": tc.arguments}}
+                    )
             elif msg.content:
                 if msg.thinking_content:
-                    parts.append(genai_types.Part(text=msg.thinking_content, thought=True))
-                parts.append(genai_types.Part.from_text(text=msg.content))
+                    parts.append({"text": msg.thinking_content, "thought": True})
+                parts.append({"text": msg.content})
 
             if parts:
-                contents.append(genai_types.Content(role=role, parts=parts))
+                contents.append({"role": role, "parts": parts})
         return contents
-
-    @staticmethod
-    def _build_response_from_stream(
-        text_parts: list,
-        thinking_parts: list,
-        tool_calls: list,
-        finish_reason_raw,
-        usage_metadata,
-    ) -> LLMResponse:
-        """Build LLMResponse from accumulated stream chunks."""
-        text = "".join(text_parts) if text_parts else None
-        thinking_content = "".join(thinking_parts) if thinking_parts else None
-        structured_output = None
-
-        if text:
-            try:
-                structured_output = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        finish_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "error"}
-        finish_reason = (
-            "tool_calls" if tool_calls
-            else finish_map.get(str(finish_reason_raw), "stop")
-        )
-
-        usage = TokenUsage()
-        if usage_metadata:
-            um = usage_metadata
-            cache_read = getattr(um, 'cached_content_token_count', 0) or 0
-            usage = TokenUsage(
-                prompt_tokens=um.prompt_token_count or 0,
-                completion_tokens=um.candidates_token_count or 0,
-                total_tokens=um.total_token_count or 0,
-                cache_read_tokens=cache_read,
-            )
-
-        return LLMResponse(
-            content=text,
-            thinking_content=thinking_content,
-            tool_calls=tool_calls if tool_calls else None,
-            structured_output=structured_output,
-            finish_reason=finish_reason,
-            usage=usage,
-        )

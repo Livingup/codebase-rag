@@ -4,7 +4,7 @@
 
 ## 0. 项目架构约束记忆路由表（L0）
 
-项目工程约束记忆位于 `.agent/` 目录：13 份业务域文档（`.agent/01-business-and-features/`）、1 份分层规范（`.agent/02-code-structure/architecture-rules.md`，全项目分层词汇唯一来源）、6 篇非平凡技术机制文档（`.agent/04-tech-decisions/`）。本项目为纯后端服务，无独立 UI 现状文档（说明见 architecture-rules.md 第 5 节）。查找业务规则、放码位置或源码清单时，从下表按关键词定位功能单元（共 56 个），跳转至对应域文档。
+项目工程约束记忆位于 `.agent/` 目录：13 份业务域文档（`.agent/01-business-and-features/`）、1 份分层规范（`.agent/02-code-structure/architecture-rules.md`，全项目分层词汇唯一来源）、7 篇非平凡技术机制文档（`.agent/04-tech-decisions/`）。本项目为纯后端服务，无独立 UI 现状文档（说明见 architecture-rules.md 第 5 节）。查找业务规则、放码位置或源码清单时，从下表按关键词定位功能单元（共 56 个），跳转至对应域文档。
 
 | 功能单元 ID | 功能名称 | 业务关键词 | 所属业务域文档与锚点 | 关联技术架构抉择 |
 | --- | --- | --- | --- | --- |
@@ -55,17 +55,17 @@
 | `FEAT-MGMT-03` | 仓库副本注销与重启恢复 | 注销, unregister_repo, unregister_project, 单副本, 整分区, 重启恢复, 裁剪, 保留持久数据 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-03` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
 | `FEAT-MGMT-04` | REST 管理端点 | REST, /api/v1, health, config reload, 管理搜索, 状态 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-04` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
 | `FEAT-MGMT-05` | 本地 Admin UI | Admin UI, 本地后台, 单页状态页 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-05` | 无 |
-| `FEAT-AG-01` | Provider 生命周期管理 | provider, 服务商, 探活, 三向 diff, degraded | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-01` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-AG-01` | Provider 生命周期管理 | provider, 服务商, 探活, 三向 diff, degraded | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-01` | `.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md` |
 | `FEAT-AG-02` | 并发容量选择与绑定 | 并发容量, 信号量, provider 绑定, 等待空位 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-02` | 无 |
 | `FEAT-AG-03` | Agent 注册与执行循环 | run_agent, 工具调用, 执行循环, trace, 批量执行 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-03` | 无 |
-| `FEAT-AG-04` | LLM 调用双层重试 | 429, 退避, 双层重试, 熔断, 鉴权失败, 换 Key | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-04` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-AG-04` | LLM 调用双层重试 | 429, 退避, 双层重试, 熔断, 鉴权失败, 换 Key | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-04` | `.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md` |
 | `FEAT-AG-05` | 上下文压缩 | 上下文压缩, compress_and_replace_history, 压缩阈值, 八分区 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-05` | 无 |
-| `FEAT-EMB-01` | 双 Provider 初始化 | embedding, Gemini, DashScope, 密钥健康, 双通道 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-01` | `.agent/04-tech-decisions/tech-key-pool.md` |
-| `FEAT-EMB-02` | embed 门禁与重试 | 向量, 批处理门禁, batch_size, query 模式, document 模式 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-02` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-EMB-01` | 双 Provider 初始化 | embedding, Gemini, DashScope, 密钥健康, 双通道 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-01` | `.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md` |
+| `FEAT-EMB-02` | embed 门禁与重试 | 向量, 批处理门禁, batch_size, query 模式, document 模式 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-02` | `.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md` |
 | `FEAT-MCPC-01` | 三种 Transport 连接 | stdio, sse, streamable_http, 工具发现, 外部 MCP | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-01` | 无 |
 | `FEAT-MCPC-02` | 懒初始化与差量重建 | 懒初始化, 部分成功, 差量重建, 工具缓存 | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-02` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
 
-配套全局文档：业务域边界与全局铁律见 `.agent/01-business-and-features/00-domain-boundaries.md`；代码分层与放码位置见 `.agent/02-code-structure/architecture-rules.md`。业务域文档共 13 份，非平凡技术机制文档共 6 篇。
+配套全局文档：业务域边界与全局铁律见 `.agent/01-business-and-features/00-domain-boundaries.md`；代码分层与放码位置见 `.agent/02-code-structure/architecture-rules.md`。业务域文档共 13 份，非平凡技术机制文档共 7 篇。
 
 ## 1. 目录约定
 

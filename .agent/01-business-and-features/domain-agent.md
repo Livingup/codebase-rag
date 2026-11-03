@@ -11,7 +11,7 @@
 ### [FEAT-AG-01] LLM Provider 生命周期管理
 - **业务目标**：多服务商注册表 + KeyPool + 并发信号量的初始化与热更新。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [初始化]：遍历 `llm.providers`；`api_format=="jev"` 的 provider 跳过（System One 决策模型，MCP reranker 专用，不经 agent 运行时）；每个 provider 创建实例（工厂按 api_format 懒加载，支持格式：gemini、openai_chat、openai_responses、anthropic、zhipu、deepseek）、KeyPool、独立 `Semaphore(max_concurrency)`。
+  1. [初始化]：遍历 `llm.providers`；`api_format=="jev"` 的 provider 跳过（System One 决策模型，MCP reranker 专用，不经 agent 运行时）；每个 provider 创建实例（工厂按 api_format 懒加载，支持格式：gemini、openai_chat、openai_responses、anthropic、zhipu、deepseek；每种格式实例均为 llm-sdk 协议客户端的薄适配器，见 `.agent/04-tech-decisions/tech-llm-sdk-adoption.md`）、KeyPool、独立 `Semaphore(max_concurrency)`。
   2. [热更新三向 diff]：删除的 provider 整套移除；新增建全套；已存在则重建实例 + keypool.update_keys（保留健康状态）+ 仅当 max_concurrency 变化才重建信号量。
   3. [探活规则]：429 返回 degraded 且**不动 Key 健康度**；认证错误 mark_unhealthy；超时/其他错误 report_failure。
   4. [状态判定]：未初始化→unavailable；无 Key→not_configured；healthy=0→unavailable；部分不健康→degraded。
@@ -19,10 +19,11 @@
 - **级联依赖功能单元（Cascade Links）**：FEAT-COMMON-01（KeyPool）、FEAT-COMMON-04（reconciler 注册）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
-  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`
+  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
   - 域服务门面（services/agent/service.py）：`src/codebase_rag/services/agent/service.py`（初始化与 reconcile 段）
   - 服务商适配器（services/agent/providers/base.py）：`src/codebase_rag/services/agent/providers/base.py`
+  - 服务商适配器（services/agent/providers/llm_sdk_common.py）：`src/codebase_rag/services/agent/providers/llm_sdk_common.py` *(同类参考样板：llm-sdk 客户端构造、流事件聚合与错误映射)*
   - 服务商适配器（services/agent/providers/<name>.py）：`src/codebase_rag/services/agent/providers/anthropic.py`、`src/codebase_rag/services/agent/providers/deepseek.py`、`src/codebase_rag/services/agent/providers/gemini.py`、`src/codebase_rag/services/agent/providers/openai_chat.py`、`src/codebase_rag/services/agent/providers/openai_responses.py`、`src/codebase_rag/services/agent/providers/zhipu.py`
 
 ### [FEAT-AG-02] 并发容量选择与 Provider 绑定（select_provider）
@@ -65,10 +66,11 @@
 - **级联依赖功能单元（Cascade Links）**：FEAT-COMMON-01（KeyPool）、FEAT-AG-02（信号量与事件）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
-  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`
+  - 技术架构抉择：`.agent/04-tech-decisions/tech-key-pool.md`、`.agent/04-tech-decisions/tech-llm-sdk-adoption.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
   - 域服务门面（services/agent/service.py）：`src/codebase_rag/services/agent/service.py`（_llm_call_with_retry 段）
   - 域异常体系（services/agent/errors.py）：`src/codebase_rag/services/agent/errors.py`
+  - 服务商适配器（services/agent/providers/llm_sdk_common.py）：`src/codebase_rag/services/agent/providers/llm_sdk_common.py`（llm-sdk 错误 kind → LLMAuthError/LLMRateLimitError/LLMAPIError 映射）
 
 ### [FEAT-AG-05] 上下文压缩
 - **业务目标**：会话 token 接近模型上下文窗口时，由独立压缩链路提炼历史。

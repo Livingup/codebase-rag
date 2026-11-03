@@ -3,6 +3,7 @@
     [string]$Version,
     [string]$SourceRoot,
     [string]$OutputRoot,
+    [string]$SdkWheelDir,
     [switch]$SkipTests
 )
 
@@ -20,6 +21,20 @@ if (-not $SourceRoot) { $SourceRoot = $defaultSourceRoot }
 if (-not $OutputRoot) { $OutputRoot = Join-Path $SourceRoot "dist\packages" }
 Ensure-Directory $OutputRoot
 
+# llm-sdk (multi-protocol-llm-client) 未发布到 PyPI，构建时从本地 wheel 目录解析依赖。
+if (-not $SdkWheelDir) {
+    $SdkWheelDir = Join-Path (Split-Path $defaultSourceRoot -Parent) "llm-sdk\pythonsdk\dist"
+}
+if (-not (Test-Path $SdkWheelDir)) {
+    throw "llm-sdk wheel directory not found: $SdkWheelDir. Build it first or pass -SdkWheelDir."
+}
+$sdkWheel = Get-ChildItem -Path $SdkWheelDir -Filter "multi_protocol_llm_client-*.whl" |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $sdkWheel) {
+    throw "multi_protocol_llm_client wheel not found in $SdkWheelDir."
+}
+$extraIndexArgs = @("--find-links", $SdkWheelDir)
+
 Push-Location $SourceRoot
 try {
     $buildVenvDir = Join-Path $SourceRoot ".venv-build"
@@ -30,7 +45,7 @@ try {
     Invoke-NativeCommand $buildPythonExe "-m" "pip" "install" "--upgrade" "pip" "build"
 
     if (-not $SkipTests) {
-        Invoke-NativeCommand $buildPythonExe "-m" "pip" "install" "-e" "$SourceRoot[dev]"
+        Invoke-NativeCommand $buildPythonExe "-m" "pip" "install" "-e" "$SourceRoot[dev]" @extraIndexArgs
         Invoke-NativeCommand $buildPythonExe "-m" "compileall" "-q" "src"
         Invoke-NativeCommand $buildPythonExe "-m" "pytest"
     }
@@ -48,7 +63,7 @@ try {
     Ensure-Directory (Join-Path $packageRoot "scripts")
 
     Copy-Item -Path $wheel.FullName -Destination (Join-Path $packageRoot "packages")
-    Invoke-NativeCommand $buildPythonExe "-m" "pip" "download" "--dest" (Join-Path $packageRoot "wheels") $wheel.FullName
+    Invoke-NativeCommand $buildPythonExe "-m" "pip" "download" "--dest" (Join-Path $packageRoot "wheels") @extraIndexArgs $wheel.FullName
 
     Copy-Item -Path (Join-Path $SourceRoot "config.example.yaml") -Destination $packageRoot
     Copy-Item -Path (Join-Path $SourceRoot ".env.example") -Destination $packageRoot

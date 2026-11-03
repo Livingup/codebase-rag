@@ -31,14 +31,12 @@ class DeepSeekToolChoiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_deepseek_provider_sends_auto_tool_choice(self):
         captured = {}
 
-        async def create(**kwargs):
-            captured.update(kwargs)
+        def stream(request, options=None):
+            captured["request"] = request
             return _EmptyAsyncStream()
 
         provider = DeepSeekProvider("https://api.deepseek.com")
-        provider._make_client = lambda api_key: SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-        )
+        provider._make_client = lambda api_key: SimpleNamespace(stream=stream)
 
         await provider.chat_completion(
             api_key="test-key",
@@ -55,8 +53,10 @@ class DeepSeekToolChoiceTest(unittest.IsolatedAsyncioTestCase):
             thinking_config={"thinking": {"type": "disabled"}},
         )
 
-        self.assertEqual(captured["tool_choice"], "auto")
-        self.assertEqual(captured["tools"][0]["function"]["name"], "end_task")
+        request = captured["request"]
+        self.assertEqual(request.tool_choice, "auto")
+        self.assertEqual(request.tools[0]["function"]["name"], "end_task")
+        self.assertEqual(request.messages[0]["role"], "user")
 
 
 if __name__ == "__main__":

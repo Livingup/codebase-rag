@@ -32,7 +32,9 @@ src/codebase_rag/
     │   ├── models.py                  #   [域数据模型] 领域对象与枚举
     │   ├── errors.py                  #   [域异常体系] 该域异常基类与子类
     │   ├── providers/                 #   [服务商适配器] 仅 agent/embedding 有：外部 LLM/向量服务商协议适配
-    │   │   └── <name>.py              #     一个服务商一个文件 + base.py 抽象基类
+    │   │   ├── base.py                #     抽象基类（LLMProvider / EmbeddingProvider）
+    │   │   ├── <name>.py              #     一个服务商一个文件，只做报文转换，协议由 pythonsdk（llm-sdk）承担
+    │   │   └── llm_sdk_common.py      #     [agent 专用] llm-sdk 客户端配置、流事件聚合与错误映射
     │   └── <辅助模块>.py              #   [域内辅助实现] task_queue/store/watcher/file_filter 等实现细节
     ├── agent/                         # 12 个业务域：agent、embedding、event_detection、
     ├── context_engine/                #   git_operations、knowledge_sync、management_api、
@@ -60,8 +62,8 @@ config.example.yaml .env.example       # [配置模板] 仓库只留模板，真
 | 要新增的代码 | 放置位置 | 必须同步的动作 |
 | :--- | :--- | :--- |
 | 新业务域 | `services/<domain>/{service.py, models.py, errors.py, __init__.py}` | `__main__.py` ServiceContainer 按依赖分层实例化并接线；`config/schema.py` 增配置段；同步 `config.example.yaml` 与 `.env.example` |
-| 新 LLM 服务商 | `services/agent/providers/<name>.py`（实现 `LLMProvider`） | `agent/service.py` 工厂 `_SUPPORTED_FORMATS` 注册 api_format |
-| 新向量服务商 | `services/embedding/providers/<name>.py`（实现 EmbeddingProvider 抽象） | `embedding/service.py` 工厂注册 |
+| 新 LLM 服务商 | `services/agent/providers/<name>.py`（实现 `LLMProvider`） | 协议必须来自 `pythonsdk`（llm-sdk）；`agent/service.py` 工厂 `_SUPPORTED_FORMATS` 注册 api_format；缺失协议先在 llm-sdk 补齐 |
+| 新向量服务商 | `services/embedding/providers/<name>.py`（实现 EmbeddingProvider 抽象） | 协议必须来自 `pythonsdk`；`embedding/service.py` 工厂注册；llm-sdk 未支持时先在 SDK 补齐客户端 |
 | 新 MCP 工具 | `mcp_service/server.py` 定义工具 schema + `service.py` 实现 handler + `handle_call_tool` 分发 | 工具描述必须内嵌调用边界与参数约束语义 |
 | 新 REST 管理端点 | `management_api/routes.py` | 错误体统一 `ErrorResponse{error:{code,message}}` |
 | 新配置字段 | `config/schema.py` 对应段 | 同步 `config.example.yaml`、`.env.example` 与相关 reconciler |
@@ -79,6 +81,7 @@ config.example.yaml .env.example       # [配置模板] 仓库只留模板，真
 6. **禁止多进程/线程执行业务逻辑**：单进程 asyncio 是既定约束；阻塞调用必须 `asyncio.to_thread` 或子进程（参考 Git 命令执行器）。
 7. **禁止服务直接写其他域的数据目录**：每个域只写自己的存储（如 knowledge_sync 只写 `data_dir/knowledge_sync/`，workflow 只写 `retry_queue_*.json` 与 `dead_letter_*.json`）。
 8. **禁止把真实 `.env`、`config.yaml`、密钥提交入 Git**：仓库只保留 `*.example` 模板。
+9. **禁止在 `providers/` 内直接使用第三方 LLM/向量 SDK 或裸 HTTP 客户端**：`openai` / `anthropic` / `google-genai` / `httpx` 不得用于模型与向量请求；协议、SSE 解析、重试与错误分类统一由 `pythonsdk`（llm-sdk）承担（见 `.agent/04-tech-decisions/tech-llm-sdk-adoption.md`）。
 
 ## 5. 本项目无 UI 现状文档的说明
 
