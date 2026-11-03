@@ -389,6 +389,21 @@ git checkout v0.2.0
 .\ops\windows\build-windows-package.ps1 -EnvFile .\.env -Version 0.2.0 -SkipTests
 ```
 
+不加 `-SkipTests` 时，构建脚本会执行 `python -m pytest`（**全量**，包含依赖外部 Qdrant / LLM 的 `tests/integration`）。只有在单元测试已单独通过、且外部依赖不可用时才跳过，例如：
+
+```powershell
+.\.venv-build\Scripts\python.exe -m pytest tests/unit -q
+```
+
+**PowerShell 错误偏好设置（必读）**：构建/更新脚本内部通过 `Invoke-NativeCommand`（`& $FilePath @Arguments` + `$LASTEXITCODE`）调用 python、git、pip。在 `$ErrorActionPreference = "Stop"` 的会话中，这些工具写入 **stderr** 的正常日志会被 PowerShell 提升为终止错误（`NativeCommandError`，报错位置指向 `common.ps1` 的 `& $FilePath @Arguments`），导致构建被误判为失败。遇到该现象时先放宽错误偏好再执行：
+
+```powershell
+$ErrorActionPreference = "Continue"
+.\ops\windows\build-windows-package.ps1 -EnvFile .\.env -Version 0.2.0
+```
+
+该限制对 `build-windows-package.ps1` 与 `update-from-zip.ps1`（内部会跑 `python -m venv`、`pip install`）同样适用。
+
 ### 7.3 构建输出
 
 默认输出到：
@@ -471,7 +486,7 @@ Expand-Archive -Path .\dist\packages\CodebaseRAG-0.2.0-windows-x64.zip -Destinat
 .\scripts\start-local-service.ps1 -EnvFile D:\project\codebase-rag\.env
 ```
 
-每次安装都会从安装包或源码目录的 `config.example.yaml` 重新生成正式配置文件：
+安装脚本的正式配置处理规则：目标 `config.yaml` **已存在则原样保留**（打印 `Existing config preserved (manual edits kept)`），只有不存在时（首次安装）才从安装包或源码目录的 `config.example.yaml` 生成：
 
 ```text
 ${CODEBASE_RAG_DATA_DIR}\config\config.yaml
@@ -514,11 +529,18 @@ git pull --ff-only
 2. 解压本地构建 zip。
 3. 备份 `${CODEBASE_RAG_DATA_DIR}\config`、`data`、`runtime`。
 4. 停止正式服务。
-5. 安装新版本到 `${CODEBASE_RAG_PROGRAM_DIR}\releases\<new-version>`，并使用安装包内的 `config.example.yaml` 重新生成正式 `config.yaml`。
+5. 安装新版本到 `${CODEBASE_RAG_PROGRAM_DIR}\releases\<new-version>`；目标 `config.yaml` 已存在时原样保留（打印 `Existing config preserved (manual edits kept)`），仅首次安装才从安装包内 `config.example.yaml` 生成。
 6. 切换 `current`。
 7. 启动服务。
 8. 访问健康检查。
 9. 如果失败，切回旧版本并重新启动服务。
+
+更新过程对配置文件的实际影响：
+
+- `${CODEBASE_RAG_DATA_DIR}\config\.env`：用源码根目录（或 `-EnvFile` 指定）的真实 `.env` **覆盖**，并把其中的 `CODEBASE_RAG_DATA_DIR` 改写为实际数据目录。
+- `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`：已存在则**保留不动**；需要同步模板变更时改用 `refresh-local-service-config.ps1` 或手工合并，不要指望更新脚本覆盖它。
+- 更新前自动备份到 `${CODEBASE_RAG_DATA_DIR}\backups\<时间戳>`。
+- 与构建脚本相同，在 `$ErrorActionPreference = "Stop"` 会话中运行 `update-from-zip.ps1` 可能被 python 的 stderr 日志误判失败，先设置 `$ErrorActionPreference = "Continue"`。
 
 ### 9.1 配置热重载（Hot-Reload）与服务更新规范
 
@@ -637,7 +659,8 @@ Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 - 正式服务默认监听 `127.0.0.1`，不要默认暴露到局域网。
 - 用户真实 `.env`、真实配置、密钥、日志、数据不得提交到 Git。
 - 私有服务地址（域名、端口）与密钥同等保密，不得写入任何 Git 跟踪文档、Issue、聊天或日志；仓库为公开仓库，公开即等于泄漏。
-- 安装和更新会使用用户提供的真实 `.env` 覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env`，并使用安装包内 `config.example.yaml` 重新生成 `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`。
+- 安装和更新会使用用户提供的真实 `.env` 覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env`；`${CODEBASE_RAG_DATA_DIR}\config\config.yaml` 已存在时保留不动，仅首次安装才由 `config.example.yaml` 生成。
+- 已登记仓库被移动或重命名后，下一次 MCP 读请求会把该副本的登记自动迁移到新路径：只迁移真正消失的副本，同一 project_id 的其它存活副本（含 hooks/watcher/内存实例）不受影响，`display_name` 继承原值；新增克隆或复制不会被自动登记，必须显式 `POST /api/v1/projects`。
 - 正式安装和更新必须使用用户本机从源码构建出的本地安装 zip。
 - 不再通过 Gitee Release 发布或命令行下载安装包。
 - 本地安装 zip 只交付运行所需 wheel、依赖 wheel、配置模板和运维脚本。
