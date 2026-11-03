@@ -22,24 +22,28 @@ logger = get_logger(__name__)
 
 
 class GitWatcher:
-    """Per-project poller monitoring .git/HEAD for HEAD changes.
+    """Per-repository poller monitoring .git/HEAD for HEAD changes.
 
     Args:
-        project_id: The project being watched.
+        project_id: The data-partition id of the watched repository.
         git_repo_path: Absolute path to the Git repository root.
+        repo_key: Canonical identity key of this local repository copy.
         config: Watcher configuration.
-        on_change: Async callback invoked when a change is detected.
+        on_change: Async callback invoked with ``repo_key`` when a change
+            is detected.
     """
 
     def __init__(
         self,
         project_id: str,
         git_repo_path: str,
+        repo_key: str,
         config: WatcherConfig,
         on_change: Callable[[str], Awaitable[None]],
     ) -> None:
         self._project_id = project_id
         self._git_repo_path = git_repo_path
+        self._repo_key = repo_key
         self._config = config
         self._on_change = on_change
         self._task: Optional[asyncio.Task] = None
@@ -112,7 +116,7 @@ class GitWatcher:
                     last_snapshot = current
 
                     try:
-                        await self._on_change(self._project_id)
+                        await self._on_change(self._repo_key)
                     except Exception:
                         logger.exception(
                             "watcher_callback_error",

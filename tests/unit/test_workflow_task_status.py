@@ -13,7 +13,8 @@ from codebase_rag.services.workflow.task_queue import ProjectTaskQueue, Workflow
 class WorkflowTaskStatusTest(unittest.IsolatedAsyncioTestCase):
     def make_service(self):
         service = object.__new__(WorkflowOrchestratorService)
-        service._project_repos = {'project':'unused'}
+        # repo_key → project_id; the test's copy lives at key 'project'
+        service._project_repos = {'project': 'project'}
         service._current_tasks = {}
         service._last_completed = {}
         service._task_queue = ProjectTaskQueue()

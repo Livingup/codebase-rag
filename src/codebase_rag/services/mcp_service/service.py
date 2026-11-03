@@ -24,6 +24,7 @@ import os
 from typing import Dict, List, Optional
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import KnowledgeSubmissionConfig, MCPRerankerConfig
 from codebase_rag.services.agent.errors import AgentTaskComplete
@@ -175,6 +176,8 @@ class McpService:
         # Step 0: Resolve project_id from .git/codebase-rag/project_id
         # (also schedules a background moved-repo heal when needed)
         project_id = self._resolve_project_id(project_path)
+        # Instance identity: the caller's local repository copy
+        repo_key = normalize_repo_key(project_path)
 
         # ---- Stage 1: Vector recall ----
         recall_limit = self._reranker_config.recall_limit
@@ -187,6 +190,7 @@ class McpService:
         logger.info(
             "mcp_search_start",
             project_id=project_id,
+            repo_key=repo_key,
             query_preview=query[:80],
             top_k=top_k,
             recall_limit=recall_limit,
@@ -197,7 +201,7 @@ class McpService:
         # Hybrid search
         try:
             candidates_raw = await self._memory.hybrid_search(
-                project_id=project_id,
+                repo_key,
                 query_dense=emb.dense_vector,
                 query_sparse=emb.sparse_vector,
                 top_k=recall_limit,
@@ -218,7 +222,7 @@ class McpService:
                 ) from e
             try:
                 candidates_raw = await self._memory.hybrid_search(
-                    project_id=project_id,
+                    normalize_repo_key(project_path),
                     query_dense=emb.dense_vector,
                     query_sparse=emb.sparse_vector,
                     top_k=recall_limit,
@@ -620,9 +624,10 @@ class McpService:
     async def get_active_instance_info(
         self, project_path: str,
     ) -> Optional[ActiveInstanceInfo]:
-        """Get active instance info for a project path."""
-        project_id = self._resolve_project_id(project_path)
-        return await self._memory.get_active_instance_info(project_id)
+        """Get active instance info for the caller's repository copy."""
+        self._resolve_project_id(project_path)
+        repo_key = normalize_repo_key(project_path)
+        return await self._memory.get_active_instance_info(repo_key)
 
     # =========================================================================
     # 2.5 Knowledge query — get committed file knowledge
@@ -723,6 +728,7 @@ class McpService:
         assert self._knowledge_sync is not None, "knowledge_sync dependency required"
 
         project_id = self._resolve_project_id(project_path)
+        repo_key = normalize_repo_key(project_path)
         token_limit = self._knowledge_submission_config.point_token_limit
         result = AddKnowledgeResult()
 
@@ -737,6 +743,7 @@ class McpService:
                 blob_hash,
                 knowledge_descriptions,
                 token_limit,
+                repo_key=repo_key,
             )
             expected_fvid = compute_file_version_id(canon_path, blob_hash)
             if sync_result.file_version_id != expected_fvid:
@@ -802,6 +809,7 @@ class McpService:
         blob_hash: str,
         descriptions: List[str],
         token_limit: int,
+        repo_key: Optional[str] = None,
     ):
         """Process a single file for add_file_knowledge.
 
@@ -837,6 +845,7 @@ class McpService:
                 file_version_id=fvid,
                 update_latest=True,
                 update_memory=True,
+                repo_key=repo_key,
             )
         except Exception as e:
             logger.warning(
@@ -902,6 +911,7 @@ class McpService:
             update_latest=True,
             update_memory=True,
             replace_existing_job=True,
+            repo_key=repo_key,
         )
 
         logger.info(

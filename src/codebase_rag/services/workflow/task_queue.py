@@ -1,8 +1,8 @@
-"""Per-project serial task queue with cross-project parallelism.
+"""Per-repository serial task queue with cross-repository parallelism.
 
 Rules:
-- Same project → serial (FIFO queue, next starts after current finishes)
-- Different projects → parallel
+- Same repository copy (repo_key) → serial (FIFO queue, next starts after current finishes)
+- Different copies / projects → parallel
 - Same-type events in queue can be coalesced (keep latest commit only)
 """
 
@@ -26,20 +26,24 @@ class WorkflowTask:
     task_type: str              # "branch_switch" | "content_commit" | "initialization"
     project_id: str
     kwargs: Dict[str, Any] = field(default_factory=dict)
+    # Canonical identity of the local repository copy this task operates on.
+    # Empty for legacy tasks — the executor then resolves a single-copy
+    # project by project_id.
+    repo_key: str = ""
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 class ProjectTaskQueue:
-    """Manages per-project serial execution of workflow tasks.
+    """Manages per-repository serial execution of workflow tasks.
 
-    Tasks for the same project are queued and executed one at a time.
-    Tasks for different projects can run in parallel.
+    Tasks for the same repository copy (repo_key) are queued and executed
+    one at a time.  Tasks for different copies can run in parallel.
     """
 
     def __init__(self) -> None:
-        # Per-project asyncio.Queue
+        # Per-repository asyncio.Queue
         self._queues: Dict[str, asyncio.Queue[Optional[WorkflowTask]]] = {}
-        # Per-project worker task
+        # Per-repository worker task
         self._workers: Dict[str, asyncio.Task] = {}
         # Callback to execute a task
         self._executor: Optional[Callable[[WorkflowTask], Awaitable[None]]] = None
@@ -50,20 +54,20 @@ class ProjectTaskQueue:
         self._executor = executor
 
     def enqueue(self, task: WorkflowTask) -> int:
-        """Add a task to the project's queue. Returns queue depth after enqueue.
+        """Add a task to the repository's queue. Returns queue depth after enqueue.
 
         Coalesces same-type events: if the queue already has a pending task
-        of the same type for the same project, replace it with the newer one.
+        of the same type for the same repository, replace it with the newer one.
         """
-        project_id = task.project_id
+        queue_key = task.repo_key or task.project_id
 
-        if project_id not in self._queues:
-            self._queues[project_id] = asyncio.Queue()
-            self._workers[project_id] = asyncio.create_task(
-                self._worker_loop(project_id)
+        if queue_key not in self._queues:
+            self._queues[queue_key] = asyncio.Queue()
+            self._workers[queue_key] = asyncio.create_task(
+                self._worker_loop(queue_key)
             )
 
-        queue = self._queues[project_id]
+        queue = self._queues[queue_key]
 
         # Coalescing: check if there's already a same-type task pending
         # We can only coalesce if we drain and re-add. For simplicity,
@@ -73,15 +77,15 @@ class ProjectTaskQueue:
         depth = queue.qsize()
         logger.info(
             "task_enqueued",
-            project_id=project_id,
+            queue_key=queue_key,
             task_type=task.task_type,
             queue_depth=depth,
         )
         return depth
 
-    def get_queue_depth(self, project_id: str) -> int:
-        """Get pending task count for a project."""
-        q = self._queues.get(project_id)
+    def get_queue_depth(self, queue_key: str) -> int:
+        """Get pending task count for a repository copy."""
+        q = self._queues.get(queue_key)
         return q.qsize() if q else 0
 
     async def shutdown(self, timeout: float = 30.0) -> None:
@@ -107,9 +111,9 @@ class ProjectTaskQueue:
         self._workers.clear()
         self._queues.clear()
 
-    async def _worker_loop(self, project_id: str) -> None:
-        """Process tasks for one project serially."""
-        queue = self._queues[project_id]
+    async def _worker_loop(self, queue_key: str) -> None:
+        """Process tasks for one repository copy serially."""
+        queue = self._queues[queue_key]
 
         while True:
             task = await queue.get()
@@ -117,20 +121,20 @@ class ProjectTaskQueue:
                 break
 
             if self._executor is None:
-                logger.warning("task_queue_no_executor", project_id=project_id)
+                logger.warning("task_queue_no_executor", queue_key=queue_key)
                 continue
 
             try:
                 logger.info(
                     "task_executing",
-                    project_id=project_id,
+                    queue_key=queue_key,
                     task_type=task.task_type,
                 )
                 await self._executor(task)
             except Exception:
                 logger.exception(
                     "task_execution_failed",
-                    project_id=project_id,
+                    queue_key=queue_key,
                     task_type=task.task_type,
                 )
             finally:

@@ -24,6 +24,8 @@ from codebase_rag.services.management_api.models import (
     SearchRequest,
     SearchResponse,
     TaskResponse,
+    UnregisterRepoRequest,
+    UnregisterRepoResponse,
 )
 from codebase_rag.services.management_api.admin_ui import require_local_request
 from codebase_rag.services.management_api.service import ManagementApiService
@@ -95,10 +97,21 @@ def create_router(service: ManagementApiService) -> APIRouter:
 
     @router.delete("/projects/{project_id}", response_model=DeleteProjectResponse)
     async def delete_project(project_id: str):
+        """Unregister every local copy of a project (Qdrant data preserved)."""
         try:
-            return await service.delete_project(project_id)
+            return await service.unregister_project(project_id)
         except ProjectNotFoundError as e:
             _error(404, "PROJECT_NOT_FOUND", str(e))
+
+    @router.delete("/repos", response_model=UnregisterRepoResponse)
+    async def unregister_repo(req: UnregisterRepoRequest):
+        """Unregister one local repository copy (Qdrant data preserved)."""
+        try:
+            return await service.unregister_repo(req.git_repo_path)
+        except ProjectNotFoundError as e:
+            _error(404, "PROJECT_NOT_FOUND", str(e))
+        except InvalidRequestError as e:
+            _error(400, "INVALID_REQUEST", str(e))
 
     # =====================================================================
     # 2.2 Semantic search

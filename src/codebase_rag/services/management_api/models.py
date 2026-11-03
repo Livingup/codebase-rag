@@ -19,11 +19,17 @@ from pydantic import BaseModel, Field
 
 @dataclass
 class ProjectRecord:
-    """In-memory record of a registered project."""
+    """In-memory record of one registered local repository copy.
+
+    The registry is keyed by ``repo_key`` (canonical normalized path);
+    multiple copies of the same project share one ``project_id`` but hold
+    distinct repo_keys.
+    """
 
     project_id: str
     git_repo_path: str
     display_name: str
+    repo_key: str = ""
     registered_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -54,6 +60,12 @@ class BatchRegisterProjectRequest(BaseModel):
     projects: List[RegisterProjectRequest] = Field(
         ..., min_length=1, max_length=50,
     )
+
+
+class UnregisterRepoRequest(BaseModel):
+    """DELETE /repos — unregister a single local repository copy."""
+
+    git_repo_path: str
 
 
 class SearchRequest(BaseModel):
@@ -134,11 +146,27 @@ class BatchRegisterProjectResponse(BaseModel):
 
 
 class DeleteProjectResponse(BaseModel):
-    """DELETE /projects/{project_id} response."""
+    """DELETE /projects/{project_id} — unregister every copy of a partition.
+
+    Persistent Qdrant points are always preserved for reuse.
+    """
 
     project_id: str
-    deleted_points: int
-    status: str = "deleted"
+    unregistered_repos: int = 0
+    deleted_points: int = 0
+    status: str = "unregistered"
+
+
+class UnregisterRepoResponse(BaseModel):
+    """DELETE /repos — unregister one local repository copy.
+
+    Persistent Qdrant points are always preserved for reuse.
+    """
+
+    git_repo_path: str
+    project_id: str
+    deleted_points: int = 0
+    status: str = "unregistered"
 
 
 class SearchResultItem(BaseModel):

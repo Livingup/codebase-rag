@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.services.management_api.models import InvalidRequestError, ProjectRecord
 from codebase_rag.services.management_api.service import ManagementApiService
 
@@ -14,7 +15,15 @@ from codebase_rag.services.management_api.service import ManagementApiService
 class RegistrationViewTest(unittest.IsolatedAsyncioTestCase):
     def make_service(self, records=(), task=None):
         service = object.__new__(ManagementApiService)
-        service._projects = {r.project_id: r for r in records}
+        service._projects = {}
+        for record in records:
+            repo_key = record.repo_key or normalize_repo_key(record.git_repo_path)
+            service._projects[repo_key] = ProjectRecord(
+                project_id=record.project_id,
+                git_repo_path=record.git_repo_path,
+                display_name=record.display_name,
+                repo_key=repo_key,
+            )
         service._workflow = SimpleNamespace(get_workflow_status=Mock(return_value=SimpleNamespace(
             current_task=task, queued_tasks=9, last_completed=SimpleNamespace(task_type='initialization'),
         )))
@@ -28,7 +37,9 @@ class RegistrationViewTest(unittest.IsolatedAsyncioTestCase):
         result = await service.list_registered_projects()
         self.assertEqual([r.project_id for r in result], ['a', 'b'])
         result[0].display_name = 'changed'
-        self.assertEqual(service._projects['a'].display_name, 'first')
+        self.assertEqual(
+            service._projects[normalize_repo_key('G:/one')].display_name, 'first',
+        )
         service._get_project_summary.assert_not_called()
         service._workflow.get_workflow_status.assert_not_called()
 
@@ -73,11 +84,17 @@ class RegistrationViewTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await service.get_project_registration_status(child)).git_repo_path, child)
             self.assertFalse((await service.get_project_registration_status(str(Path(child) / 'other'))).registered)
 
-    async def test_duplicate_registration_paths_are_rejected(self):
+    async def test_same_path_spelled_differently_hits_the_single_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = self.make_service([ProjectRecord('a', tmp, 'a'), ProjectRecord('b', tmp + os.sep, 'b')])
-            with self.assertRaisesRegex(InvalidRequestError, '多个登记记录'):
-                await service.get_project_registration_status(tmp)
+            # The registry is keyed by canonical repo_key: one path can only
+            # ever hold one entry, regardless of textual spelling or of how
+            # many project ids were derived from it historically.
+            service = self.make_service([ProjectRecord('a', tmp, 'a')])
+            for path in (tmp + os.sep, os.path.join(tmp, '.'), tmp.replace('\\', '/')):
+                with self.subTest(path=path):
+                    info = await service.get_project_registration_status(path)
+                    self.assertTrue(info.registered)
+                    self.assertEqual(info.git_repo_path, tmp)
 
     async def test_invalid_paths_and_status_failures_are_not_unregistered(self):
         service = self.make_service()

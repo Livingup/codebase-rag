@@ -47,6 +47,7 @@ class HookEvent:
     project_id: str
     hook_type: str
     args: str = ""
+    git_repo_path: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -62,6 +63,7 @@ class GitEvent:
     commit_hash: str
     previous_branch_name: Optional[str]
     previous_commit_hash: str
+    git_repo_path: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -77,12 +79,13 @@ class HookStatus:
 
 @dataclass
 class ProjectHeadState:
-    """Tracked HEAD state for a registered project."""
+    """Tracked HEAD state for one registered repository copy."""
 
     project_id: str
     git_repo_path: str
     branch_name: Optional[str] = None
     commit_hash: Optional[str] = None
+    repo_key: str = ""
     watcher_active: bool = False
     last_event_time: Optional[datetime] = None
 

@@ -1,7 +1,12 @@
-"""Memory Qdrant Service — in-memory branch-specific vector search.
+"""Memory Qdrant Service — in-memory repo-copy-specific vector search.
 
-Manages per-branch in-memory Qdrant instances with LRU caching.
+Manages per-repository-copy in-memory Qdrant instances with LRU caching.
 All semantic search happens here, not on Qdrant Server.
+
+Instance identity is the canonical repo_key of the local Git repository
+copy (plus branch@commit), so multiple copies of the same project —
+registered under one project_id — never share an active instance and
+never topple each other's search results.
 """
 
 from __future__ import annotations
@@ -39,8 +44,8 @@ logger = get_logger(__name__)
 InstanceHandle = str
 
 
-def _cache_key(project_id: str, branch_name: str, commit_hash: str) -> str:
-    return f"{project_id}:{branch_name}@{commit_hash}"
+def _cache_key(repo_key: str, branch_name: str, commit_hash: str) -> str:
+    return f"{repo_key}:{branch_name}@{commit_hash}"
 
 
 def _consume_task_exception(task: asyncio.Task[None]) -> None:
@@ -52,17 +57,20 @@ def _consume_task_exception(task: asyncio.Task[None]) -> None:
 class _CachedInstance:
     """Internal wrapper for an in-memory Qdrant instance."""
 
-    __slots__ = ("client", "project_id", "branch_name", "commit_hash",
-                 "last_accessed", "last_search_time", "point_count")
+    __slots__ = ("client", "repo_key", "project_id", "branch_name",
+                 "commit_hash", "last_accessed", "last_search_time",
+                 "point_count")
 
     def __init__(
         self,
         client: AsyncQdrantClient,
+        repo_key: str,
         project_id: str,
         branch_name: str,
         commit_hash: str,
     ) -> None:
         self.client = client
+        self.repo_key = repo_key
         self.project_id = project_id
         self.branch_name = branch_name
         self.commit_hash = commit_hash
@@ -81,14 +89,15 @@ class _CachedInstance:
 
 
 class MemoryQdrantService:
-    """In-memory branch-specific Qdrant instances with LRU caching + hybrid search.
+    """In-memory repo-copy-specific Qdrant instances with LRU caching + hybrid search.
 
     Args:
         config: Memory Qdrant configuration section from AppConfig.
     """
 
-    # Type: async callback that rebuilds the memory instance for a project.
-    # Expected to call create_instance + upsert_points + set_active_instance.
+    # Type: async callback that rebuilds the memory instance for a repo copy.
+    # Receives the repo_key; expected to call create_instance +
+    # upsert_points + set_active_instance.
     RebuildHandler = Callable[[str], Awaitable[None]]
 
     def __init__(self, config_manager: ConfigManager) -> None:
@@ -97,9 +106,9 @@ class MemoryQdrantService:
         self._cache: OrderedDict[str, _CachedInstance] = OrderedDict()
         # Staging handles currently loading and protected from cache cleanup
         self._loading: set[str] = set()
-        # Active instance per project: project_id → cache_key
+        # Active instance per repository copy: repo_key → cache_key
         self._active: Dict[str, str] = {}
-        # One shared lazy rebuild task per project_id
+        # One shared lazy rebuild task per repo_key
         self._in_flight_rebuilds: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
         self._initialized = False
@@ -163,8 +172,9 @@ class MemoryQdrantService:
     def set_rebuild_handler(self, handler: RebuildHandler) -> None:
         """Register a callback for lazy rebuild when search finds no active instance.
 
-        The handler receives ``project_id`` and is expected to create the
-        in-memory instance, load data from Qdrant Server, and call
+        The handler receives the ``repo_key`` of the requesting local
+        repository copy and is expected to create the in-memory instance
+        for that copy, load data from Qdrant Server, and call
         ``set_active_instance``.
         """
         self._rebuild_handler = handler
@@ -176,19 +186,28 @@ class MemoryQdrantService:
 
     async def create_instance(
         self,
-        project_id: str,
+        repo_key: str,
         branch_name: str,
         commit_hash: str,
         *,
+        project_id: Optional[str] = None,
         staging: bool = False,
     ) -> InstanceHandle:
         """Create an in-memory Qdrant instance and register in LRU cache.
+
+        Args:
+            repo_key: Canonical identity key of the local repository copy.
+            branch_name / commit_hash: HEAD snapshot the instance serves.
+            project_id: Data-partition id kept as instance metadata (used
+                by project-level destroys).  Defaults to ``repo_key``.
+            staging: Staging instances get a unique key and are protected
+                from eviction until promoted.
 
         Returns:
             InstanceHandle (cache key string) for subsequent operations.
         """
         self._check_initialized()
-        base_key = _cache_key(project_id, branch_name, commit_hash)
+        base_key = _cache_key(repo_key, branch_name, commit_hash)
         key = f"{base_key}#staging:{uuid.uuid4()}" if staging else base_key
 
         async with self._lock:
@@ -200,9 +219,9 @@ class MemoryQdrantService:
                 return key
 
             # Evict if cache full. A staged replacement must never evict the
-            # same project's current active instance before successful promote.
+            # same copy's current active instance before successful promote.
             await self._evict_if_needed(
-                protected_project_id=project_id if staging else None,
+                protected_repo_key=repo_key if staging else None,
                 allow_over_capacity=staging,
             )
 
@@ -246,7 +265,11 @@ class MemoryQdrantService:
             )
 
             # Register in cache
-            cached = _CachedInstance(client, project_id, branch_name, commit_hash)
+            cached = _CachedInstance(
+                client, repo_key,
+                project_id if project_id is not None else repo_key,
+                branch_name, commit_hash,
+            )
             self._cache[key] = cached
             if staging:
                 self._loading.add(key)
@@ -358,15 +381,15 @@ class MemoryQdrantService:
 
     async def hybrid_search(
         self,
-        project_id: str,
+        repo_key: str,
         query_dense: List[float],
         query_sparse: SparseVector,
         top_k: Optional[int] = None,
         filters: Optional[SearchFilters] = None,
     ) -> List[SearchResult]:
-        """Hybrid search with Prefetch + RRF fusion on active instance."""
+        """Hybrid search with Prefetch + RRF fusion on the copy's active instance."""
         self._check_initialized()
-        inst, handle = await self._get_active_instance_or_rebuild(project_id)
+        inst, handle = await self._get_active_instance_or_rebuild(repo_key)
         coll = self._config.instance.collection_name
         search_cfg = self._config.search
 
@@ -431,7 +454,7 @@ class MemoryQdrantService:
         elapsed = time.monotonic() - start
         logger.info(
             "hybrid_search",
-            project_id=project_id,
+            repo_key=repo_key,
             top_k=k,
             dense_hits=dense_hit_count,
             sparse_hits=sparse_hit_count,
@@ -450,14 +473,14 @@ class MemoryQdrantService:
 
     async def dense_search(
         self,
-        project_id: str,
+        repo_key: str,
         query_dense: List[float],
         top_k: Optional[int] = None,
         filters: Optional[SearchFilters] = None,
     ) -> List[SearchResult]:
-        """Dense-only vector search on active instance (no RRF)."""
+        """Dense-only vector search on the copy's active instance (no RRF)."""
         self._check_initialized()
-        inst, handle = await self._get_active_instance_or_rebuild(project_id)
+        inst, handle = await self._get_active_instance_or_rebuild(repo_key)
         coll = self._config.instance.collection_name
         search_cfg = self._config.search
 
@@ -495,31 +518,31 @@ class MemoryQdrantService:
     # =========================================================================
 
     async def set_active_instance(
-        self, project_id: str, branch_name: str, commit_hash: str
+        self, repo_key: str, branch_name: str, commit_hash: str
     ) -> None:
-        """Set a cached instance as the active search target for a project. O(1)."""
-        key = _cache_key(project_id, branch_name, commit_hash)
+        """Set a cached instance as the active search target for a repo copy. O(1)."""
+        key = _cache_key(repo_key, branch_name, commit_hash)
         async with self._lock:
             if key not in self._cache:
                 raise InstanceNotFoundError(
                     f"Instance not in cache: {key}. Create it first."
                 )
-            self._active[project_id] = key
+            self._active[repo_key] = key
             self._cache[key].touch()
             self._cache.move_to_end(key)
 
         logger.info(
             "active_instance_set",
-            project_id=project_id,
+            repo_key=repo_key,
             cache_key=key,
             point_count=self._cache[key].point_count,
         )
 
     async def get_active_instance_info(
-        self, project_id: str
+        self, repo_key: str
     ) -> Optional[ActiveInstanceInfo]:
-        """Return info about the active instance for a project, or None."""
-        key = self._active.get(project_id)
+        """Return info about the active instance for a repo copy, or None."""
+        key = self._active.get(repo_key)
         if not key or key not in self._cache:
             return None
 
@@ -544,7 +567,7 @@ class MemoryQdrantService:
                 )
             inst = self._cache[handle]
             self._loading.discard(handle)
-            active_key = _cache_key(inst.project_id, inst.branch_name, inst.commit_hash)
+            active_key = _cache_key(inst.repo_key, inst.branch_name, inst.commit_hash)
             if handle != active_key:
                 existing = self._cache.pop(active_key, None)
                 if existing is not None:
@@ -552,13 +575,13 @@ class MemoryQdrantService:
                     logger.info("instance_replaced", cache_key=active_key)
                 self._cache[active_key] = self._cache.pop(handle)
                 handle = active_key
-            self._active[inst.project_id] = handle
+            self._active[inst.repo_key] = handle
             inst.touch()
             self._cache.move_to_end(handle)
 
         logger.info(
             "active_instance_set",
-            project_id=inst.project_id,
+            repo_key=inst.repo_key,
             cache_key=handle,
             point_count=inst.point_count,
         )
@@ -568,10 +591,10 @@ class MemoryQdrantService:
     # =========================================================================
 
     async def get_cached_instance(
-        self, project_id: str, branch_name: str, commit_hash: str
+        self, repo_key: str, branch_name: str, commit_hash: str
     ) -> Optional[InstanceHandle]:
-        """Check if a specific branch@commit instance is cached."""
-        key = _cache_key(project_id, branch_name, commit_hash)
+        """Check if a specific branch@commit instance is cached for a repo copy."""
+        key = _cache_key(repo_key, branch_name, commit_hash)
         async with self._lock:
             if key in self._cache:
                 self._cache[key].touch()
@@ -581,18 +604,18 @@ class MemoryQdrantService:
         logger.info("cache_query_miss", cache_key=key)
         return None
 
-    async def get_cache_status(self, project_id: str) -> List[CacheEntry]:
-        """Return cache entries for a project."""
+    async def get_cache_status(self, repo_key: str) -> List[CacheEntry]:
+        """Return cache entries for a repository copy."""
         entries: List[CacheEntry] = []
         for key, inst in self._cache.items():
-            if inst.project_id != project_id:
+            if inst.repo_key != repo_key:
                 continue
             entries.append(CacheEntry(
                 branch_name=inst.branch_name,
                 commit_hash=inst.commit_hash,
                 point_count=inst.point_count,
                 last_accessed=inst.last_accessed,
-                is_active=(self._active.get(project_id) == key),
+                is_active=(self._active.get(repo_key) == key),
             ))
         return entries
 
@@ -601,24 +624,47 @@ class MemoryQdrantService:
     # =========================================================================
 
     async def destroy_all_instances(self, project_id: str) -> int:
-        """Close and remove all cached instances for a project.
+        """Close and remove all cached instances for a project (all copies).
 
-        Used when a project is unregistered from the system.
+        Used when a project partition is unregistered or rebranded.
 
         Returns:
             Number of instances destroyed.
         """
         async with self._lock:
-            keys_to_remove = [
-                key for key, inst in self._cache.items()
+            targets = [
+                (key, inst) for key, inst in self._cache.items()
                 if inst.project_id == project_id
             ]
+            keys_to_remove = [key for key, _ in targets]
             removed = await self._destroy_keys_locked(keys_to_remove)
-            self._active.pop(project_id, None)
+            for _, inst in targets:
+                self._active.pop(inst.repo_key, None)
 
         logger.info(
             "all_instances_destroyed",
             project_id=project_id,
+            count=removed,
+        )
+        return removed
+
+    async def destroy_repo_instances(self, repo_key: str) -> int:
+        """Close and remove all cached instances for one repository copy.
+
+        Used when a single local copy is unregistered; other copies of
+        the same project keep their instances.
+        """
+        async with self._lock:
+            keys_to_remove = [
+                key for key, inst in self._cache.items()
+                if inst.repo_key == repo_key
+            ]
+            removed = await self._destroy_keys_locked(keys_to_remove)
+            self._active.pop(repo_key, None)
+
+        logger.info(
+            "repo_instances_destroyed",
+            repo_key=repo_key,
             count=removed,
         )
         return removed
@@ -630,21 +676,21 @@ class MemoryQdrantService:
                 return False
             inst = self._cache[handle]
             await self._destroy_keys_locked([handle])
-            if self._active.get(inst.project_id) == handle:
-                self._active.pop(inst.project_id, None)
+            if self._active.get(inst.repo_key) == handle:
+                self._active.pop(inst.repo_key, None)
 
         logger.info("instance_destroyed", cache_key=handle)
         return True
 
-    async def destroy_inactive_instances(self, project_id: str) -> int:
-        """Close inactive project instances, preserving any still loading."""
+    async def destroy_inactive_instances(self, repo_key: str) -> int:
+        """Close inactive instances of a repo copy, preserving any still loading."""
         async with self._lock:
-            active_key = self._active.get(project_id)
+            active_key = self._active.get(repo_key)
             skipped_loading = sum(
                 1
                 for key, inst in self._cache.items()
                 if (
-                    inst.project_id == project_id
+                    inst.repo_key == repo_key
                     and key != active_key
                     and key in self._loading
                 )
@@ -652,7 +698,7 @@ class MemoryQdrantService:
             keys_to_remove = [
                 key for key, inst in self._cache.items()
                 if (
-                    inst.project_id == project_id
+                    inst.repo_key == repo_key
                     and key != active_key
                     and key not in self._loading
                 )
@@ -661,7 +707,7 @@ class MemoryQdrantService:
 
         logger.info(
             "inactive_instances_destroyed",
-            project_id=project_id,
+            repo_key=repo_key,
             count=removed,
             skipped_loading=skipped_loading,
         )
@@ -673,14 +719,14 @@ class MemoryQdrantService:
 
     async def update_cache_commit(
         self,
-        project_id: str,
+        repo_key: str,
         branch_name: str,
         old_commit_hash: str,
         new_commit_hash: str,
     ) -> bool:
         """In-place update of cache key when commit hash changes."""
-        old_key = _cache_key(project_id, branch_name, old_commit_hash)
-        new_key = _cache_key(project_id, branch_name, new_commit_hash)
+        old_key = _cache_key(repo_key, branch_name, old_commit_hash)
+        new_key = _cache_key(repo_key, branch_name, new_commit_hash)
 
         async with self._lock:
             if old_key not in self._cache:
@@ -692,12 +738,12 @@ class MemoryQdrantService:
             self._cache[new_key] = inst
 
             # Update active reference if needed
-            if self._active.get(project_id) == old_key:
-                self._active[project_id] = new_key
+            if self._active.get(repo_key) == old_key:
+                self._active[repo_key] = new_key
 
         logger.info(
             "cache_commit_updated",
-            project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             old_commit=old_commit_hash[:8],
             new_commit=new_commit_hash[:8],
@@ -746,48 +792,48 @@ class MemoryQdrantService:
 
     async def _run_rebuild(
         self,
-        project_id: str,
+        repo_key: str,
         handler: RebuildHandler,
     ) -> None:
-        """Run one project's lazy rebuild and release its single-flight slot."""
+        """Run one repo copy's lazy rebuild and release its single-flight slot."""
         try:
-            await handler(project_id)
+            await handler(repo_key)
         finally:
-            if self._in_flight_rebuilds.get(project_id) is asyncio.current_task():
-                del self._in_flight_rebuilds[project_id]
+            if self._in_flight_rebuilds.get(repo_key) is asyncio.current_task():
+                del self._in_flight_rebuilds[repo_key]
 
     async def _get_active_instance_or_rebuild(
-        self, project_id: str,
+        self, repo_key: str,
     ) -> Tuple[_CachedInstance, str]:
-        """Get the active instance for a project, with lazy rebuild fallback.
+        """Get the active instance for a repo copy, with lazy rebuild fallback.
 
         If no active instance exists but a rebuild handler is registered,
         invoke it to recreate the instance from Qdrant Server, then retry.
-        Concurrent requests for one project share the same rebuild task.
+        Concurrent requests for one copy share the same rebuild task.
         """
-        inst, key = self._try_get_active(project_id)
+        inst, key = self._try_get_active(repo_key)
         if inst is not None:
             return inst, key
 
         # No active instance — attempt lazy rebuild
         handler = self._rebuild_handler
         if handler is not None:
-            task = self._in_flight_rebuilds.get(project_id)
+            task = self._in_flight_rebuilds.get(repo_key)
             if task is None:
                 logger.info(
                     "lazy_rebuild_triggered",
-                    project_id=project_id,
+                    repo_key=repo_key,
                 )
                 task = asyncio.create_task(
-                    self._run_rebuild(project_id, handler),
-                    name=f"lazy_rebuild:{project_id}",
+                    self._run_rebuild(repo_key, handler),
+                    name=f"lazy_rebuild:{repo_key}",
                 )
                 task.add_done_callback(_consume_task_exception)
-                self._in_flight_rebuilds[project_id] = task
+                self._in_flight_rebuilds[repo_key] = task
             else:
                 logger.info(
                     "lazy_rebuild_joined",
-                    project_id=project_id,
+                    repo_key=repo_key,
                 )
 
             try:
@@ -796,50 +842,50 @@ class MemoryQdrantService:
                 current = asyncio.current_task()
                 if task.cancelled() and (current is None or current.cancelling() == 0):
                     raise NoActiveInstanceError(
-                        f"No active instance for project '{project_id}' "
+                        f"No active instance for repository '{repo_key}' "
                         "and lazy rebuild was cancelled."
                     ) from None
                 raise
             except Exception as e:
                 logger.warning(
                     "lazy_rebuild_failed",
-                    project_id=project_id,
+                    repo_key=repo_key,
                     error=str(e)[:200],
                 )
                 raise NoActiveInstanceError(
-                    f"No active instance for project '{project_id}' "
+                    f"No active instance for repository '{repo_key}' "
                     f"and lazy rebuild failed: {e}"
                 ) from e
 
             # Retry after rebuild
-            inst, key = self._try_get_active(project_id)
+            inst, key = self._try_get_active(repo_key)
             if inst is not None:
                 logger.info(
                     "lazy_rebuild_success",
-                    project_id=project_id,
+                    repo_key=repo_key,
                     cache_key=key,
                 )
                 return inst, key
 
         raise NoActiveInstanceError(
-            f"No active instance for project '{project_id}'."
+            f"No active instance for repository '{repo_key}'."
         )
 
-    def _try_get_active(self, project_id: str) -> Tuple[Optional[_CachedInstance], str]:
+    def _try_get_active(self, repo_key: str) -> Tuple[Optional[_CachedInstance], str]:
         """Try to get the active instance. Returns (None, '') if not found."""
-        key = self._active.get(project_id, "")
+        key = self._active.get(repo_key, "")
         if not key:
             return None, ""
         inst = self._cache.get(key)
         if inst is None:
             # Active reference points to evicted instance — clean up stale ref
-            del self._active[project_id]
+            del self._active[repo_key]
             return None, ""
         return inst, key
 
     async def _evict_if_needed(
         self,
-        protected_project_id: Optional[str] = None,
+        protected_repo_key: Optional[str] = None,
         *,
         allow_over_capacity: bool = False,
     ) -> None:
@@ -849,8 +895,8 @@ class MemoryQdrantService:
           1. Oldest non-active instance that is not loading
           2. Oldest idle active instance (search idle >= idle_timeout_minutes)
 
-        ``protected_project_id`` prevents staging reloads from evicting the same
-        project's active instance before a replacement has loaded successfully.
+        ``protected_repo_key`` prevents staging reloads from evicting the same
+        copy's active instance before a replacement has loaded successfully.
         When no safe victim exists, ``allow_over_capacity`` lets a staging
         replacement exceed the configured cache limit. Promotion does not
         proactively shrink the cache; normal cleanup/eviction still applies.
@@ -860,8 +906,8 @@ class MemoryQdrantService:
 
         active_keys = set(self._active.values())
         protected_active_key = (
-            self._active.get(protected_project_id)
-            if protected_project_id is not None
+            self._active.get(protected_repo_key)
+            if protected_repo_key is not None
             else None
         )
 
@@ -887,7 +933,7 @@ class MemoryQdrantService:
                 idle_seconds = (now - idle_since).total_seconds()
                 if idle_seconds >= idle_min * 60:
                     # Remove from active before evicting
-                    self._active.pop(inst.project_id, None)
+                    self._active.pop(inst.repo_key, None)
                     await self._evict_instance(key)
                     return
 
@@ -896,7 +942,7 @@ class MemoryQdrantService:
                 "cache_over_capacity_allowed_for_staging",
                 cache_size=len(self._cache),
                 max_branches=self._config.cache.max_branches,
-                protected_project_id=protected_project_id,
+                protected_repo_key=protected_repo_key,
             )
             return
 
@@ -913,7 +959,7 @@ class MemoryQdrantService:
         logger.info(
             "instance_evicted",
             cache_key=key,
-            project_id=inst.project_id,
+            repo_key=inst.repo_key,
             branch=inst.branch_name,
             points=inst.point_count,
         )
@@ -921,8 +967,9 @@ class MemoryQdrantService:
     async def _idle_sweep_loop(self) -> None:
         """Periodically evict active instances that have been idle too long.
 
-        Frees memory for projects that are registered but not actively searched.
-        The instance will be lazily rebuilt from Qdrant Server on next search.
+        Frees memory for repository copies that are registered but not
+        actively searched. The instance will be lazily rebuilt from
+        Qdrant Server on next search.
         """
         idle_min = self._config.cache.idle_timeout_minutes
         # Check every 1/3 of the timeout period, minimum 60s
@@ -948,7 +995,7 @@ class MemoryQdrantService:
             idle_keys = []
             for key, inst in self._cache.items():
                 # Only sweep active instances; non-active are already LRU-managed
-                if self._active.get(inst.project_id) != key:
+                if self._active.get(inst.repo_key) != key:
                     continue
                 idle_since = inst.last_search_time or inst.last_accessed
                 if (now - idle_since).total_seconds() >= threshold_s:
@@ -956,11 +1003,11 @@ class MemoryQdrantService:
 
             for key in idle_keys:
                 inst = self._cache[key]
-                self._active.pop(inst.project_id, None)
+                self._active.pop(inst.repo_key, None)
                 await self._evict_instance(key)
                 logger.info(
                     "idle_sweep_evicted",
-                    project_id=inst.project_id,
+                    repo_key=inst.repo_key,
                     branch=inst.branch_name,
                     idle_minutes=idle_min,
                 )

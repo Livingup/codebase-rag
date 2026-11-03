@@ -101,6 +101,7 @@ class HookReceiver:
             project_id=project_id,
             hook_type=hook_type,
             args=data.get("args", ""),
+            git_repo_path=data.get("repo_path", ""),
         )
 
         logger.info(

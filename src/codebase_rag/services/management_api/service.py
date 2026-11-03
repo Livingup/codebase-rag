@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import ManagementApiConfig
 from codebase_rag.services.agent.service import AgentService
@@ -51,6 +52,7 @@ from codebase_rag.services.management_api.models import (
     SearchResultItem,
     ServiceUnavailableError,
     TaskResponse,
+    UnregisterRepoResponse,
 )
 from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.memory_qdrant.models import SearchFilters as MemorySearchFilters
@@ -129,7 +131,9 @@ class ManagementApiService:
         self._agent = agent
         self._knowledge_sync = knowledge_sync
 
-        # In-memory project registry: project_id → ProjectRecord
+        # In-memory project registry: repo_key → ProjectRecord.
+        # Multiple local copies of one project (same project_id) hold
+        # distinct repo_keys and coexist as separate entries.
         self._projects: Dict[str, ProjectRecord] = {}
 
         # One shared moved-repo heal task per project_id (single-flight)
@@ -178,17 +182,21 @@ class ManagementApiService:
     async def register_project(
         self, git_repo_path: str, display_name: str = "",
     ) -> ProjectResponse:
-        """Register a project: validate repo, get/create project_id, trigger init.
+        """Register a local repository copy: validate, resolve id, trigger init.
 
         Steps:
           1. Validate .git/ exists
           2. Derive project_id deterministically from the Git root commit;
              migrate any data attributed to a stale id (cached from a prior
              derivation rule) to the new id before continuing
-          3. Register to event detection service
-          4. Register to workflow orchestrator
+          3. Register the copy (repo_key) to event detection service
+          4. Register the copy to workflow orchestrator
           5. Trigger full initialization (async)
           6. Return project info
+
+        Multiple copies of the same project (same project_id, different
+        paths) coexist: each path gets its own registry entry, hooks,
+        watcher and in-memory instances.
         """
         # Step 1: Validate repo
         validation = await self._git_ops.validate_repository(git_repo_path)
@@ -201,14 +209,17 @@ class ManagementApiService:
         # and migrate any pre-existing data attributed to a stale id.
         project_id = await self._resolve_project_id_with_migration(git_repo_path)
 
-        # Check if already registered with a different path
-        existing = self._projects.get(project_id)
-        path_changed = existing is not None and existing.git_repo_path != git_repo_path
+        repo_key = self._normalize_registered_path(git_repo_path)
+        existing = self._projects.get(repo_key)
+        sibling_copies = [
+            record for record in self._projects.values()
+            if record.project_id == project_id and record.repo_key != repo_key
+        ]
 
-        # Step 3: Register to event detection
+        # Step 3: Register the copy to event detection
         await self._event_detection.register_project(project_id, git_repo_path)
 
-        # Step 4: Register to workflow orchestrator
+        # Step 4: Register the copy to workflow orchestrator
         self._workflow.register_project(project_id, git_repo_path)
 
         # Get HEAD info
@@ -216,20 +227,35 @@ class ManagementApiService:
 
         # Save to registry
         if not display_name:
-            display_name = existing.display_name if existing else os.path.basename(git_repo_path)
-        if path_changed:
+            display_name = (
+                existing.display_name if existing
+                else os.path.basename(git_repo_path)
+            )
+        if existing is None and sibling_copies:
             logger.info(
-                "project_path_updated",
+                "project_copy_registered",
+                project_id=project_id,
+                repo_path=git_repo_path,
+                existing_copies=len(sibling_copies),
+            )
+        elif existing is not None and existing.git_repo_path != git_repo_path:
+            logger.info(
+                "project_path_respelled",
                 project_id=project_id,
                 old_path=existing.git_repo_path,
                 new_path=git_repo_path,
+                repo_key=repo_key,
             )
         record = ProjectRecord(
             project_id=project_id,
             git_repo_path=git_repo_path,
             display_name=display_name,
+            repo_key=repo_key,
+            registered_at=(
+                existing.registered_at if existing else datetime.utcnow()
+            ),
         )
-        self._projects[project_id] = record
+        self._projects[repo_key] = record
         try:
             self._save_registry(raise_on_error=True)
         except Exception as e:
@@ -240,9 +266,11 @@ class ManagementApiService:
                 f"原因：{e}"
             ) from e
 
-        # Step 5: Trigger full initialization (via task queue, serial per project)
+        # Step 5: Trigger full initialization (via task queue, serial per copy)
         branch = head_info.branch_name or "HEAD"
-        self._workflow.enqueue_initialization(project_id, branch, head_info.commit_hash)
+        self._workflow.enqueue_initialization(
+            project_id, git_repo_path, branch, head_info.commit_hash,
+        )
 
         logger.info(
             "project_registered",
@@ -324,25 +352,19 @@ class ManagementApiService:
     def _normalize_registered_path(path: str) -> str:
         if not isinstance(path, str) or not path.strip() or not os.path.isabs(path):
             raise InvalidRequestError("git_repo_path 必须为非空的仓库根目录绝对路径。")
-        return os.path.normcase(os.path.realpath(os.path.abspath(os.path.normpath(path))))
+        return normalize_repo_key(path)
 
     async def get_project_registration_status(
         self, git_repo_path: str,
     ) -> ProjectRegistrationStatus:
         """Report registration and a running initialization, not readiness."""
         normalized = self._normalize_registered_path(git_repo_path)
-        matches = [
-            record for record in self._projects.values()
-            if self._normalize_registered_path(record.git_repo_path) == normalized
-        ]
-        if not matches:
-            return ProjectRegistrationStatus(git_repo_path=normalized, registered=False)
-        if len(matches) != 1:
-            raise InvalidRequestError(
-                "同一路径存在多个登记记录，无法确认项目；请联系服务维护者检查登记信息。"
+        record = self._projects.get(normalized)
+        if record is None:
+            return ProjectRegistrationStatus(
+                git_repo_path=normalized, registered=False,
             )
-        record = matches[0]
-        task = self._workflow.get_workflow_status(record.project_id).current_task
+        task = self._workflow.get_workflow_status(record.repo_key).current_task
         return ProjectRegistrationStatus(
             git_repo_path=record.git_repo_path,
             registered=True,
@@ -354,15 +376,16 @@ class ManagementApiService:
     # =========================================================================
 
     async def heal_moved_project(self, project_id: str, incoming_path: str) -> bool:
-        """Re-register a project whose repository moved to a new path.
+        """Re-register a repository copy whose path moved to a new location.
 
         MCP read paths always receive the caller's current Git repo root.
-        When that root carries this project's identity while the registered
-        path differs and no longer exists on disk, the repository was moved
-        and the registration is healed here automatically — reusing the
-        normal ``register_project`` flow so the registry path, event
-        detection, hooks and workflow state all converge, and missed
-        commits are caught up.
+        When that root carries this project's identity while the registration
+        of the same path is missing and older entries of the project point at
+        paths that no longer exist, the repository was moved and the stale
+        entries are healed here automatically — reusing the normal
+        ``register_project`` flow so the registry entry, event detection,
+        hooks and workflow state all converge, and missed commits are caught
+        up.
 
         Conservative by design — healing only runs when ALL hold:
           1. ``incoming_path`` is a Git repo root (contract check; the
@@ -372,13 +395,13 @@ class ManagementApiService:
              content, never from the caller's claim or the ``.git`` cache
              file alone.
           3. Either:
-             a. the project is registered with a different path AND the
-                old path's ``.git`` no longer exists (a move, not a copy —
-                two live clones must be switched via manual registration),
-                or
-             b. the project is not registered at all (the entry was pruned
-                by a restart-restore while the ``.git`` cache file still
-                travels with the repository).
+             a. no repository copy of this project is registered at the
+                incoming path AND at least one older copy's ``.git`` no
+                longer exists (a move, not a copy — two live clones must
+                be switched via manual registration), or
+             b. the project has no registered copies at all (the entries
+                were pruned by a restart-restore while the ``.git`` cache
+                file still travels with the repository).
 
         Single-flight per project_id: concurrent callers join the same
         heal task.  The pre-check is cheap (registry lookup + existence
@@ -392,8 +415,8 @@ class ManagementApiService:
         if not self._initialized or not incoming_path:
             return False
 
-        # Cheap pre-check (no git subprocess) so the hot path — registered
-        # path already matches the caller's path — returns immediately.
+        # Cheap pre-check (no git subprocess) so the hot path — a copy is
+        # already registered at the caller's path — returns immediately.
         if not self._move_heal_precheck(project_id, incoming_path):
             return False
 
@@ -418,21 +441,23 @@ class ManagementApiService:
         except InvalidRequestError:
             return False
 
-        record = self._projects.get(project_id)
-        if record is not None:
-            try:
-                normalized_registered = self._normalize_registered_path(
-                    record.git_repo_path,
-                )
-            except InvalidRequestError:
-                normalized_registered = None
-            if normalized_registered == normalized_incoming:
-                # Hot path: registration already matches the caller's path.
+        # A copy already registered at the caller's path — nothing to heal.
+        if normalized_incoming in self._projects:
+            return False
+
+        copies = [
+            record for record in self._projects.values()
+            if record.project_id == project_id
+        ]
+        if copies:
+            # Any live copy means copy / two-clone scenario — switching must
+            # be an explicit decision, never automatic.
+            if any(
+                os.path.exists(os.path.join(record.git_repo_path, ".git"))
+                for record in copies
+            ):
                 return False
-            if os.path.exists(os.path.join(record.git_repo_path, ".git")):
-                # Old path still live: copy / two-clone scenario — switching
-                # must be an explicit decision, never automatic.
-                return False
+            # All registered copies are dead: the repository moved.
 
         # Contract check: the caller's path must itself be a Git repo root
         # (.git may be a directory or a worktree file).
@@ -477,8 +502,16 @@ class ManagementApiService:
             )
             return False
 
-        old_record = self._projects.get(project_id)
-        old_path = old_record.git_repo_path if old_record is not None else None
+        # Drop the dead entries of this project before re-registering the
+        # moved path (register_project creates the fresh entry).
+        dead_copies = [
+            record for record in self._projects.values()
+            if record.project_id == project_id
+            and not os.path.exists(os.path.join(record.git_repo_path, ".git"))
+        ]
+        for record in dead_copies:
+            self._projects.pop(record.repo_key, None)
+
         try:
             await self.register_project(incoming_path)
         except Exception:
@@ -491,17 +524,17 @@ class ManagementApiService:
         logger.info(
             "moved_project_healed",
             project_id=project_id,
-            old_path=old_path,
+            healed_copies=len(dead_copies),
             new_path=incoming_path,
         )
         return True
 
     async def list_projects(self) -> List[ProjectResponse]:
-        """List all registered projects."""
+        """List all registered repository copies (one entry per copy)."""
         results = []
         for record in self._projects.values():
             status, branch, commit, points = await self._get_project_summary(
-                record.project_id, record.git_repo_path,
+                record.project_id, record.repo_key,
             )
             results.append(ProjectResponse(
                 project_id=record.project_id,
@@ -514,18 +547,25 @@ class ManagementApiService:
             ))
         return results
 
+    def _first_copy(self, project_id: str) -> Optional[ProjectRecord]:
+        """Return the first registered copy of a project, if any."""
+        for record in self._projects.values():
+            if record.project_id == project_id:
+                return record
+        return None
+
     async def get_project(self, project_id: str) -> ProjectDetailResponse:
-        """Get detailed info for a single project."""
-        record = self._projects.get(project_id)
+        """Get detailed info for a single project (first registered copy)."""
+        record = self._first_copy(project_id)
         if not record:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         status, branch, commit, points = await self._get_project_summary(
-            project_id, record.git_repo_path,
+            project_id, record.repo_key,
         )
 
         # Workflow status
-        wf_status = self._workflow.get_workflow_status(project_id)
+        wf_status = self._workflow.get_workflow_status(record.repo_key)
         wf_dict = None
         if wf_status.current_task:
             wf_dict = {
@@ -544,17 +584,24 @@ class ManagementApiService:
             workflow_status=wf_dict,
         )
 
-    async def delete_project(self, project_id: str) -> DeleteProjectResponse:
-        """Unregister a project. Preserves Qdrant persistent data for reuse.
+    async def unregister_project(self, project_id: str) -> DeleteProjectResponse:
+        """Unregister every local copy of a project (data partition).
+
+        Persistent Qdrant points are always preserved for reuse — this
+        operation only stops local tracking (hooks, watchers, in-memory
+        instances, registry entries) for all registered copies.
 
         Steps:
-          1. Stop event monitoring
-          2. Unregister from workflow
-          3. Destroy in-memory instances
-          4. Remove from registry
+          1. Stop event monitoring for every copy
+          2. Unregister every copy from workflow
+          3. Destroy in-memory instances of the project
+          4. Remove the registry entries
         """
-        record = self._projects.get(project_id)
-        if not record:
+        copies = [
+            record for record in self._projects.values()
+            if record.project_id == project_id
+        ]
+        if not copies:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         # Step 1
@@ -567,16 +614,53 @@ class ManagementApiService:
         await self._memory.destroy_all_instances(project_id)
 
         # Step 4
-        self._projects.pop(project_id, None)
+        for record in copies:
+            self._projects.pop(record.repo_key, None)
         self._save_registry()
 
         logger.info(
-            "project_deleted",
+            "project_unregistered",
             project_id=project_id,
+            unregistered_repos=len(copies),
         )
 
         return DeleteProjectResponse(
             project_id=project_id,
+            unregistered_repos=len(copies),
+            deleted_points=0,
+        )
+
+    async def unregister_repo(self, git_repo_path: str) -> UnregisterRepoResponse:
+        """Unregister a single local repository copy.
+
+        Other copies of the same project (same project_id, different
+        paths) keep their tracking.  Persistent Qdrant points are always
+        preserved for reuse.
+        """
+        repo_key = self._normalize_registered_path(git_repo_path)
+        record = self._projects.get(repo_key)
+        if record is None:
+            raise ProjectNotFoundError(
+                f"No registered repository at '{git_repo_path}'"
+            )
+
+        # Stop event monitoring and workflow tracking for this copy only
+        await self._event_detection.unregister_repo(record.git_repo_path)
+        self._workflow.unregister_repo(record.git_repo_path)
+        await self._memory.destroy_repo_instances(repo_key)
+
+        self._projects.pop(repo_key, None)
+        self._save_registry()
+
+        logger.info(
+            "repo_unregistered",
+            project_id=record.project_id,
+            git_repo_path=record.git_repo_path,
+        )
+
+        return UnregisterRepoResponse(
+            git_repo_path=record.git_repo_path,
+            project_id=record.project_id,
             deleted_points=0,
         )
 
@@ -593,8 +677,8 @@ class ManagementApiService:
         entity_type: Optional[str] = None,
         file_path_prefix: Optional[str] = None,
     ) -> SearchResponse:
-        """Execute semantic search on a project's active in-memory instance."""
-        record = self._projects.get(project_id)
+        """Execute semantic search on a project's first-copy in-memory instance."""
+        record = self._first_copy(project_id)
         if not record:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
@@ -625,7 +709,7 @@ class ManagementApiService:
 
         # Step 3: Hybrid search
         results = await self._memory.hybrid_search(
-            project_id=project_id,
+            record.repo_key,
             query_dense=emb.dense_vector,
             query_sparse=emb.sparse_vector,
             top_k=top_k,
@@ -649,7 +733,7 @@ class ManagementApiService:
             ))
 
         # Get active branch info
-        active = await self._memory.get_active_instance_info(project_id)
+        active = await self._memory.get_active_instance_info(record.repo_key)
         branch = active.branch_name if active else None
         commit = active.commit_hash[:8] if active else None
 
@@ -678,8 +762,8 @@ class ManagementApiService:
     async def trigger_rebuild(
         self, project_id: str, force: bool = False,
     ) -> TaskResponse:
-        """Trigger full rebuild for a project (async)."""
-        record = self._projects.get(project_id)
+        """Trigger full rebuild for a project's first copy (async)."""
+        record = self._first_copy(project_id)
         if not record:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
@@ -690,7 +774,9 @@ class ManagementApiService:
         # Force rebuild is intentionally non-destructive: workflow initialization
         # now loads a staged replacement and promotes it only after success, so
         # the existing active in-memory instance remains searchable during reload.
-        self._workflow.enqueue_initialization(project_id, branch, head.commit_hash)
+        self._workflow.enqueue_initialization(
+            project_id, record.git_repo_path, branch, head.commit_hash,
+        )
 
         logger.info(
             "rebuild_triggered",
@@ -706,8 +792,8 @@ class ManagementApiService:
         )
 
     async def trigger_sync(self, project_id: str) -> TaskResponse:
-        """Trigger manual incremental sync for a project."""
-        record = self._projects.get(project_id)
+        """Trigger manual incremental sync for a project's first copy."""
+        record = self._first_copy(project_id)
         if not record:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
@@ -715,10 +801,11 @@ class ManagementApiService:
         task_id = str(uuid.uuid4())
 
         branch = head.branch_name or "HEAD"
-        active = await self._memory.get_active_instance_info(project_id)
+        active = await self._memory.get_active_instance_info(record.repo_key)
         if active and active.commit_hash != head.commit_hash:
             self._workflow.enqueue_content_commit(
-                project_id, branch, head.commit_hash, active.commit_hash,
+                project_id, record.git_repo_path, branch,
+                head.commit_hash, active.commit_hash,
             )
             message = "Incremental sync enqueued"
         else:
@@ -737,13 +824,13 @@ class ManagementApiService:
     # =========================================================================
 
     async def get_project_status(self, project_id: str) -> ProjectStatusResponse:
-        """Get detailed index status for a project."""
-        record = self._projects.get(project_id)
+        """Get detailed index status for a project (first registered copy)."""
+        record = self._first_copy(project_id)
         if not record:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
-        active = await self._memory.get_active_instance_info(project_id)
-        wf_status = self._workflow.get_workflow_status(project_id)
+        active = await self._memory.get_active_instance_info(record.repo_key)
+        wf_status = self._workflow.get_workflow_status(record.repo_key)
 
         # Determine index status
         if wf_status.current_task:
@@ -1232,12 +1319,12 @@ class ManagementApiService:
                 new_project_id=new_id,
             )
 
-        # 5) Local registry (in-memory dict + persisted JSON)
-        if old_id in self._projects:
-            record = self._projects.pop(old_id)
-            record.project_id = new_id
-            self._projects[new_id] = record
-            self._save_registry()
+        # 5) Local registry (in-memory dict keyed by repo_key — keys stay
+        # valid, only the record's project_id field needs rewriting).
+        for record in self._projects.values():
+            if record.project_id == old_id:
+                record.project_id = new_id
+        self._save_registry()
 
         logger.info(
             "project_id_migration_done",
@@ -1246,11 +1333,11 @@ class ManagementApiService:
         )
 
     async def _get_project_summary(
-        self, project_id: str, repo_path: str,
+        self, project_id: str, repo_key: str,
     ) -> tuple:
-        """Get (status, branch, commit_hash_short, knowledge_points) for a project."""
-        active = await self._memory.get_active_instance_info(project_id)
-        wf_status = self._workflow.get_workflow_status(project_id)
+        """Get (status, branch, commit_hash_short, knowledge_points) for a copy."""
+        active = await self._memory.get_active_instance_info(repo_key)
+        wf_status = self._workflow.get_workflow_status(repo_key)
 
         if wf_status.current_task:
             status = "initializing"

@@ -2,6 +2,71 @@
 
 本文档约定 Codebase RAG 在 Windows 本地运行场景下的开发、测试、提交、打包、本地安装与用户端更新流程。目标用户主要在 Windows 本地长期运行服务，因此所有运维脚本集中放在 `ops/windows/`，本文档只说明脚本用途和调用方式，不内嵌脚本源码。
 
+## 0. 项目架构约束记忆路由表（L0）
+
+项目工程约束记忆位于 `.agent/` 目录：13 份业务域文档（`.agent/01-business-and-features/`）、1 份分层规范（`.agent/02-code-structure/architecture-rules.md`，全项目分层词汇唯一来源）、6 篇非平凡技术机制文档（`.agent/04-tech-decisions/`）。本项目为纯后端服务，无独立 UI 现状文档（说明见 architecture-rules.md 第 5 节）。查找业务规则、放码位置或源码清单时，从下表按关键词定位功能单元（共 56 个），跳转至对应域文档。
+
+| 功能单元 ID | 功能名称 | 业务关键词 | 所属业务域文档与锚点 | 关联技术架构抉择 |
+| --- | --- | --- | --- | --- |
+| `FEAT-COMMON-01` | Key 池调度 | API Key, 轮换, 熔断, 冷却, 429, KeyPool, keypool | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-01` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-COMMON-02` | Token 计数器 | token 计数, 三级回退, 上下文窗口, 预估 | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-02` | 无 |
+| `FEAT-COMMON-03` | 结构化日志 | structlog, 日志, snake_case, 日志轮转 | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-03` | 无 |
+| `FEAT-COMMON-04` | 配置加载与热重载协调 | 配置, 热重载, reload, reconciler, .env, 不可变参数, requires_restart | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-04` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
+| `FEAT-COMMON-05` | 服务组装根 | 组装根, 启动, ServiceContainer, 回调接线, 双 Server | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-05` | 无 |
+| `FEAT-COMMON-06` | 仓库副本路径规范化 | repo_key, normalize_repo_key, 路径归一, 副本身份, 规范化路径 | `.agent/01-business-and-features/domain-common.md#FEAT-COMMON-06` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
+| `FEAT-WF-01` | Git 事件接收与副本任务队列 | 事件接收, 任务队列, 串行调度, GitEvent, ProjectTaskQueue, repo_key, 副本路由 | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-01` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
+| `FEAT-WF-02` | 分支切换与懒重建 | 分支切换, staging, 原子提升, 懒重建, 内存实例重建 | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-02` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-WF-03` | 内容提交知识生产 | 提交同步, 知识生产, 纯重命名复用, 守卫链, 知识生成 | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-WF-04` | 灰区文件 L3 分类 | 灰区, LLM 分类, 类型键, uncertain, 灰区缓存 | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-04` | 无 |
+| `FEAT-WF-05` | 项目初始化（全量/增量） | 初始化, 全量, 增量, 基线知识, backfill | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-05` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-WF-06` | 补偿循环与死信 | 补偿循环, 重试, 死信, 退避, retry_queue, dead_letter | `.agent/01-business-and-features/domain-workflow.md#FEAT-WF-06` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-ED-01` | 仓库副本接入与 HEAD 基线 | 副本接入, HEAD 基线, 重启恢复, 事件注册, repo_key | `.agent/01-business-and-features/domain-event-detection.md#FEAT-ED-01` | 无 |
+| `FEAT-ED-02` | Hook 注入与 wrapper 备份 | Git hook, wrapper, 备份, 托管标记, post-commit, 巡检 | `.agent/01-business-and-features/domain-event-detection.md#FEAT-ED-02` | 无 |
+| `FEAT-ED-03` | 事件分类与去重 | 事件分类, 去重窗口, BRANCH_SWITCH, CONTENT_COMMIT | `.agent/01-business-and-features/domain-event-detection.md#FEAT-ED-03` | 无 |
+| `FEAT-ED-04` | Watcher 兜底轮询 | watcher, 轮询, 兜底, git reset, 去抖 | `.agent/01-business-and-features/domain-event-detection.md#FEAT-ED-04` | 无 |
+| `FEAT-GIT-01` | 变更解析与纯重命名识别 | diff, 变更解析, 纯重命名, name-status, added modified deleted | `.agent/01-business-and-features/domain-git-operations.md#FEAT-GIT-01` | 无 |
+| `FEAT-GIT-02` | 三层文件过滤 | 黑名单, 白名单, 灰区, 文件过滤, exclude_patterns | `.agent/01-business-and-features/domain-git-operations.md#FEAT-GIT-02` | 无 |
+| `FEAT-GIT-03` | file_version_id 与 blob 读取 | file_version_id, blob, sha256, 严格模式, get_file_content | `.agent/01-business-and-features/domain-git-operations.md#FEAT-GIT-03` | 无 |
+| `FEAT-GIT-04` | Git 命令执行器 | 子进程, 超时, GitTimeoutError, 并发上限 | `.agent/01-business-and-features/domain-git-operations.md#FEAT-GIT-04` | 无 |
+| `FEAT-KS-01` | 知识提交受理与发布 | 提交受理, 双锁, 发布确认, wait=True, cancelled_stale | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-01` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-KS-02` | 外发箱持久化与失败重试 | 外发箱, outbox, ready, 重试, 原子写, tmp replace | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-02` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-KS-03` | 幂等快路径与最新版本管理 | 幂等, 跳过, 存在性, stale, 最新版本 | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-KS-04` | 内存镜像刷新与迁移 | 内存刷新, best-effort, rebrand, 镜像 | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-04` | 无 |
+| `FEAT-QS-01` | 连接生命周期与自愈 | 连接, 自愈, PoolTimeout, 客户端重建, 探活 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-01` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
+| `FEAT-QS-02` | 确定性点写入 | upsert, 确认, uuid5, knowledge_set_id, point ID | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-02` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-QS-03` | 完整知识集读取 | scroll, 完整知识集, chunk, 字典序最小, 读取 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-QS-04` | 存在性检查与迁移 | check_existence, 内容寻址, 去重, rebrand, set_payload | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-04` | 无 |
+| `FEAT-MQ-01` | 实例创建与 LRU 缓存 | 实例创建, LRU, staging, 缓存命中, 容量, repo_key, 副本实例 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-01` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-MQ-02` | 混合检索 | 混合检索, RRF, dense, sparse, prefetch, 融合 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-02` | 无 |
+| `FEAT-MQ-03` | 活跃实例管理与 staging 晋升 | 活跃实例, 提升, staging, active, 转正 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-03` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-MQ-04` | LRU 淘汰与空闲清扫 | 淘汰, 空闲清扫, 超容量, idle_timeout | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-04` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-MQ-05` | 懒加载单飞重建 | 懒加载, 单飞, shield, NoActiveInstance, 共享重建 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-05` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
+| `FEAT-MQ-06` | 实例销毁与缓存键迁移 | 销毁, update_cache_commit, 缓存键, 注销清理, destroy_repo_instances, 单副本销毁 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-06` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
+| `FEAT-MCPS-01` | 多查询分组语义搜索 | codebase_search, 多查询, 多仓库, 分组, top_k | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-01` | 无 |
+| `FEAT-MCPS-02` | 两阶段检索引擎 | 两阶段检索, 召回, 重排, reranker, Jev, 自愈重试 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-02` | 无 |
+| `FEAT-MCPS-03` | 仓库根契约校验 | git_repo_path, 仓库根, project_id, 不上溯, ProjectNotRegistered | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-03` | `.agent/04-tech-decisions/tech-moved-repo-heal.md` |
+| `FEAT-MCPS-04` | 已提交知识查询 | get_file_knowledge, 知识查询, 严格模式, HEAD 版本 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-04` | 无 |
+| `FEAT-MCPS-05` | 知识提交 | add_file_knowledge, 受理, blob_hash, 未覆盖, accepted | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-05` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
+| `FEAT-MCPS-06` | 登记类北向工具 | project_status, list_projects, register_project, 登记状态, 初始化中 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-06` | 无 |
+| `FEAT-CE-01` | 深度上下文分析编排 | 上下文分析, 实现现状报告, submit_report, ripgrep, 多候选 | `.agent/01-business-and-features/domain-context-engine.md#FEAT-CE-01` | 无 |
+| `FEAT-CE-02` | 本地工具集与 rg 执行 | search_code, read_file, list_directory, rg, 行号 | `.agent/01-business-and-features/domain-context-engine.md#FEAT-CE-02` | 无 |
+| `FEAT-MGMT-01` | 仓库副本注册主链与身份派生 | 注册, project_id, uuid5, 身份迁移, 注册表, 批量注册, repo_key, 多副本 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-01` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
+| `FEAT-MGMT-02` | 仓库移动自愈 | 移动自愈, heal, 双克隆, 身份重派生, single-flight | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-02` | `.agent/04-tech-decisions/tech-moved-repo-heal.md` |
+| `FEAT-MGMT-03` | 仓库副本注销与重启恢复 | 注销, unregister_repo, unregister_project, 单副本, 整分区, 重启恢复, 裁剪, 保留持久数据 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-03` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |
+| `FEAT-MGMT-04` | REST 管理端点 | REST, /api/v1, health, config reload, 管理搜索, 状态 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-04` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
+| `FEAT-MGMT-05` | 本地 Admin UI | Admin UI, 本地后台, 单页状态页 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-05` | 无 |
+| `FEAT-AG-01` | Provider 生命周期管理 | provider, 服务商, 探活, 三向 diff, degraded | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-01` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-AG-02` | 并发容量选择与绑定 | 并发容量, 信号量, provider 绑定, 等待空位 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-02` | 无 |
+| `FEAT-AG-03` | Agent 注册与执行循环 | run_agent, 工具调用, 执行循环, trace, 批量执行 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-03` | 无 |
+| `FEAT-AG-04` | LLM 调用双层重试 | 429, 退避, 双层重试, 熔断, 鉴权失败, 换 Key | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-04` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-AG-05` | 上下文压缩 | 上下文压缩, compress_and_replace_history, 压缩阈值, 八分区 | `.agent/01-business-and-features/domain-agent.md#FEAT-AG-05` | 无 |
+| `FEAT-EMB-01` | 双 Provider 初始化 | embedding, Gemini, DashScope, 密钥健康, 双通道 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-01` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-EMB-02` | embed 门禁与重试 | 向量, 批处理门禁, batch_size, query 模式, document 模式 | `.agent/01-business-and-features/domain-embedding.md#FEAT-EMB-02` | `.agent/04-tech-decisions/tech-key-pool.md` |
+| `FEAT-MCPC-01` | 三种 Transport 连接 | stdio, sse, streamable_http, 工具发现, 外部 MCP | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-01` | 无 |
+| `FEAT-MCPC-02` | 懒初始化与差量重建 | 懒初始化, 部分成功, 差量重建, 工具缓存 | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-02` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
+
+配套全局文档：业务域边界与全局铁律见 `.agent/01-business-and-features/00-domain-boundaries.md`；代码分层与放码位置见 `.agent/02-code-structure/architecture-rules.md`。业务域文档共 13 份，非平凡技术机制文档共 6 篇。
+
 ## 1. 目录约定
 
 ### 1.1 Git 仓库内容

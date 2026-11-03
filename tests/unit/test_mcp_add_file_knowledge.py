@@ -78,6 +78,7 @@ class _KnowledgeSync:
         old_file_version_id: str | None = None,
         update_latest: bool = True,
         update_memory: bool = True,
+        repo_key: str | None = None,
     ) -> KnowledgeSyncResult | None:
         self.try_skip_calls.append(
             {
@@ -103,6 +104,7 @@ class _KnowledgeSync:
         update_latest: bool = True,
         update_memory: bool = True,
         replace_existing_job: bool = False,
+        repo_key: str | None = None,
     ) -> KnowledgeSyncResult:
         self.submit_calls.append(
             {
@@ -401,6 +403,7 @@ class _KnowledgeSyncServiceForTest(KnowledgeSyncService):
         project_id: str,
         file_version_id: str,
         old_file_version_id: str | None = None,
+        repo_key: str | None = None,
     ) -> None:
         self.upsert_calls.append((project_id, file_version_id, old_file_version_id))
 

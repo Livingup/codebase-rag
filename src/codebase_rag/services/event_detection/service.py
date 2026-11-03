@@ -8,6 +8,7 @@ structured GitEvent to subscribers (Workflow Orchestrator).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import stat
@@ -17,6 +18,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import EventDetectionConfig
 from codebase_rag.services.event_detection.errors import (
@@ -55,12 +57,6 @@ MANAGED_HOOKS = [
     HookType.POST_CHECKOUT,
     HookType.POST_REWRITE,
 ]
-
-
-def _same_path(left: str, right: str) -> bool:
-    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
-        os.path.abspath(right)
-    )
 
 
 class EventDetectionService:
@@ -199,12 +195,17 @@ class EventDetectionService:
     # =========================================================================
 
     async def register_project(self, project_id: str, git_repo_path: str) -> bool:
-        """Register a project for event monitoring.
+        """Register a repository copy for event monitoring.
 
         1. Validates .git/ exists
         2. Injects hook scripts
         3. Starts filesystem watcher (if enabled)
         4. Reads initial HEAD state as baseline
+
+        Registration is keyed by the canonical repo_key of the local copy:
+        registering another copy of the same project (same project_id,
+        different path) adds an independent entry instead of replacing
+        this one.
 
         Returns True on success.
         """
@@ -213,15 +214,15 @@ class EventDetectionService:
             raise GitRepoNotFoundError(git_repo_path)
 
         head = await self._git_ops.get_head_info(git_repo_path)
+        repo_key = normalize_repo_key(git_repo_path)
 
         async with self._projects_lock:
-            existing = self._projects.get(project_id)
+            existing = self._projects.get(repo_key)
             if existing is not None:
-                path_changed = not _same_path(existing.git_repo_path, git_repo_path)
+                path_changed = existing.git_repo_path != git_repo_path
                 old_path = existing.git_repo_path
-                if path_changed:
-                    await self._stop_watcher(project_id)
-                    existing.git_repo_path = git_repo_path
+                existing.project_id = project_id
+                existing.git_repo_path = git_repo_path
 
                 await self.inject_hooks(project_id, git_repo_path)
                 existing.branch_name = head.branch_name
@@ -248,11 +249,12 @@ class EventDetectionService:
                 git_repo_path=git_repo_path,
                 branch_name=head.branch_name,
                 commit_hash=head.commit_hash,
+                repo_key=repo_key,
             )
 
             await self._sync_project_watcher(state)
 
-            self._projects[project_id] = state
+            self._projects[repo_key] = state
 
         logger.info(
             "project_registered",
@@ -288,8 +290,10 @@ class EventDetectionService:
         if not os.path.isdir(git_dir):
             raise GitRepoNotFoundError(git_repo_path)
 
+        repo_key = normalize_repo_key(git_repo_path)
+
         async with self._projects_lock:
-            if project_id in self._projects:
+            if repo_key in self._projects:
                 logger.info(
                     "project_already_registered",
                     project_id=project_id,
@@ -310,11 +314,12 @@ class EventDetectionService:
                 git_repo_path=git_repo_path,
                 branch_name=last_branch_name,
                 commit_hash=last_commit_hash,
+                repo_key=repo_key,
             )
 
             await self._sync_project_watcher(state)
 
-            self._projects[project_id] = state
+            self._projects[repo_key] = state
 
         logger.info(
             "project_restored",
@@ -351,6 +356,7 @@ class EventDetectionService:
                 commit_hash=current_commit,
                 previous_branch_name=last_branch_name,
                 previous_commit_hash=last_commit_hash or "",
+                git_repo_path=git_repo_path,
                 timestamp=datetime.utcnow(),
             )
             logger.info(
@@ -455,30 +461,48 @@ class EventDetectionService:
 
     async def _on_hook_event(self, event: HookEvent) -> None:
         """Handle a raw hook event from the hook receiver."""
-        await self._on_raw_notification(event.project_id, EventSource.HOOK)
+        if event.git_repo_path:
+            await self._on_raw_notification(
+                normalize_repo_key(event.git_repo_path), EventSource.HOOK,
+            )
+            return
+        # Legacy hooks without repo_path: route only when the project has
+        # exactly one registered copy; otherwise the source is ambiguous.
+        candidates = [
+            key for key, state in self._projects.items()
+            if state.project_id == event.project_id
+        ]
+        if len(candidates) == 1:
+            await self._on_raw_notification(candidates[0], EventSource.HOOK)
+        elif len(candidates) > 1:
+            logger.warning(
+                "hook_event_ambiguous_project_copies",
+                project_id=event.project_id,
+                copies=len(candidates),
+            )
 
     # =========================================================================
     # 2.4 Watcher change callback
     # =========================================================================
 
-    async def _on_watcher_change(self, project_id: str) -> None:
+    async def _on_watcher_change(self, repo_key: str) -> None:
         """Handle a filesystem change detected by the watcher."""
-        await self._on_raw_notification(project_id, EventSource.WATCHER)
+        await self._on_raw_notification(repo_key, EventSource.WATCHER)
 
     # =========================================================================
     # 2.5 Event classification (core logic)
     # =========================================================================
 
     async def _on_raw_notification(
-        self, project_id: str, source: EventSource
+        self, repo_key: str, source: EventSource
     ) -> None:
         """Process a raw notification: dedup → read HEAD → classify → publish."""
-        # Check project is registered
-        state = self._projects.get(project_id)
+        # Check repository copy is registered
+        state = self._projects.get(repo_key)
         if state is None:
             logger.debug(
-                "notification_for_unregistered_project",
-                project_id=project_id,
+                "notification_for_unregistered_repo",
+                repo_key=repo_key,
                 source=source.value,
             )
             return
@@ -486,15 +510,15 @@ class EventDetectionService:
         # Dedup check
         now = time.monotonic()
         window_s = self._config.dedup.window_ms / 1000.0
-        last = self._dedup_timestamps.get(project_id, 0.0)
+        last = self._dedup_timestamps.get(repo_key, 0.0)
         if (now - last) < window_s:
             logger.debug(
                 "event_deduped",
-                project_id=project_id,
+                repo_key=repo_key,
                 source=source.value,
             )
             return
-        self._dedup_timestamps[project_id] = now
+        self._dedup_timestamps[repo_key] = now
 
         # Read current HEAD state
         try:
@@ -502,7 +526,8 @@ class EventDetectionService:
         except Exception:
             logger.exception(
                 "head_read_failed",
-                project_id=project_id,
+                project_id=state.project_id,
+                repo_key=repo_key,
                 repo=state.git_repo_path,
             )
             return
@@ -523,7 +548,7 @@ class EventDetectionService:
             # No change
             logger.debug(
                 "event_no_change",
-                project_id=project_id,
+                repo_key=repo_key,
                 source=source.value,
                 branch=current_branch,
                 commit=current_commit[:8] if current_commit else None,
@@ -538,20 +563,22 @@ class EventDetectionService:
         # Build and publish event
         git_event = GitEvent(
             event_id=str(uuid.uuid4()),
-            project_id=project_id,
+            project_id=state.project_id,
             event_type=event_type,
             source=source,
             branch_name=current_branch,
             commit_hash=current_commit,
             previous_branch_name=prev_branch,
             previous_commit_hash=prev_commit or "",
+            git_repo_path=state.git_repo_path,
             timestamp=datetime.utcnow(),
         )
 
         logger.info(
             "event_classified",
             event_id=git_event.event_id,
-            project_id=project_id,
+            project_id=state.project_id,
+            repo_key=repo_key,
             event_type=event_type.value,
             source=source.value,
             branch=current_branch,
@@ -611,14 +638,16 @@ class EventDetectionService:
             return
 
     async def _check_and_repair_hooks(self) -> None:
-        """Check all registered projects' hooks and re-inject if needed."""
-        # Snapshot current projects (avoid holding lock during I/O)
+        """Check all registered repositories' hooks and re-inject if needed."""
+        # Snapshot current registrations (avoid holding lock during I/O)
         async with self._projects_lock:
             snapshot = list(self._projects.items())
 
-        for project_id, state in snapshot:
+        for repo_key, state in snapshot:
             try:
-                status = await self.check_hooks_status(project_id, state.git_repo_path)
+                status = await self.check_hooks_status(
+                    state.project_id, state.git_repo_path,
+                )
                 needs_repair = any(
                     getattr(status, hook.value.replace("-", "_"))
                     != HookInstallStatus.INSTALLED
@@ -627,17 +656,19 @@ class EventDetectionService:
                 if needs_repair:
                     logger.warning(
                         "hooks_damaged_reinjecting",
-                        project_id=project_id,
+                        project_id=state.project_id,
+                        repo_key=repo_key,
                         post_commit=status.post_commit.value,
                         post_merge=status.post_merge.value,
                         post_checkout=status.post_checkout.value,
                         post_rewrite=status.post_rewrite.value,
                     )
-                    await self.inject_hooks(project_id, state.git_repo_path)
+                    await self.inject_hooks(state.project_id, state.git_repo_path)
             except Exception:
                 logger.exception(
                     "hook_health_check_error",
-                    project_id=project_id,
+                    project_id=state.project_id,
+                    repo_key=repo_key,
                 )
 
     # =========================================================================
@@ -645,11 +676,31 @@ class EventDetectionService:
     # =========================================================================
 
     def get_project_status(self, project_id: str) -> ProjectHeadStatus:
-        """Get the current HEAD status of a monitored project."""
-        state = self._projects.get(project_id)
+        """Get the current HEAD status of a monitored project.
+
+        With multiple registered copies of the same project, the first
+        registered copy is reported.
+        """
+        state = next(
+            (s for s in self._projects.values() if s.project_id == project_id),
+            None,
+        )
         if state is None:
             raise ProjectNotRegisteredError(project_id)
+        return self._build_head_status(state)
 
+    def get_repo_status(self, repo_key: str) -> ProjectHeadStatus:
+        """Get the current HEAD status of one registered repository copy."""
+        state = self._projects.get(repo_key)
+        if state is None:
+            raise ProjectNotRegisteredError(repo_key)
+        return self._build_head_status(state)
+
+    def list_monitored_projects(self) -> List[ProjectHeadStatus]:
+        """List all monitored repository copies with their status."""
+        return [self._build_head_status(state) for state in self._projects.values()]
+
+    def _build_head_status(self, state: ProjectHeadState) -> ProjectHeadStatus:
         hooks_dir = os.path.join(state.git_repo_path, ".git", "hooks")
         hooks_status = HookStatus()
         for hook_type in MANAGED_HOOKS:
@@ -658,7 +709,7 @@ class EventDetectionService:
             setattr(hooks_status, hook_type.value.replace("-", "_"), install_status)
 
         return ProjectHeadStatus(
-            project_id=project_id,
+            project_id=state.project_id,
             git_repo_path=state.git_repo_path,
             branch_name=state.branch_name,
             commit_hash=state.commit_hash,
@@ -667,40 +718,78 @@ class EventDetectionService:
             last_event_time=state.last_event_time,
         )
 
-    def list_monitored_projects(self) -> List[ProjectHeadStatus]:
-        """List all monitored projects with their status."""
-        return [
-            self.get_project_status(pid) for pid in self._projects
-        ]
-
     # =========================================================================
     # 2.8 Project unregistration
     # =========================================================================
 
     async def unregister_project(self, project_id: str) -> bool:
-        """Unregister a project: stop watcher, remove hooks, clear state."""
+        """Unregister every local copy of a project.
+
+        Stops watchers, removes hooks and clears state for all registered
+        repository copies whose project_id matches.
+        """
+        removed = False
         async with self._projects_lock:
-            state = self._projects.get(project_id)
+            targets = [
+                (key, state) for key, state in self._projects.items()
+                if state.project_id == project_id
+            ]
+            for repo_key, state in targets:
+                # Stop watcher
+                await self._stop_watcher(repo_key)
+
+                # Remove hooks (restore user originals)
+                try:
+                    await self.remove_hooks(state.project_id, state.git_repo_path)
+                except Exception:
+                    logger.exception(
+                        "hook_removal_failed_on_unregister",
+                        project_id=state.project_id,
+                        repo_key=repo_key,
+                    )
+
+                # Clear state
+                del self._projects[repo_key]
+                self._dedup_timestamps.pop(repo_key, None)
+                removed = True
+
+        logger.info("project_unregistered", project_id=project_id)
+        return removed
+
+    async def unregister_repo(self, git_repo_path: str) -> bool:
+        """Unregister a single local repository copy.
+
+        Other copies of the same project (same project_id, different
+        paths) keep their watchers and hooks.
+        """
+        repo_key = normalize_repo_key(git_repo_path)
+        async with self._projects_lock:
+            state = self._projects.get(repo_key)
             if state is None:
                 return False
 
             # Stop watcher
-            await self._stop_watcher(project_id)
+            await self._stop_watcher(repo_key)
 
             # Remove hooks (restore user originals)
             try:
-                await self.remove_hooks(project_id, state.git_repo_path)
+                await self.remove_hooks(state.project_id, state.git_repo_path)
             except Exception:
                 logger.exception(
                     "hook_removal_failed_on_unregister",
-                    project_id=project_id,
+                    project_id=state.project_id,
+                    repo_key=repo_key,
                 )
 
             # Clear state
-            del self._projects[project_id]
-            self._dedup_timestamps.pop(project_id, None)
+            del self._projects[repo_key]
+            self._dedup_timestamps.pop(repo_key, None)
 
-        logger.info("project_unregistered", project_id=project_id)
+        logger.info(
+            "repo_unregistered",
+            project_id=state.project_id,
+            repo_key=repo_key,
+        )
         return True
 
     # =========================================================================
@@ -708,10 +797,10 @@ class EventDetectionService:
     # =========================================================================
 
     async def _sync_project_watcher(self, state: ProjectHeadState) -> str:
-        watcher = self._watchers.get(state.project_id)
+        watcher = self._watchers.get(state.repo_key)
         if not self._config.watcher.enabled:
             if watcher:
-                await self._stop_watcher(state.project_id)
+                await self._stop_watcher(state.repo_key)
                 return "stopped"
             state.watcher_active = False
             return "none"
@@ -723,24 +812,25 @@ class EventDetectionService:
         watcher = GitWatcher(
             project_id=state.project_id,
             git_repo_path=state.git_repo_path,
+            repo_key=state.repo_key,
             config=self._config.watcher,
             on_change=self._on_watcher_change,
         )
         watcher.start()
-        self._watchers[state.project_id] = watcher
+        self._watchers[state.repo_key] = watcher
         state.watcher_active = True
         return "started"
 
-    async def _stop_watcher(self, project_id: str) -> bool:
-        watcher = self._watchers.pop(project_id, None)
+    async def _stop_watcher(self, repo_key: str) -> bool:
+        watcher = self._watchers.pop(repo_key, None)
         if watcher is None:
-            state = self._projects.get(project_id)
+            state = self._projects.get(repo_key)
             if state is not None:
                 state.watcher_active = False
             return False
 
         await watcher.stop()
-        state = self._projects.get(project_id)
+        state = self._projects.get(repo_key)
         if state is not None:
             state.watcher_active = False
         return True
@@ -759,7 +849,7 @@ class EventDetectionService:
         """Inject a single hook script, handling conflicts with user hooks."""
         hook_path = os.path.join(hooks_dir, hook_name)
         backup_path = hook_path + HOOK_BACKUP_SUFFIX
-        new_content = self._generate_hook_script(project_id, hook_name)
+        new_content = self._generate_hook_script(project_id, git_repo_path, hook_name)
 
         if os.path.exists(hook_path):
             with open(hook_path, "r", encoding="utf-8") as f:
@@ -780,7 +870,7 @@ class EventDetectionService:
                     )
 
                 wrapper = self._generate_wrapper_script(
-                    project_id, hook_name, backup_path
+                    project_id, git_repo_path, hook_name, backup_path
                 )
                 with open(hook_path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(wrapper)
@@ -793,8 +883,16 @@ class EventDetectionService:
         if platform.system() != "Windows":
             os.chmod(hook_path, os.stat(hook_path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    def _generate_hook_script(self, project_id: str, hook_name: str) -> str:
-        """Generate a hook script that notifies this service."""
+    def _generate_hook_script(
+        self, project_id: str, git_repo_path: str, hook_name: str,
+    ) -> str:
+        """Generate a hook script that notifies this service.
+
+        The payload carries both the project_id (data partition) and the
+        repository path (local copy identity) so events from multiple
+        registered copies of the same project stay distinguishable.
+        """
+        payload = self._hook_payload(project_id, git_repo_path, hook_name)
         if self._config.hook_receiver.mode == "http":
             http_cfg = self._config.hook_receiver.http
             url = f"http://{http_cfg.host}:{http_cfg.port}{http_cfg.endpoint}"
@@ -805,9 +903,7 @@ class EventDetectionService:
                 "\n"
                 f'curl -s -X POST "{url}" \\\n'
                 '  -H "Content-Type: application/json" \\\n'
-                f'  -d \'{{"project_id":"{project_id}",'
-                f'"hook_type":"{hook_name}",'
-                f'"args":"$@"}}\' \\\n'
+                f"  -d '{payload}' \\\n"
                 "  --max-time 2 \\\n"
                 "  || true  # Failure must not block Git operations\n"
             )
@@ -819,15 +915,15 @@ class EventDetectionService:
                 f"{HOOK_MARKER} - DO NOT EDIT\n"
                 "# Managed by Codebase RAG Event Detection Service\n"
                 "\n"
-                f'echo \'{{"project_id":"{project_id}",'
-                f'"hook_type":"{hook_name}",'
-                f'"args":"$@"}}\' > "{pipe_path}" 2>/dev/null || true\n'
+                f"echo '{payload}' > \"{pipe_path}\" 2>/dev/null || true\n"
             )
 
     def _generate_wrapper_script(
-        self, project_id: str, hook_name: str, backup_path: str
+        self, project_id: str, git_repo_path: str, hook_name: str,
+        backup_path: str,
     ) -> str:
         """Generate a wrapper script that runs user's original hook first, then ours."""
+        payload = self._hook_payload(project_id, git_repo_path, hook_name)
         if self._config.hook_receiver.mode == "http":
             http_cfg = self._config.hook_receiver.http
             url = f"http://{http_cfg.host}:{http_cfg.port}{http_cfg.endpoint}"
@@ -845,9 +941,7 @@ class EventDetectionService:
                 "# Notify Codebase RAG\n"
                 f'curl -s -X POST "{url}" \\\n'
                 '  -H "Content-Type: application/json" \\\n'
-                f'  -d \'{{"project_id":"{project_id}",'
-                f'"hook_type":"{hook_name}",'
-                f'"args":"$@"}}\' \\\n'
+                f"  -d '{payload}' \\\n"
                 "  --max-time 2 \\\n"
                 "  || true\n"
             )
@@ -862,9 +956,7 @@ class EventDetectionService:
                 f'  "{backup_path}" "$@"\n'
                 "fi\n"
                 "\n"
-                f'echo \'{{"project_id":"{project_id}",'
-                f'"hook_type":"{hook_name}",'
-                f'"args":"$@"}}\' > "{pipe_path}" 2>/dev/null || true\n'
+                f"echo '{payload}' > \"{pipe_path}\" 2>/dev/null || true\n"
             )
 
     def _check_single_hook_status(self, hook_path: str) -> HookInstallStatus:
@@ -884,3 +976,19 @@ class EventDetectionService:
         # Check if the hook content matches what we'd generate
         # (simplified: just verify the marker is present)
         return HookInstallStatus.INSTALLED
+
+    @staticmethod
+    def _hook_payload(project_id: str, git_repo_path: str, hook_name: str) -> str:
+        """Build the JSON notification payload embedded in hook scripts.
+
+        ``args`` keeps the literal ``"$@"`` placeholder — the receiver
+        treats it as opaque.  Single quotes are shell-escaped so the
+        payload stays one argument inside ``-d '<payload>'`` / ``echo``.
+        """
+        payload = json.dumps({
+            "project_id": project_id,
+            "repo_path": git_repo_path,
+            "hook_type": hook_name,
+            "args": "$@",
+        })
+        return payload.replace("'", "'\\''")

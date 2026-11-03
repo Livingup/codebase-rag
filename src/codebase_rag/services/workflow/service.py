@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Set
 from qdrant_client import models
 
 from codebase_rag.common.logging import get_logger
+from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.common.token_counter import TokenCounter
 from codebase_rag.common.types import SparseVector
 from codebase_rag.config.loader import ConfigManager
@@ -95,10 +96,13 @@ class WorkflowOrchestratorService:
         self._task_queue = ProjectTaskQueue()
         self._task_queue.set_executor(self._execute_task)
 
-        # Project repo path registry (set by caller via register_project)
+        # Repository copy registry (set by caller via register_project):
+        # repo_key → project_id.  The repo_key (canonical normalized path)
+        # doubles as a usable path for Git operations, and one project_id
+        # may map from multiple repo_keys (multiple local copies).
         self._project_repos: Dict[str, str] = {}
 
-        # Current task info per project (for status queries)
+        # Current task info per repository copy (for status queries)
         self._current_tasks: Dict[str, TaskInfo] = {}
         self._last_completed: Dict[str, TaskInfo] = {}
 
@@ -223,12 +227,12 @@ class WorkflowOrchestratorService:
         logger.info("workflow_service_shutdown")
 
     def register_project(self, project_id: str, repo_path: str) -> None:
-        """Register a project's repo path (called by management API).
+        """Register a repository copy's project mapping (called by management API).
 
         Also loads persisted retry/dead-letter queues so the background
         compensation task can pick them up after service restart.
         """
-        self._project_repos[project_id] = repo_path
+        self._project_repos[normalize_repo_key(repo_path)] = project_id
         # Load persisted queues (idempotent — skips if already in memory)
         if project_id not in self._retry_queues:
             loaded = self._load_retry_queue(project_id)
@@ -245,8 +249,24 @@ class WorkflowOrchestratorService:
                 self._dead_letters[project_id] = loaded
 
     def unregister_project(self, project_id: str) -> None:
-        """Unregister a project."""
-        self._project_repos.pop(project_id, None)
+        """Unregister every local copy of a project."""
+        stale_keys = [
+            repo_key for repo_key, pid in self._project_repos.items()
+            if pid == project_id
+        ]
+        for repo_key in stale_keys:
+            del self._project_repos[repo_key]
+
+    def unregister_repo(self, repo_path: str) -> None:
+        """Unregister a single local repository copy."""
+        self._project_repos.pop(normalize_repo_key(repo_path), None)
+
+    def get_repo_key_for_project(self, project_id: str) -> Optional[str]:
+        """Return the first registered repo_key of a project, if any."""
+        for repo_key, pid in self._project_repos.items():
+            if pid == project_id:
+                return repo_key
+        return None
 
     def rebrand_project_id(
         self, old_project_id: str, new_project_id: str,
@@ -304,10 +324,11 @@ class WorkflowOrchestratorService:
                     affected += 1
             self._dead_letters[new_project_id] = dl
 
-        if old_project_id in self._project_repos:
-            self._project_repos[new_project_id] = self._project_repos.pop(
-                old_project_id,
-            )
+        # Registry keys are repo_keys (no project_id inside), so only the
+        # mapped project_id values need rewriting.
+        for repo_key, pid in list(self._project_repos.items()):
+            if pid == old_project_id:
+                self._project_repos[repo_key] = new_project_id
 
         logger.info(
             "workflow_rebrand_project_id_done",
@@ -323,11 +344,12 @@ class WorkflowOrchestratorService:
 
     async def on_git_event(self, event: GitEvent) -> None:
         """Receive a GitEvent and dispatch to appropriate workflow."""
-        repo_path = self._project_repos.get(event.project_id)
-        if repo_path is None:
+        repo_key = self._resolve_repo_key_from_event(event)
+        if repo_key is None:
             logger.warning(
-                "workflow_event_unknown_project",
+                "workflow_event_unroutable_repo",
                 project_id=event.project_id,
+                repo=getattr(event, "git_repo_path", "") or "",
             )
             return
 
@@ -335,6 +357,7 @@ class WorkflowOrchestratorService:
             "workflow_event_received",
             event_id=event.event_id,
             project_id=event.project_id,
+            repo_key=repo_key,
             event_type=event.event_type.value,
             branch=event.branch_name,
             commit=event.commit_hash[:8],
@@ -347,6 +370,7 @@ class WorkflowOrchestratorService:
             task = WorkflowTask(
                 task_type="branch_switch",
                 project_id=event.project_id,
+                repo_key=repo_key,
                 kwargs={
                     "branch_name": event.branch_name,
                     "commit_hash": event.commit_hash,
@@ -358,6 +382,7 @@ class WorkflowOrchestratorService:
             task = WorkflowTask(
                 task_type="content_commit",
                 project_id=event.project_id,
+                repo_key=repo_key,
                 kwargs={
                     "branch_name": event.branch_name,
                     "commit_hash": event.commit_hash,
@@ -370,13 +395,35 @@ class WorkflowOrchestratorService:
 
         self._task_queue.enqueue(task)
 
+    def _resolve_repo_key_from_event(self, event: GitEvent) -> Optional[str]:
+        """Map an event to the registered repository copy it originated from."""
+        if event.git_repo_path:
+            repo_key = normalize_repo_key(event.git_repo_path)
+            if repo_key in self._project_repos:
+                return repo_key
+            return None
+        # Legacy events without a repo path: route only when the project
+        # has exactly one registered copy.
+        matches = [
+            repo_key for repo_key, pid in self._project_repos.items()
+            if pid == event.project_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def enqueue_initialization(
-        self, project_id: str, branch_name: str, commit_hash: str,
+        self,
+        project_id: str,
+        repo_path: str,
+        branch_name: str,
+        commit_hash: str,
     ) -> None:
-        """Enqueue a full initialization task via the project task queue."""
+        """Enqueue a full initialization task for one repository copy."""
         task = WorkflowTask(
             task_type="initialization",
             project_id=project_id,
+            repo_key=normalize_repo_key(repo_path),
             kwargs={"branch_name": branch_name, "commit_hash": commit_hash},
         )
         self._task_queue.enqueue(task)
@@ -384,14 +431,16 @@ class WorkflowOrchestratorService:
     def enqueue_content_commit(
         self,
         project_id: str,
+        repo_path: str,
         branch_name: str,
         commit_hash: str,
         previous_commit: str,
     ) -> None:
-        """Enqueue a content commit task via the project task queue."""
+        """Enqueue a content commit task for one repository copy."""
         task = WorkflowTask(
             task_type="content_commit",
             project_id=project_id,
+            repo_key=normalize_repo_key(repo_path),
             kwargs={
                 "branch_name": branch_name,
                 "commit_hash": commit_hash,
@@ -407,29 +456,31 @@ class WorkflowOrchestratorService:
     async def workflow_branch_switch(
         self,
         project_id: str,
+        repo_key: str,
         branch_name: str,
         commit_hash: str,
         previous_branch: Optional[str],
         previous_commit: Optional[str],
     ) -> BranchSwitchResult:
-        """Execute branch switch — update in-memory instance."""
+        """Execute branch switch — update the copy's in-memory instance."""
         start_ms = time.monotonic() * 1000
-        repo_path = self._project_repos.get(project_id, "")
+        repo_path = repo_key
 
         logger.info(
             "workflow_branch_switch_start",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             commit=commit_hash[:8],
         )
 
         # Step 1: Check cache
         cached = await self._memory.get_cached_instance(
-            project_id, branch_name, commit_hash,
+            repo_key, branch_name, commit_hash,
         )
         if cached is not None:
             await self._memory.set_active_instance(
-                project_id, branch_name, commit_hash,
+                repo_key, branch_name, commit_hash,
             )
             duration = int(time.monotonic() * 1000 - start_ms)
             logger.info(
@@ -450,10 +501,10 @@ class WorkflowOrchestratorService:
 
         # Step 3: Get current in-memory file_version_ids (if active instance exists)
         mem_versions: Set[str] = set()
-        active_info = await self._memory.get_active_instance_info(project_id)
+        active_info = await self._memory.get_active_instance_info(repo_key)
         if active_info is not None:
             active_handle = await self._memory.get_cached_instance(
-                project_id, active_info.branch_name, active_info.commit_hash,
+                repo_key, active_info.branch_name, active_info.commit_hash,
             )
             if active_handle is not None:
                 mem_versions = await self._memory.get_all_file_version_ids(active_handle)
@@ -474,7 +525,8 @@ class WorkflowOrchestratorService:
         # Step 5: Create a staging in-memory instance and keep the old active
         # searchable until the new instance has fully loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash, staging=True,
+            repo_key, branch_name, commit_hash,
+            project_id=project_id, staging=True,
         )
 
         try:
@@ -494,7 +546,7 @@ class WorkflowOrchestratorService:
 
             # Step 7: Promote only after the staged load succeeds.
             await self._memory.set_active_handle(handle)
-            await self._memory.destroy_inactive_instances(project_id)
+            await self._memory.destroy_inactive_instances(repo_key)
         except Exception:
             await self._memory.destroy_instance(handle)
             logger.exception(
@@ -529,25 +581,29 @@ class WorkflowOrchestratorService:
     # 2.2b Lazy rebuild — reconstruct in-memory instance from Qdrant Server
     # =========================================================================
 
-    async def rebuild_memory_instance(self, project_id: str) -> None:
-        """Rebuild an in-memory instance from Qdrant Server for a project.
+    async def rebuild_memory_instance(self, repo_key: str) -> None:
+        """Rebuild an in-memory instance from Qdrant Server for one repo copy.
 
         Called by MemoryQdrantService's rebuild handler when a search request
-        arrives but no active instance exists (e.g. after idle eviction).
+        arrives for a copy that has no active instance (e.g. after idle
+        eviction).  The repo_key identifies the local copy; its project_id
+        (Qdrant partition) is resolved from the registry.
 
         Flow:
-          1. Look up repo_path from registered projects
-          2. Read current HEAD (branch + commit)
+          1. Resolve project_id from the registered repository copy
+          2. Read current HEAD (branch + commit) from the copy
           3. Get file tree → compute file_version_ids
           4. Create in-memory instance
           5. Batch load Points from Qdrant Server
           6. Set as active instance
         """
-        repo_path = self._project_repos.get(project_id)
-        if not repo_path:
+        project_id = self._project_repos.get(repo_key)
+        if not project_id:
             raise WorkflowError(
-                f"Cannot rebuild: project '{project_id}' not registered in workflow."
+                f"Cannot rebuild: repository copy '{repo_key}' is not registered "
+                "in workflow."
             )
+        repo_path = repo_key
 
         start_ms = time.monotonic() * 1000
 
@@ -559,21 +615,23 @@ class WorkflowOrchestratorService:
         logger.info(
             "rebuild_memory_start",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             commit=commit_hash[:8],
         )
 
         # Step 2: Check if already cached (race condition guard)
         cached = await self._memory.get_cached_instance(
-            project_id, branch_name, commit_hash,
+            repo_key, branch_name, commit_hash,
         )
         if cached is not None:
             await self._memory.set_active_instance(
-                project_id, branch_name, commit_hash,
+                repo_key, branch_name, commit_hash,
             )
             logger.info(
                 "rebuild_memory_cache_hit",
                 project_id=project_id,
+                repo_key=repo_key,
             )
             return
 
@@ -586,7 +644,8 @@ class WorkflowOrchestratorService:
         # Step 4: Create a staging instance so an existing active instance is
         # preserved until the replacement is fully loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash, staging=True,
+            repo_key, branch_name, commit_hash,
+            project_id=project_id, staging=True,
         )
 
         try:
@@ -600,12 +659,13 @@ class WorkflowOrchestratorService:
 
             # Step 6: Promote the staged instance after successful load.
             await self._memory.set_active_handle(handle)
-            await self._memory.destroy_inactive_instances(project_id)
+            await self._memory.destroy_inactive_instances(repo_key)
         except Exception:
             await self._memory.destroy_instance(handle)
             logger.exception(
                 "rebuild_memory_staging_failed",
                 project_id=project_id,
+                repo_key=repo_key,
                 branch=branch_name,
                 commit=commit_hash[:8],
             )
@@ -615,6 +675,7 @@ class WorkflowOrchestratorService:
         logger.info(
             "rebuild_memory_complete",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             files_loaded=files_loaded,
             points_loaded=points_loaded,
@@ -628,17 +689,19 @@ class WorkflowOrchestratorService:
     async def workflow_content_commit(
         self,
         project_id: str,
+        repo_key: str,
         branch_name: str,
         commit_hash: str,
         previous_commit: str,
     ) -> ContentCommitResult:
-        """Execute knowledge production for a content commit."""
+        """Execute knowledge production for a content commit on one copy."""
         start = time.monotonic()
-        repo_path = self._project_repos.get(project_id, "")
+        repo_path = repo_key
 
         logger.info(
             "workflow_content_commit_start",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             commit=commit_hash[:8],
             prev_commit=previous_commit[:8],
@@ -694,7 +757,7 @@ class WorkflowOrchestratorService:
                     pts, skipped, agents, cache_hit = await self._process_file_with_agent(
                         project_id, repo_path, entry.file_path,
                         entry.blob_hash, entry.file_version_id,
-                        is_new=True,
+                        is_new=True, repo_key=repo_key,
                     )
                     total_points += pts
                     total_agent_calls += agents
@@ -738,6 +801,7 @@ class WorkflowOrchestratorService:
                         is_new=False,
                         old_descriptions=old_descriptions,
                         old_file_version_id=entry.old_file_version_id,
+                        repo_key=repo_key,
                     )
                     total_points += pts
                     total_agent_calls += agents
@@ -769,7 +833,7 @@ class WorkflowOrchestratorService:
         async def _process_deleted(entry) -> None:
             nonlocal deleted_count
             try:
-                await self._delete_from_memory(project_id, entry.file_version_id)
+                await self._delete_from_memory(project_id, repo_key, entry.file_version_id)
                 deleted_count += 1
             except Exception as e:
                 failed_files.append(FailedFile(entry.file_path, str(e)))
@@ -817,6 +881,7 @@ class WorkflowOrchestratorService:
                         old_file_version_id=entry.old_file_version_id,
                         update_latest=True,
                         update_memory=True,
+                        repo_key=repo_key,
                     )
                     if sync_result.cancelled_stale or sync_result.skipped_existing:
                         return
@@ -864,7 +929,7 @@ class WorkflowOrchestratorService:
 
         # Step 3: Update cache key
         await self._memory.update_cache_commit(
-            project_id, branch_name, previous_commit, commit_hash,
+            repo_key, branch_name, previous_commit, commit_hash,
         )
 
         duration = time.monotonic() - start
@@ -904,10 +969,11 @@ class WorkflowOrchestratorService:
     async def workflow_full_initialization(
         self,
         project_id: str,
+        repo_key: str,
         branch_name: str,
         commit_hash: str,
     ) -> InitializationResult:
-        """Full knowledge production for all files in a branch.
+        """Full knowledge production for all files in a branch of one copy.
 
         When ``initialization.mode`` is ``"incremental"``, skip the full scan
         and create an empty in-memory instance directly so that subsequent
@@ -916,15 +982,16 @@ class WorkflowOrchestratorService:
         # --- incremental mode: empty start ---
         if self._config.initialization.mode == "incremental":
             return await self._incremental_initialization(
-                project_id, branch_name, commit_hash,
+                project_id, repo_key, branch_name, commit_hash,
             )
 
         start = time.monotonic()
-        repo_path = self._project_repos.get(project_id, "")
+        repo_path = repo_key
 
         logger.info(
             "workflow_initialization_start",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             commit=commit_hash[:8],
         )
@@ -942,7 +1009,7 @@ class WorkflowOrchestratorService:
         failed_files: List[FailedFile] = []
         progress = Progress(total_files=len(file_tree))
 
-        self._current_tasks[project_id] = TaskInfo(
+        self._current_tasks[repo_key] = TaskInfo(
             task_type="initialization",
             project_id=project_id,
             progress=progress,
@@ -974,6 +1041,7 @@ class WorkflowOrchestratorService:
                         project_id, repo_path, entry.file_path,
                         entry.blob_hash, fvid, is_new=True,
                         sync_source="initialization_backfill",
+                        repo_key=repo_key,
                     )
                     async with progress_lock:
                         total_points += pts
@@ -1010,7 +1078,8 @@ class WorkflowOrchestratorService:
         # Step 5: Build a staging in-memory instance, then promote only after
         # all readable persistent points have been loaded successfully.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash, staging=True,
+            repo_key, branch_name, commit_hash,
+            project_id=project_id, staging=True,
         )
         try:
             files_loaded, memory_points_loaded = await self._batch_load_qdrant_to_memory(
@@ -1022,7 +1091,7 @@ class WorkflowOrchestratorService:
 
             # Step 6: Set as active
             await self._memory.set_active_handle(handle)
-            await self._memory.destroy_inactive_instances(project_id)
+            await self._memory.destroy_inactive_instances(repo_key)
         except Exception:
             await self._memory.destroy_instance(handle)
             logger.exception(
@@ -1033,7 +1102,7 @@ class WorkflowOrchestratorService:
             )
             raise
 
-        self._current_tasks.pop(project_id, None)
+        self._current_tasks.pop(repo_key, None)
 
         duration = time.monotonic() - start
 
@@ -1061,6 +1130,7 @@ class WorkflowOrchestratorService:
     async def _incremental_initialization(
         self,
         project_id: str,
+        repo_key: str,
         branch_name: str,
         commit_hash: str,
     ) -> InitializationResult:
@@ -1070,11 +1140,12 @@ class WorkflowOrchestratorService:
         The knowledge base grows as the user makes commits.
         """
         start = time.monotonic()
-        repo_path = self._project_repos.get(project_id, "")
+        repo_path = repo_key
 
         logger.info(
             "workflow_incremental_initialization_start",
             project_id=project_id,
+            repo_key=repo_key,
             branch=branch_name,
             commit=commit_hash[:8],
         )
@@ -1099,7 +1170,8 @@ class WorkflowOrchestratorService:
         # Step 3: Create a staging in-memory instance. Do not replace any
         # existing active instance until all persisted points are loaded.
         handle = await self._memory.create_instance(
-            project_id, branch_name, commit_hash, staging=True,
+            repo_key, branch_name, commit_hash,
+            project_id=project_id, staging=True,
         )
 
         try:
@@ -1113,12 +1185,13 @@ class WorkflowOrchestratorService:
 
             # Step 5: Set as active only after the staged load succeeds.
             await self._memory.set_active_handle(handle)
-            await self._memory.destroy_inactive_instances(project_id)
+            await self._memory.destroy_inactive_instances(repo_key)
         except Exception:
             await self._memory.destroy_instance(handle)
             logger.exception(
                 "workflow_incremental_memory_staging_failed",
                 project_id=project_id,
+                repo_key=repo_key,
                 branch=branch_name,
                 commit=commit_hash[:8],
             )
@@ -1148,12 +1221,12 @@ class WorkflowOrchestratorService:
     # 2.5 Workflow status query
     # =========================================================================
 
-    def get_workflow_status(self, project_id: str) -> WorkflowStatus:
-        """Get current workflow status for a project."""
+    def get_workflow_status(self, repo_key: str) -> WorkflowStatus:
+        """Get current workflow status for a repository copy."""
         return WorkflowStatus(
-            current_task=self._current_tasks.get(project_id),
-            queued_tasks=self._task_queue.get_queue_depth(project_id),
-            last_completed=self._last_completed.get(project_id),
+            current_task=self._current_tasks.get(repo_key),
+            queued_tasks=self._task_queue.get_queue_depth(repo_key),
+            last_completed=self._last_completed.get(repo_key),
         )
 
     # =========================================================================
@@ -1173,12 +1246,15 @@ class WorkflowOrchestratorService:
         skip_memory_update: bool = False,
         sync_source: KnowledgeSyncSource = "commit_event",
         update_latest: bool = True,
+        repo_key: Optional[str] = None,
     ) -> tuple:
         """Process a single file via knowledge_producer agent with tool calling.
 
         Args:
             skip_memory_update: If True, skip in-memory Qdrant update (used by
                 compensation task which only writes to persistent storage).
+            repo_key: Repository copy whose in-memory instance receives the
+                update; when None the memory refresh is skipped.
 
         Returns (points_written, skipped, agent_calls, cache_hit).
         """
@@ -1208,9 +1284,13 @@ class WorkflowOrchestratorService:
                 file_version_id=file_version_id[:16],
             )
             if not skip_memory_update:
-                await self._upsert_to_memory_from_qdrant(project_id, file_version_id)
+                await self._upsert_to_memory_from_qdrant(
+                    project_id, repo_key, file_version_id,
+                )
                 if old_file_version_id:
-                    await self._delete_from_memory(project_id, old_file_version_id)
+                    await self._delete_from_memory(
+                        project_id, repo_key, old_file_version_id,
+                    )
             return (0, True, 0, False)
 
         if self._knowledge_sync.has_ready_job(project_id, file_version_id):
@@ -1218,6 +1298,7 @@ class WorkflowOrchestratorService:
                 project_id,
                 file_version_id,
                 update_memory=not skip_memory_update,
+                repo_key=repo_key,
             )
             if sync_result.cancelled_stale or sync_result.skipped_existing:
                 return (0, True, 0, True)
@@ -1379,6 +1460,7 @@ class WorkflowOrchestratorService:
                 old_file_version_id=old_file_version_id,
                 update_latest=update_latest,
                 update_memory=not skip_memory_update,
+                repo_key=repo_key,
             )
             if sync_result.cancelled_stale or sync_result.skipped_existing:
                 return (0, True, 1, False)
@@ -1431,15 +1513,17 @@ class WorkflowOrchestratorService:
         return loaded_files, loaded_points
 
     async def _upsert_to_memory_from_qdrant(
-        self, project_id: str, file_version_id: str,
+        self, project_id: str, repo_key: Optional[str], file_version_id: str,
     ) -> None:
-        """Load points from Qdrant and upsert into active in-memory instance."""
-        active_info = await self._memory.get_active_instance_info(project_id)
+        """Load points from Qdrant and upsert into a copy's active instance."""
+        if repo_key is None:
+            return
+        active_info = await self._memory.get_active_instance_info(repo_key)
         if active_info is None:
             return
 
         handle = await self._memory.get_cached_instance(
-            project_id, active_info.branch_name, active_info.commit_hash,
+            repo_key, active_info.branch_name, active_info.commit_hash,
         )
         if handle is None:
             return
@@ -1454,20 +1538,23 @@ class WorkflowOrchestratorService:
             logger.debug(
                 "memory_upsert_from_qdrant",
                 project_id=project_id,
+                repo_key=repo_key,
                 file_version_id=file_version_id[:16],
                 points=loaded_points,
             )
 
     async def _delete_from_memory(
-        self, project_id: str, file_version_id: str,
+        self, project_id: str, repo_key: Optional[str], file_version_id: str,
     ) -> None:
-        """Delete points from active in-memory instance."""
-        active_info = await self._memory.get_active_instance_info(project_id)
+        """Delete points from a copy's active in-memory instance."""
+        if repo_key is None:
+            return
+        active_info = await self._memory.get_active_instance_info(repo_key)
         if active_info is None:
             return
 
         handle = await self._memory.get_cached_instance(
-            project_id, active_info.branch_name, active_info.commit_hash,
+            repo_key, active_info.branch_name, active_info.commit_hash,
         )
         if handle is None:
             return
@@ -1476,6 +1563,7 @@ class WorkflowOrchestratorService:
         logger.debug(
             "memory_delete_file_version",
             project_id=project_id,
+            repo_key=repo_key,
             file_version_id=file_version_id[:16],
         )
 
@@ -1568,29 +1656,42 @@ class WorkflowOrchestratorService:
 
     async def _execute_task(self, task: WorkflowTask) -> None:
         """Execute a workflow task (called by ProjectTaskQueue)."""
-        project_id = task.project_id
-        repo_path = self._project_repos.get(project_id, "")
+        repo_key = task.repo_key or self._resolve_repo_key_for_project(
+            task.project_id,
+        )
+        if not repo_key or repo_key not in self._project_repos:
+            logger.warning(
+                "workflow_task_repo_not_registered",
+                project_id=task.project_id,
+                repo_key=task.repo_key,
+            )
+            return
+
+        project_id = self._project_repos.get(repo_key, task.project_id)
 
         task_info = TaskInfo(
             task_type=task.task_type,
             project_id=project_id,
         )
-        self._current_tasks[project_id] = task_info
+        self._current_tasks[repo_key] = task_info
 
         try:
             if task.task_type == "branch_switch":
                 await self.workflow_branch_switch(
                     project_id=project_id,
+                    repo_key=repo_key,
                     **task.kwargs,
                 )
             elif task.task_type == "content_commit":
                 await self.workflow_content_commit(
                     project_id=project_id,
+                    repo_key=repo_key,
                     **task.kwargs,
                 )
             elif task.task_type == "initialization":
                 await self.workflow_full_initialization(
                     project_id=project_id,
+                    repo_key=repo_key,
                     **task.kwargs,
                 )
             else:
@@ -1599,8 +1700,16 @@ class WorkflowOrchestratorService:
                     task_type=task.task_type,
                 )
         finally:
-            self._last_completed[project_id] = task_info
-            self._current_tasks.pop(project_id, None)
+            self._last_completed[repo_key] = task_info
+            self._current_tasks.pop(repo_key, None)
+
+    def _resolve_repo_key_for_project(self, project_id: str) -> str:
+        """Resolve a legacy task's repo_key: valid only for single-copy projects."""
+        matches = [
+            repo_key for repo_key, pid in self._project_repos.items()
+            if pid == project_id
+        ]
+        return matches[0] if len(matches) == 1 else ""
 
     # =========================================================================
     # Internal: agent registration
@@ -2343,7 +2452,10 @@ class WorkflowOrchestratorService:
 
                 # Collect all pending records across projects
                 all_records: List[FailedFileRecord] = []
-                for project_id in list(self._project_repos):
+                registered_project_ids = {
+                    pid for pid in self._project_repos.values()
+                }
+                for project_id in registered_project_ids:
                     if project_id not in self._retry_queues:
                         self._retry_queues[project_id] = self._load_retry_queue(
                             project_id,
@@ -2424,7 +2536,12 @@ class WorkflowOrchestratorService:
         """
         comp_cfg = self._config.compensation
         project_id = record.project_id
-        repo_path = self._project_repos.get(project_id)
+        # Any registered copy holding the blob works: try them in order.
+        repo_candidates = [
+            repo_key for repo_key, pid in self._project_repos.items()
+            if pid == project_id
+        ]
+        repo_path = repo_candidates[0] if repo_candidates else None
 
         if not repo_path:
             logger.warning(

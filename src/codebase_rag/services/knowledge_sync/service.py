@@ -73,6 +73,7 @@ class KnowledgeSyncService:
         update_latest: bool = True,
         update_memory: bool = True,
         replace_existing_job: bool = False,
+        repo_key: Optional[str] = None,
     ) -> KnowledgeSyncResult:
         self._check_initialized()
         file_lock_key = self._file_lock_key(project_id, file_path)
@@ -96,11 +97,12 @@ class KnowledgeSyncService:
                     result = await self._publish_locked(
                         current,
                         update_memory=update_memory,
+                        repo_key=repo_key,
                     )
                     if result.error and update_memory:
                         await self._refresh_memory_best_effort(
                             project_id, file_version_id, current.old_file_version_id,
-                            points=current.points,
+                            points=current.points, repo_key=repo_key,
                         )
                     return result
 
@@ -114,10 +116,13 @@ class KnowledgeSyncService:
                     old_file_version_id=old_file_version_id,
                 )
                 self._store.put_job(job)
-                result = await self._publish_locked(job, update_memory=update_memory)
+                result = await self._publish_locked(
+                    job, update_memory=update_memory, repo_key=repo_key,
+                )
                 if result.error and update_memory:
                     await self._refresh_memory_best_effort(
-                        project_id, file_version_id, old_file_version_id, points=points,
+                        project_id, file_version_id, old_file_version_id,
+                        points=points, repo_key=repo_key,
                     )
                 return result
 
@@ -126,6 +131,7 @@ class KnowledgeSyncService:
         project_id: str,
         file_version_id: str,
         update_memory: bool = True,
+        repo_key: Optional[str] = None,
     ) -> KnowledgeSyncResult:
         self._check_initialized()
         lock_key = self._version_lock_key(project_id, file_version_id)
@@ -134,7 +140,9 @@ class KnowledgeSyncService:
             if existing.get(file_version_id, False):
                 self._remove_job_best_effort(project_id, file_version_id)
                 if update_memory:
-                    await self._refresh_memory_best_effort(project_id, file_version_id)
+                    await self._refresh_memory_best_effort(
+                        project_id, file_version_id, repo_key=repo_key,
+                    )
                 return KnowledgeSyncResult(
                     file_version_id=file_version_id,
                     points_count=0,
@@ -149,11 +157,13 @@ class KnowledgeSyncService:
                     published=False,
                     error="knowledge_sync_job_not_found",
                 )
-            result = await self._publish_locked(job, update_memory=update_memory)
+            result = await self._publish_locked(
+                job, update_memory=update_memory, repo_key=repo_key,
+            )
             if result.error and update_memory:
                 await self._refresh_memory_best_effort(
                     project_id, file_version_id, job.old_file_version_id,
-                    points=job.points,
+                    points=job.points, repo_key=repo_key,
                 )
             return result
 
@@ -165,6 +175,7 @@ class KnowledgeSyncService:
         old_file_version_id: Optional[str] = None,
         update_latest: bool = True,
         update_memory: bool = True,
+        repo_key: Optional[str] = None,
     ) -> Optional[KnowledgeSyncResult]:
         """Return a skipped-existing result if Qdrant already has this file version.
 
@@ -191,6 +202,7 @@ class KnowledgeSyncService:
                 if update_memory:
                     await self._refresh_memory_best_effort(
                         project_id, file_version_id, old_file_version_id,
+                        repo_key=repo_key,
                     )
                 return KnowledgeSyncResult(
                     file_version_id=file_version_id,
@@ -256,12 +268,16 @@ class KnowledgeSyncService:
         project_id: str,
         file_version_id: str,
         old_file_version_id: Optional[str] = None,
+        repo_key: Optional[str] = None,
     ) -> None:
-        active_info = await self._memory.get_active_instance_info(project_id)
+        if repo_key is None:
+            # No target repository copy — nothing to refresh.
+            return
+        active_info = await self._memory.get_active_instance_info(repo_key)
         if active_info is None:
             return
         handle = await self._memory.get_cached_instance(
-            project_id, active_info.branch_name, active_info.commit_hash,
+            repo_key, active_info.branch_name, active_info.commit_hash,
         )
         if handle is None:
             return
@@ -277,12 +293,16 @@ class KnowledgeSyncService:
         file_version_id: str,
         points_data: List[PointData],
         old_file_version_id: Optional[str] = None,
+        repo_key: Optional[str] = None,
     ) -> None:
-        active_info = await self._memory.get_active_instance_info(project_id)
+        if repo_key is None:
+            # No target repository copy — nothing to refresh.
+            return
+        active_info = await self._memory.get_active_instance_info(repo_key)
         if active_info is None:
             return
         handle = await self._memory.get_cached_instance(
-            project_id, active_info.branch_name, active_info.commit_hash,
+            repo_key, active_info.branch_name, active_info.commit_hash,
         )
         if handle is None:
             return
@@ -301,6 +321,7 @@ class KnowledgeSyncService:
         self,
         job: KnowledgeSyncJob,
         update_memory: bool,
+        repo_key: Optional[str] = None,
     ) -> KnowledgeSyncResult:
         latest = self._store.get_latest(job.project_id, job.file_path)
         if latest is not None and latest != job.file_version_id:
@@ -349,6 +370,7 @@ class KnowledgeSyncService:
         if update_memory:
             await self._refresh_memory_best_effort(
                 job.project_id, job.file_version_id, job.old_file_version_id,
+                repo_key=repo_key,
             )
         if not skipped_existing:
             logger.info(
@@ -383,16 +405,24 @@ class KnowledgeSyncService:
         old_file_version_id: Optional[str] = None,
         *,
         points: Optional[List[PointData]] = None,
+        repo_key: Optional[str] = None,
     ) -> None:
-        """Refresh existing memory only; preserve receipts and cancellation."""
+        """Refresh existing memory only; preserve receipts and cancellation.
+
+        ``repo_key`` selects which local copy's in-memory instance gets
+        refreshed; when None the refresh is a no-op (the job receipt and
+        persistent result are unaffected).
+        """
         try:
             if points is None:
                 await self.upsert_memory_from_qdrant(
                     project_id, file_version_id, old_file_version_id,
+                    repo_key=repo_key,
                 )
             else:
                 await self.upsert_memory_points(
                     project_id, file_version_id, points, old_file_version_id,
+                    repo_key=repo_key,
                 )
         except Exception:
             logger.exception(
