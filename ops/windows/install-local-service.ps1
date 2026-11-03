@@ -96,8 +96,15 @@ $configTemplatePath = Join-Path $PackageRoot "config.example.yaml"
 if (-not (Test-Path $configTemplatePath)) {
     throw "Config template does not exist: $configTemplatePath"
 }
-Copy-Item -Path $configTemplatePath -Destination $configPath -Force
-Copy-Item -Path $resolvedEnvFile -Destination $envPath -Force
+if (Test-Path $configPath) {
+    Write-Host "Existing config preserved (manual edits kept): $configPath"
+}
+else {
+    Copy-Item -Path $configTemplatePath -Destination $configPath -Force
+}
+if ($resolvedEnvFile -and ((Resolve-Path -LiteralPath $resolvedEnvFile).Path -ne (Resolve-Path -LiteralPath $envPath -ErrorAction SilentlyContinue).Path)) {
+    Copy-Item -Path $resolvedEnvFile -Destination $envPath -Force
+}
 $envDataDir = $resolvedDataDir -replace "\\", "/"
 $envContent = Get-Content -Path $envPath -Raw
 if ($envContent -match "(?m)^CODEBASE_RAG_DATA_DIR=") {

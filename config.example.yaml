@@ -322,6 +322,24 @@ agent:
       #     retry_backoff_multiplier: 2.0
       #     key_cooldown_seconds: 60
       #   max_concurrency: 5                  # 该服务商最大并发请求数
+      # 本地 OpenAI 兼容渠道（127.0.0.1:8318）：当前仅提供 deepseek-v4.1-flash，
+      # 协议为 openai_chat_completions。密钥经环境变量 LOCAL_DEEPSEEK_API_KEY 注入，
+      # 严禁将明文密钥写入仓库文件。
+      local_deepseek:
+        api_format: "openai_chat"
+        api_base_url: "http://127.0.0.1:8318/v1"
+        models:
+          - id: "deepseek-v4.1-flash"
+            tool_choice: "auto"
+            thinking: '{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
+        api_keys:
+          - key: "${LOCAL_DEEPSEEK_API_KEY}"
+        retry:
+          max_retries_per_key: 3
+          retry_base_delay: 1.0
+          retry_backoff_multiplier: 2.0
+          key_cooldown_seconds: 60
+        max_concurrency: 20                 # 该服务商最大并发请求数
       zhipu:
         api_format: "zhipu"
         api_base_url: "https://open.bigmodel.cn"
@@ -475,19 +493,13 @@ agent:
           key_cooldown_seconds: 60
         max_concurrency: 20                   # 该服务商最大并发请求数
         request_timeout: 10                   # 单次调用超时（秒）
-    default_provider: "deepseek"
-    default_model: "deepseek-v4-pro"
+    default_provider: "local_deepseek"
+    default_model: "deepseek-v4.1-flash"
   context_compression:                     # 上下文压缩 agent 的 LLM 配置
     providers:
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-terra"
+      - provider: "local_deepseek"
+        model: "deepseek-v4.1-flash"
         priority: 10
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-luna"
-        priority: 20
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 30
     temperature: 0.0
     timeout: 600                            # 压缩 agent 超时（秒）
 
@@ -740,31 +752,16 @@ workflow:
     max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-terra"
+      - provider: "local_deepseek"
+        model: "deepseek-v4.1-flash"
         priority: 50
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-luna"
-        priority: 60
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 70
   gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
     timeout: 30                         # agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-luna"
+      - provider: "local_deepseek"
+        model: "deepseek-v4.1-flash"
         priority: 50
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-luna"
-        priority: 60
-      - provider: "deepseek"
-        model: "deepseek-flash"
-        priority: 70
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 80
   compensation:                           # 失败文件补偿任务配置
     enabled: true                         # 是否启用后台补偿
     scan_interval: 60                     # 扫描间隔基准（秒）
@@ -776,15 +773,9 @@ workflow:
 # --- 11-Context Engine 服务 ---
 context_engine:
   providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-    - provider: "openai_compatible_secondary"
-      model: "gpt-5.6-terra"
+    - provider: "local_deepseek"
+      model: "deepseek-v4.1-flash"
       priority: 10
-    - provider: "openai_compatible_secondary"
-      model: "gpt-5.6-luna"
-      priority: 20
-    - provider: "deepseek"
-      model: "deepseek-v4-pro"
-      priority: 30
   max_rate_limit_retries: 20           # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   mcp_servers:                         # 需要接入的 MCP 服务（key 对应 mcp_client.servers）
     codebase_rag:
@@ -836,29 +827,10 @@ mcp:
     #   version: "1.0.0"
   reranker:
     providers:                            # 服务商队列：按 priority 升序排列，值越小优先级越高
-      # 1. DeepSeek 对话模型（最高优先级）
-      - provider: "deepseek"
-        model: "deepseek-flash"
+      # 统一使用本地 OpenAI 兼容渠道（deepseek-v4.1-flash）
+      - provider: "local_deepseek"
+        model: "deepseek-v4.1-flash"
         priority: 1
-      # 2. Jev 官方直连
-      - provider: "jev_official"
-        model: "jev-latest"
-        priority: 2
-      # 3. OpenRouter 聚合决策端点
-      - provider: "jev_openrouter"
-        model: "~typesafe/jev-latest"
-        priority: 3
-      # 4. Vercel AI Gateway 评估模型网关
-      - provider: "jev_vercel"
-        model: "typesafe-ai/jev"
-        priority: 4
-      # 5. 原有 LLM 对话模型兜底队列
-      - provider: "openai_compatible_secondary"
-        model: "gpt-5.6-luna"
-        priority: 50
-      - provider: "deepseek"
-        model: "deepseek-v4-pro"
-        priority: 70
     recall_limit: 80                    # Stage 1 向量召回最大候选数
     timeout: 600                          # 重排序 agent 超时（秒，10 分钟）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
