@@ -27,11 +27,12 @@
 ### [FEAT-MGMT-02] 仓库移动自愈（heal_moved_project）
 - **业务目标**：仓库被移动后，读路径传入新根路径时自动重新登记。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [自愈判定三条件（全部满足）]：① incoming_path 本身是 Git 仓库根（不上溯）；② 从 incoming_path 的 root commit 派生的 id == project_id（身份来自仓库内容，不信任调用方声明或缓存文件）；③ 二选一：(a) incoming 的 repo_key 未登记**且该 project_id 已登记副本中至少一条路径 .git 已不存在**（判定为移动而非复制——存在任一存活副本时不得自动切换，两个活 clone 必须人工显式注册），或 (b) 该 project_id 完全无登记副本（重启恢复时被裁剪但 .git 缓存文件随仓库迁移）。
+  1. [自愈判定三条件（全部满足）]：① incoming_path 本身是 Git 仓库根（不上溯）；② 从 incoming_path 的 root commit 派生的 id == project_id（身份来自仓库内容，不信任调用方声明或缓存文件）；③ 按副本三态判定——alive（`.git` 含 HEAD，或 worktree 指针的 gitdir 含 HEAD）/ gone（不满足 alive 且所在卷在线）/ unknown（不满足 alive 但卷不可用）。存在 unknown → 不自愈；gone 为 0（没有任何副本消失，即新增克隆）→ 不自愈，必须显式注册；gone ≥ 1 → 自愈，且**只迁移 gone 的那几条**，alive 副本的登记、hooks、watcher、内存实例不受影响。
   2. [身份不匹配]：记 move_heal_identity_mismatch 并放弃。
-  3. [并发合并]：按 project_id single-flight（`_in_flight_heals` + `asyncio.shield`，并发调用者加入同一任务，调用者取消不影响在途自愈）。
-  4. [同步预检]：纯注册表比对 + 存在性检查（无 git 子进程），热路径（incoming 已登记或存在存活副本）立即返回 False。
-  5. [自愈执行]：移除该 project_id 的全部失联条目 → 复用 register_project 全链登记新路径以补齐漏掉的提交；自愈仅恢复既有登记身份，不构成新的注册授权。
+  3. [并发合并]：single-flight 键为 `(project_id, incoming repo_key)`（`_in_flight_heals` + `asyncio.shield`，同一副本的并发调用加入同一任务，不同副本并行移动互不吞并，调用者取消不影响在途自愈）。
+  4. [同步预检]：纯注册表比对 + `.git`/卷探针（无 git 子进程），热路径（incoming 已登记、存在 unknown 或无 gone 副本）立即返回 False。
+  5. [自愈执行顺序]：① 对 gone 副本调 event_detection.unregister_repo（先切断旧 watcher，避免巡检重注入 hooks 在死路径重建目录）→ ② `register_project(incoming, display_name=继承 gone 副本的 display_name)` → ③ 对 gone 副本执行 workflow.unregister_repo + memory.destroy_repo_instances + 移出注册表 + 重存注册表；②失败时仍移出 gone 副本并重存，不留指向已消失路径的条目。自愈仅恢复既有登记身份，不构成新的注册授权。
+  6. [幽灵 .git 防护]：事件域 hook 注入遇 `.git` 不存在时跳过且不建目录（`hook_injection_skipped_missing_repo`），hook 巡检跳过已消失副本（`hook_health_check_skipped_missing_repo`）；存活判据不得只看 `.git` 是否存在，否则幽灵 `.git` 会把失联副本判活并永久阻塞后续自愈。
 - **级联依赖功能单元（Cascade Links）**：FEAT-MGMT-01（复用注册链）、FEAT-MCPS-03（信号来源）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无

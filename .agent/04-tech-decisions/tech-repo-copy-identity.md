@@ -23,4 +23,4 @@
 3. 同一 project_id 的多个副本严禁共用或顶替彼此的活跃实例、hooks、watcher 与登记条目；副本间交互仅通过持久层（同 fvid 知识点天然共享复用）。
 4. 注销（单副本或整分区）严禁删除持久层 Qdrant points——数据属于共享分区，删除需未来显式的数据管理操作。
 5. hook 脚本 payload 必须携带 repo_path；无 repo_path 的存量 hook 事件仅允许在"该分区恰有一个副本"时兜底路由，多副本歧义必须丢弃并告警，严禁随机选择副本。
-6. move-heal 在存在任一存活副本时严禁自动登记 incoming 路径（复制/双克隆场景必须显式注册）；仅当该分区全部已登记副本失联、或分区无任何登记时才自愈（详见 tech-moved-repo-heal.md）。
+6. move-heal 的判定基准是“哪些已登记副本消失了”而非“移动了哪一个”：存在 unknown（卷离线）或 gone 为 0（无副本消失，即复制/新克隆）时严禁自动登记 incoming；gone ≥ 1 时只迁移 gone 那几条，alive 副本的登记/实例/hooks 不得触碰；分区无任何登记时仍可凭 .git 身份缓存恢复（详见 tech-moved-repo-heal.md）。

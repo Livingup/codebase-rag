@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.paths import normalize_repo_key
@@ -96,6 +96,49 @@ def _consume_task_exception(task: asyncio.Task) -> None:
         task.exception()
 
 
+# Liveness states of a registered repository copy.
+#   alive   — the copy is still where it was registered.
+#   gone    — the copy vanished while its volume is online (moved/deleted).
+#   unknown — the volume is offline, so absence proves nothing.
+_REPO_COPY_ALIVE = "alive"
+_REPO_COPY_GONE = "gone"
+_REPO_COPY_UNKNOWN = "unknown"
+
+
+def _git_metadata_present(git_path: str) -> bool:
+    """Return True when ``git_path`` holds real Git metadata.
+
+    A ghost ``.git`` directory — only ``hooks/`` left behind by a hook
+    injection aimed at a path that no longer existed — carries no ``HEAD``
+    and must not be mistaken for a live repository copy.  Worktrees and
+    submodules store a ``gitdir: <path>`` pointer file instead of a
+    directory, so both shapes are handled here.
+    """
+    try:
+        if os.path.isdir(git_path):
+            return os.path.exists(os.path.join(git_path, "HEAD"))
+        if os.path.isfile(git_path):
+            with open(git_path, "r", encoding="utf-8", errors="replace") as f:
+                pointer = f.readline().strip()
+            if not pointer.startswith("gitdir:"):
+                return False
+            target = pointer.split(":", 1)[1].strip()
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(git_path), target)
+            return os.path.exists(os.path.join(target, "HEAD"))
+    except OSError:
+        return False
+    return False
+
+
+def _path_volume_available(path: str) -> bool:
+    """Return True when the volume holding ``path`` is currently online."""
+    drive, _ = os.path.splitdrive(path)
+    if drive:
+        return os.path.exists(drive + os.sep)
+    return os.path.exists(os.sep)
+
+
 class ManagementApiService:
     """Top-level API service coordinating all downstream services.
 
@@ -136,8 +179,10 @@ class ManagementApiService:
         # distinct repo_keys and coexist as separate entries.
         self._projects: Dict[str, ProjectRecord] = {}
 
-        # One shared moved-repo heal task per project_id (single-flight)
-        self._in_flight_heals: Dict[str, asyncio.Task] = {}
+        # One shared moved-repo heal task per (project_id, incoming repo_key):
+        # two copies of the same project may move at the same time and must
+        # not join each other's heal.
+        self._in_flight_heals: Dict[Tuple[str, str], asyncio.Task] = {}
 
         self._initialized = False
         self._start_time: float = 0.0
@@ -396,17 +441,23 @@ class ManagementApiService:
              file alone.
           3. Either:
              a. no repository copy of this project is registered at the
-                incoming path AND at least one older copy's ``.git`` no
-                longer exists (a move, not a copy — two live clones must
-                be switched via manual registration), or
+                incoming path, no copy sits on an unreachable volume, and
+                at least one older copy is really gone (``.git`` metadata
+                missing while its volume is online) — a move, not a copy.
+                Only those vanished copies are replaced; surviving copies
+                keep their entry, hooks, watcher and in-memory instance.
              b. the project has no registered copies at all (the entries
                 were pruned by a restart-restore while the ``.git`` cache
                 file still travels with the repository).
 
-        Single-flight per project_id: concurrent callers join the same
-        heal task.  The pre-check is cheap (registry lookup + existence
-        checks, no git subprocess) so read paths can call this on every
-        request.
+        Copies that are still alive, or that live on an offline volume
+        (network share / removable disk), never trigger a heal: adding a
+        fresh clone to the index stays an explicit decision.
+
+        Single-flight per (project_id, incoming repo_key): concurrent
+        callers for the same moved copy join the same heal task.  The
+        pre-check is cheap (registry lookups + ``.git``/volume probes, no
+        git subprocess) so read paths can call this on every request.
 
         Returns:
             True when a re-registration was performed by this call (or a
@@ -420,22 +471,32 @@ class ManagementApiService:
         if not self._move_heal_precheck(project_id, incoming_path):
             return False
 
-        task = self._in_flight_heals.get(project_id)
+        heal_key = self._move_heal_key(project_id, incoming_path)
+        task = self._in_flight_heals.get(heal_key)
         if task is None:
             task = asyncio.create_task(
                 self._run_move_heal(project_id, incoming_path),
-                name=f"move_heal:{project_id}",
+                name=f"move_heal:{project_id}:{heal_key[1]}",
             )
             task.add_done_callback(_consume_task_exception)
-            self._in_flight_heals[project_id] = task
+            self._in_flight_heals[heal_key] = task
         else:
-            logger.info("move_heal_joined", project_id=project_id)
+            logger.info(
+                "move_heal_joined",
+                project_id=project_id,
+                incoming_path=incoming_path,
+            )
 
         # shield: a cancelled caller must not abort an in-flight heal
         return await asyncio.shield(task)
 
     def _move_heal_precheck(self, project_id: str, incoming_path: str) -> bool:
-        """Synchronous gate deciding whether a heal task should start."""
+        """Synchronous gate deciding whether a heal task should start.
+
+        Cheap by design (no git subprocess): registry lookups plus
+        ``.git``/volume probes, so MCP read paths can call it on every
+        request.
+        """
         try:
             normalized_incoming = self._normalize_registered_path(incoming_path)
         except InvalidRequestError:
@@ -450,26 +511,49 @@ class ManagementApiService:
             if record.project_id == project_id
         ]
         if copies:
-            # Any live copy means copy / two-clone scenario — switching must
-            # be an explicit decision, never automatic.
-            if any(
-                os.path.exists(os.path.join(record.git_repo_path, ".git"))
-                for record in copies
-            ):
+            states = [self._classify_repo_copy(record) for record in copies]
+            # A copy on an offline volume (network share / removable disk)
+            # must never be read as "deleted".
+            if _REPO_COPY_UNKNOWN in states:
                 return False
-            # All registered copies are dead: the repository moved.
+            # No copy vanished: the caller's path is a *new* copy, not a
+            # moved one.  Indexing a fresh clone stays an explicit
+            # decision.
+            if _REPO_COPY_GONE not in states:
+                return False
+            # At least one copy is gone while the incoming path carries the
+            # same identity: exactly those copies moved.  Surviving copies
+            # are untouched.
 
         # Contract check: the caller's path must itself be a Git repo root
         # (.git may be a directory or a worktree file).
         return os.path.exists(os.path.join(incoming_path, ".git"))
 
+    def _classify_repo_copy(self, record: ProjectRecord) -> str:
+        """Classify a registered copy as alive / gone / unreachable."""
+        git_path = os.path.join(record.git_repo_path, ".git")
+        if _git_metadata_present(git_path):
+            return _REPO_COPY_ALIVE
+        if _path_volume_available(record.git_repo_path):
+            return _REPO_COPY_GONE
+        return _REPO_COPY_UNKNOWN
+
+    def _move_heal_key(self, project_id: str, incoming_path: str) -> Tuple[str, str]:
+        """Single-flight key: one heal task per moved copy."""
+        try:
+            repo_key = self._normalize_registered_path(incoming_path)
+        except InvalidRequestError:
+            repo_key = incoming_path
+        return (project_id, repo_key)
+
     async def _run_move_heal(self, project_id: str, incoming_path: str) -> bool:
-        """Run one project's heal and release its single-flight slot."""
+        """Run one heal and release its single-flight slot."""
+        heal_key = self._move_heal_key(project_id, incoming_path)
         try:
             return await self._do_heal_moved_project(project_id, incoming_path)
         finally:
-            if self._in_flight_heals.get(project_id) is asyncio.current_task():
-                del self._in_flight_heals[project_id]
+            if self._in_flight_heals.get(heal_key) is asyncio.current_task():
+                del self._in_flight_heals[heal_key]
 
     async def _do_heal_moved_project(self, project_id: str, incoming_path: str) -> bool:
         """Validated heal path: re-check state, verify identity, register."""
@@ -502,32 +586,85 @@ class ManagementApiService:
             )
             return False
 
-        # Drop the dead entries of this project before re-registering the
-        # moved path (register_project creates the fresh entry).
+        # Only copies that really vanished are migrated.  Alive copies keep
+        # their entry, hooks, watcher and in-memory instance; copies sitting
+        # on an offline volume are left alone until the volume is back.
         dead_copies = [
             record for record in self._projects.values()
             if record.project_id == project_id
-            and not os.path.exists(os.path.join(record.git_repo_path, ".git"))
+            and self._classify_repo_copy(record) == _REPO_COPY_GONE
         ]
-        for record in dead_copies:
-            self._projects.pop(record.repo_key, None)
+        inherited_display_name = (
+            dead_copies[0].display_name if dead_copies else ""
+        )
 
+        # Step 1: drop the vanished copies from event detection first, so no
+        # watcher can re-inject hooks into a directory that no longer exists
+        # (that injection is what recreates a ghost .git at a dead path).
+        for record in dead_copies:
+            try:
+                await self._event_detection.unregister_repo(record.git_repo_path)
+            except Exception:
+                logger.exception(
+                    "move_heal_event_unregister_failed",
+                    project_id=project_id,
+                    repo_path=record.git_repo_path,
+                )
+
+        # Step 2: register the moved path through the normal flow (registry
+        # entry, hooks, watcher, workflow state, initialization catch-up),
+        # keeping the display name of the copy it replaces.
         try:
-            await self.register_project(incoming_path)
+            await self.register_project(
+                incoming_path, display_name=inherited_display_name,
+            )
         except Exception:
             logger.exception(
                 "move_heal_register_failed",
                 repo_path=incoming_path,
             )
+            # The vanished copies are not coming back — drop them instead of
+            # leaving registry entries that point at dead paths.
+            self._drop_dead_copies(dead_copies)
+            self._save_registry()
             return False
+
+        # Step 3: purge the vanished copies from workflow / memory /
+        # registry — scoped per repo_key, never per project_id, so surviving
+        # copies keep their watchers and instances.
+        for record in dead_copies:
+            try:
+                self._workflow.unregister_repo(record.git_repo_path)
+            except Exception:
+                logger.exception(
+                    "move_heal_workflow_unregister_failed",
+                    project_id=project_id,
+                    repo_path=record.git_repo_path,
+                )
+            try:
+                await self._memory.destroy_repo_instances(record.repo_key)
+            except Exception:
+                logger.exception(
+                    "move_heal_instance_destroy_failed",
+                    project_id=project_id,
+                    repo_key=record.repo_key,
+                )
+        self._drop_dead_copies(dead_copies)
+        self._save_registry()
 
         logger.info(
             "moved_project_healed",
             project_id=project_id,
             healed_copies=len(dead_copies),
             new_path=incoming_path,
+            display_name=inherited_display_name or None,
         )
         return True
+
+    def _drop_dead_copies(self, dead_copies: List[ProjectRecord]) -> None:
+        """Remove already-migrated copies from the in-memory registry."""
+        for record in dead_copies:
+            self._projects.pop(record.repo_key, None)
 
     async def list_projects(self) -> List[ProjectResponse]:
         """List all registered repository copies (one entry per copy)."""

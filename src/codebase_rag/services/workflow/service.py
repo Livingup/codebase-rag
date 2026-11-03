@@ -262,11 +262,22 @@ class WorkflowOrchestratorService:
         self._project_repos.pop(normalize_repo_key(repo_path), None)
 
     def get_repo_key_for_project(self, project_id: str) -> Optional[str]:
-        """Return the first registered repo_key of a project, if any."""
+        """Return a live repo_key of a project, if any.
+
+        With multiple local copies of one project, keys of copies that
+        moved or were deleted may still linger here; prefer a copy whose
+        ``.git`` still exists so background work never targets a dead
+        path, and fall back to the first match when none is left.
+        """
+        fallback: Optional[str] = None
         for repo_key, pid in self._project_repos.items():
-            if pid == project_id:
+            if pid != project_id:
+                continue
+            if os.path.exists(os.path.join(repo_key, ".git")):
                 return repo_key
-        return None
+            if fallback is None:
+                fallback = repo_key
+        return fallback
 
     def rebrand_project_id(
         self, old_project_id: str, new_project_id: str,

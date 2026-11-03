@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from codebase_rag.services.management_api.models import ProjectRecord
 from codebase_rag.services.management_api.service import (
@@ -62,6 +62,9 @@ class _Embedding:
 def _make_repo(tmp: str, name: str) -> str:
     repo = Path(tmp) / name
     (repo / ".git").mkdir(parents=True)
+    # A real repository always carries HEAD; the move-heal liveness probe
+    # uses it to tell a live copy from a ghost .git left at a dead path.
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     return str(repo)
 
 
@@ -87,6 +90,19 @@ class HealMovedProjectTest(unittest.IsolatedAsyncioTestCase):
         service._git_ops = SimpleNamespace(
             get_root_commit=AsyncMock(return_value=_ROOT_COMMIT),
         )
+        service._event_detection = SimpleNamespace(
+            unregister_project=AsyncMock(return_value=True),
+            unregister_repo=AsyncMock(return_value=True),
+        )
+        service._workflow = SimpleNamespace(
+            unregister_project=Mock(),
+            unregister_repo=Mock(),
+        )
+        service._memory = SimpleNamespace(
+            destroy_all_instances=AsyncMock(return_value=0),
+            destroy_repo_instances=AsyncMock(return_value=0),
+        )
+        service._save_registry = Mock()
         service.register_project = AsyncMock(return_value=SimpleNamespace(
             project_id=_PROJECT_ID,
             git_repo_path="registered",
@@ -118,7 +134,9 @@ class HealMovedProjectTest(unittest.IsolatedAsyncioTestCase):
             )
             healed = await service.heal_moved_project(_PROJECT_ID, new_path)
             self.assertTrue(healed)
-            service.register_project.assert_awaited_once_with(new_path)
+            service.register_project.assert_awaited_once_with(
+                new_path, display_name="repo",
+            )
 
     async def test_copy_scenario_refuses_heal_when_old_path_still_live(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,7 +172,9 @@ class HealMovedProjectTest(unittest.IsolatedAsyncioTestCase):
             new_path = _make_repo(tmp, "restored")
             healed = await service.heal_moved_project(_PROJECT_ID, new_path)
             self.assertTrue(healed)
-            service.register_project.assert_awaited_once_with(new_path)
+            service.register_project.assert_awaited_once_with(
+                new_path, display_name="",
+            )
 
     async def test_non_git_root_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

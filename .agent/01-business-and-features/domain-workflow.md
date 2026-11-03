@@ -90,7 +90,7 @@
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [启动]：服务启动后常驻后台任务，先 sleep 5s 等项目注册完成。
   2. [每轮顺序]：①计算退避 `backoff = min(base_backoff×2^consecutive_failures, max_backoff)`，实际 sleep = max(backoff−距上轮耗时, scan_interval)；②汇集所有已注册 project_id（取 `_project_repos` 值去重）的持久化重试队列（`{data_dir}/retry_queue_{project_id}.json`）；③**先执行** `knowledge_sync.retry_ready_jobs`（外发箱优先于文件重试）；④逐条处理重试记录。
-  3. [单条重试裁决]：该 project_id 无任何已注册副本 → 死信；repo 取首个注册副本（blob 内容寻址，任一持有该对象的副本皆可）；`is_stale_file_version` → 移出队列视为成功；blob 探测 GitFileNotFoundError → 死信（reason="blob_not_found"）；其他 Git 异常 → retry_count+1 留队；agent 重跑（skip_memory_update=True、update_latest=False、source="compensation_retry"）异常 → retry_count+1，IF ≥ max_file_retries → 死信（"max_retries_exceeded"）。
+  3. [单条重试裁决]：该 project_id 无任何已注册副本 → 死信；repo 取仍存活的注册副本（`get_repo_key_for_project` 优先返回 `.git` 仍存在的副本，全失效时回退首个匹配；blob 内容寻址，任一持有该对象的副本皆可）；`is_stale_file_version` → 移出队列视为成功；blob 探测 GitFileNotFoundError → 死信（reason="blob_not_found"）；其他 Git 异常 → retry_count+1 留队；agent 重跑（skip_memory_update=True、update_latest=False、source="compensation_retry"）异常 → retry_count+1，IF ≥ max_file_retries → 死信（"max_retries_exceeded"）。
   4. [死信归档]：共三种死信条件（blob 消失 / 重试超限 / 项目未注册），持久化到 `{data_dir}/dead_letter_{project_id}.json`。
   5. [探针退避]：本轮首个 LLM 失败且零成功 → consecutive_failures+1 并中断本轮；任一成功则清零。
   6. [重试期间不做内存更新]：补偿重试 skip_memory_update=True，内存视图由下一次事件触发重建。

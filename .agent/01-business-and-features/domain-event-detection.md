@@ -31,8 +31,9 @@
   3. [hook 上报 payload]：JSON 含 `project_id`（数据分区）+ `repo_path`（副本身份，JSON 转义并做 shell 单引号转义）+ `hook_type` + `args`——多副本同分区时靠 repo_path 区分事件来源；HTTP（curl POST `--max-time 2 || true`）或 named pipe，**失败不阻塞 Git**。
   4. [全新安装]：无既有 hook → 直接新建托管脚本；非 Windows chmod +x。
   5. [卸载规则]：remove_hooks 只删除含托管标记的脚本；备份存在则 rename 还原用户原 hook。
-  6. [巡检状态]：hook 状态机 INSTALLED →（被删除/改写）MISSING / CONFLICT →（周期巡检重注入）INSTALLED；巡检按 (repo_key, state) 快照逐副本进行。
+  6. [巡检状态]：hook 状态机 INSTALLED →（被删除/改写）MISSING / CONFLICT →（周期巡检重注入）INSTALLED；巡检按 (repo_key, state) 快照逐副本进行；IF 该副本 `.git` 已不存在 → 记 `hook_health_check_skipped_missing_repo` 并跳过（严禁重注入：重注入会 makedirs 在死路径上重建幽灵 `.git`）。
   7. [异常]：注入异常抛 HookInjectionError。
+  8. [消失路径守卫]：inject_hooks 首步校验 `.git` 是否仍存在；不存在（副本被移动/删除）→ 记 `hook_injection_skipped_missing_repo` 并直接返回，**绝不 makedirs**——否则会在已消失的路径上凭空造出只有 hooks 的幽灵 `.git`。
 - **级联依赖功能单元（Cascade Links）**：无
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无

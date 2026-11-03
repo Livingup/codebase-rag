@@ -377,7 +377,18 @@ class EventDetectionService:
 
     async def inject_hooks(self, project_id: str, git_repo_path: str) -> None:
         """Inject all managed hook scripts into .git/hooks/."""
-        hooks_dir = os.path.join(git_repo_path, ".git", "hooks")
+        git_dir = os.path.join(git_repo_path, ".git")
+        if not os.path.exists(git_dir):
+            # The copy is gone (moved or deleted): creating the directory
+            # here would resurrect a ghost .git at a dead path.
+            logger.warning(
+                "hook_injection_skipped_missing_repo",
+                project_id=project_id,
+                repo=git_repo_path,
+            )
+            return
+
+        hooks_dir = os.path.join(git_dir, "hooks")
         os.makedirs(hooks_dir, exist_ok=True)
 
         for hook_type in MANAGED_HOOKS:
@@ -644,6 +655,15 @@ class EventDetectionService:
             snapshot = list(self._projects.items())
 
         for repo_key, state in snapshot:
+            if not os.path.exists(os.path.join(state.git_repo_path, ".git")):
+                # Never repair hooks for a copy that no longer exists; the
+                # repair itself would recreate the directory tree.
+                logger.warning(
+                    "hook_health_check_skipped_missing_repo",
+                    project_id=state.project_id,
+                    repo_key=repo_key,
+                )
+                continue
             try:
                 status = await self.check_hooks_status(
                     state.project_id, state.git_repo_path,

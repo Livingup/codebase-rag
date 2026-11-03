@@ -8,8 +8,8 @@ copy" design:
   - unregister_repo removes a single copy; unregister_project removes all
     copies — neither deletes persistent Qdrant points.
   - Hook / Git events route to the originating copy.
-  - Move-heal refuses when a live sibling copy exists and heals when all
-    registered copies of the project are dead.
+  - Move-heal migrates only the copies that really vanished (live siblings
+    keep their entry) and refuses when no copy disappeared (a new clone).
 """
 
 from __future__ import annotations
@@ -80,6 +80,9 @@ def _point(file_path: str, point_id: int) -> models.PointStruct:
 def _make_repo(tmp: str, name: str) -> str:
     repo = Path(tmp) / name
     (repo / ".git").mkdir(parents=True)
+    # A real repository always carries HEAD; the liveness probe uses it to
+    # separate a live copy from a ghost .git left at a dead path.
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     return str(repo)
 
 
@@ -226,7 +229,7 @@ class MultiCopyRegistryTest(unittest.IsolatedAsyncioTestCase):
                 _PROJECT_ID,
             )
 
-    async def test_heal_refuses_when_a_sibling_copy_is_still_live(self) -> None:
+    async def test_heal_replaces_only_the_dead_copy_and_keeps_live_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             live_copy = _make_repo(tmp, "live")
             dead_path = str(Path(tmp) / "gone")
@@ -238,8 +241,20 @@ class MultiCopyRegistryTest(unittest.IsolatedAsyncioTestCase):
 
             healed = await service.heal_moved_project(_PROJECT_ID, incoming)
 
-            self.assertFalse(healed)
-            service.register_project.assert_not_awaited()
+            self.assertTrue(healed)
+            # The vanished copy is replaced under its own display name.
+            service.register_project.assert_awaited_once_with(
+                incoming, display_name="dead",
+            )
+            self.assertIn(normalize_repo_key(live_copy), service._projects)
+            self.assertNotIn(normalize_repo_key(dead_path), service._projects)
+            # Only the vanished copy is unregistered anywhere.
+            service._event_detection.unregister_repo.assert_awaited_once_with(dead_path)
+            service._workflow.unregister_repo.assert_called_once_with(dead_path)
+            service._memory.destroy_repo_instances.assert_awaited_once_with(
+                normalize_repo_key(dead_path),
+            )
+            service._event_detection.unregister_project.assert_not_awaited()
 
     async def test_heal_reregisters_when_all_registered_copies_are_dead(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,7 +269,14 @@ class MultiCopyRegistryTest(unittest.IsolatedAsyncioTestCase):
             healed = await service.heal_moved_project(_PROJECT_ID, incoming)
 
             self.assertTrue(healed)
-            service.register_project.assert_awaited_once_with(incoming)
+            service.register_project.assert_awaited_once_with(
+                incoming, display_name="a",
+            )
+            service._event_detection.unregister_repo.assert_any_await(dead_a)
+            service._event_detection.unregister_repo.assert_any_await(dead_b)
+            service._workflow.unregister_repo.assert_any_call(dead_a)
+            service._workflow.unregister_repo.assert_any_call(dead_b)
+            self.assertEqual(service._projects, {})
 
 
 class RegistryRestoreMultiCopyTest(unittest.IsolatedAsyncioTestCase):
