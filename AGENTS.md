@@ -636,6 +636,7 @@ Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 
 - 正式服务默认监听 `127.0.0.1`，不要默认暴露到局域网。
 - 用户真实 `.env`、真实配置、密钥、日志、数据不得提交到 Git。
+- 私有服务地址（域名、端口）与密钥同等保密，不得写入任何 Git 跟踪文档、Issue、聊天或日志；仓库为公开仓库，公开即等于泄漏。
 - 安装和更新会使用用户提供的真实 `.env` 覆盖 `${CODEBASE_RAG_DATA_DIR}\config\.env`，并使用安装包内 `config.example.yaml` 重新生成 `${CODEBASE_RAG_DATA_DIR}\config\config.yaml`。
 - 正式安装和更新必须使用用户本机从源码构建出的本地安装 zip。
 - 不再通过 Gitee Release 发布或命令行下载安装包。
@@ -647,14 +648,14 @@ Get-Content "${CODEBASE_RAG_DATA_DIR}\logs\service.stderr.log" -Tail 200 -Wait
 
 当前 Codebase RAG 系统采用 **本地 Qdrant Docker 容器** 进行向量数据的持久化存储（访问地址为 `localhost:6333`）。本地持久化减少了对外部网络的依赖，提高了服务响应速度。
 
-**云端 Qdrant 回退配置（文档不保存明文密钥）：**
-云端地址与端口可记录在文档中；`QDRANT_API_KEY` 只保存在本机受控备份，不得复制到 `AGENTS.md`、Git 提交、Issue、聊天或日志中。回退参数格式如下：
+**云端 Qdrant 回退配置（文档不保存明文密钥与私有服务地址）：**
+本仓库是公开仓库。`QDRANT_HOST`、`QDRANT_PORT`、`QDRANT_GRPC_PORT` 属于私有服务地址，与 `QDRANT_API_KEY` 同级保密：只保存在本机受控备份，**不得**复制到 `AGENTS.md`、Git 提交、Issue、聊天或日志中。文档只保留参数键名与占位符：
 
 ```env
-QDRANT_HOST=qdrant.mindloop.chat
-QDRANT_PORT=48831
-QDRANT_GRPC_PORT=32293
-QDRANT_HTTPS=true
+QDRANT_HOST=<从本机受控备份按需查询>
+QDRANT_PORT=<从本机受控备份按需查询>
+QDRANT_GRPC_PORT=<从本机受控备份按需查询>
+QDRANT_HTTPS=<从本机受控备份按需查询>
 QDRANT_API_KEY=<从本机受控备份按需查询>
 ```
 
