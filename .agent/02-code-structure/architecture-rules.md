@@ -53,6 +53,7 @@ src/codebase_rag/
     ├── qdrant_storage/
     └── workflow/
 ops/windows/                           # [运维脚本] Windows 服务安装/注册/启停/构建/更新 PowerShell 脚本
+wheels/                                # [离线依赖包] 仓库自带私有 wheel（如 multi_protocol_llm_client）
 tests/unit/ tests/integration/         # [测试]
 config.example.yaml .env.example       # [配置模板] 仓库只留模板，真实配置不入 Git
 ```

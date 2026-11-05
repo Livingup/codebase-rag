@@ -87,7 +87,12 @@ if ($wheel) {
     }
 }
 else {
-    Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" $PackageRoot
+    if (Test-Path $wheelsDir) {
+        Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" "--find-links" $wheelsDir $PackageRoot
+    }
+    else {
+        Invoke-NativeCommand $pipExe "install" "--upgrade" "--force-reinstall" $PackageRoot
+    }
 }
 
 $configPath = Join-Path $configDir "config.yaml"

@@ -12,7 +12,7 @@
 
 ## 2. 选定的技术方案与强制契约
 
-- **依赖注入位置**：llm-sdk 以本地 wheel 方式接入。`pyproject.toml` 声明 `multi-protocol-llm-client>=1.0.0`，不声明 openai / anthropic / google-genai；`ops/windows/build-windows-package.ps1` 通过 `-SdkWheelDir`（默认 `../llm-sdk/pythonsdk/dist`）给 `pip install` 与 `pip download` 追加 `--find-links`，使发布包 `wheels/` 自动带入 SDK wheel。
+- **依赖注入位置**：llm-sdk 以本地 wheel 方式随仓接入（`wheels/multi_protocol_llm_client-*.whl`）。`pyproject.toml` 声明 `multi-protocol-llm-client>=1.0.0`，不声明 openai / anthropic / google-genai；`ops/windows/build-windows-package.ps1`、`start-source-takeover.ps1`、`install-local-service.ps1` 默认优先从仓库内 `wheels/` 目录（未命中时回退 `../llm-sdk/pythonsdk/dist` 或显式 `-SdkWheelDir`）为 `pip install` 与 `pip download` 追加 `--find-links`，使源码直装与发布包 `wheels/` 均能离线解析 SDK wheel。
 - **Agent provider 契约为纯适配器**：`services/agent/providers/<name>.py` 只做「codebase-rag Message/ToolSchema → 协议报文」与「llm-sdk 流事件 → `LLMResponse`」两件事。
   - 协议客户端：`openai_chat`/`deepseek`/`zhipu` → `OpenAIChatCompletionsClient`；`openai_responses` → `OpenAIResponsesClient`；`anthropic` → `ClaudeMessagesClient`；`gemini` → `GeminiStreamClient`。
   - 共享桥接：`services/agent/providers/llm_sdk_common.py` 提供 `make_client_config`、`make_request_options`、`collect_stream`、错误映射 `error_from_sdk`。
