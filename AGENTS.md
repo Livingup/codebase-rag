@@ -80,6 +80,7 @@ pyproject.toml               # Python 包与依赖定义
 config.example.yaml          # 配置模板，不包含真实密钥
 .env.example                 # 环境变量模板，不包含真实密钥
 ops/windows/                 # Windows 本地服务运维脚本
+wheels/                      # 私有离线依赖包（如 multi-protocol-llm-client）
 AGENTS.md                    # 本文件
 ```
 

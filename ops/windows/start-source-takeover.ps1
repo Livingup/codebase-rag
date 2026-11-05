@@ -51,11 +51,18 @@ if (-not (Test-Path $venvDir)) {
 $pythonExe = Join-Path $venvDir "Scripts\python.exe"
 $pipExe = Join-Path $venvDir "Scripts\pip.exe"
 Invoke-NativeCommand $pythonExe "-m" "pip" "install" "--upgrade" "pip"
+
+$extraPipArgs = @()
+$repoWheelsDir = Join-Path $SourceRoot "wheels"
+if (Test-Path $repoWheelsDir) {
+    $extraPipArgs = @("--find-links", $repoWheelsDir)
+}
+
 if ($InstallDevDependencies) {
-    Invoke-NativeCommand $pipExe "install" "-e" "$SourceRoot[dev]"
+    Invoke-NativeCommand $pipExe "install" "-e" "$SourceRoot[dev]" @extraPipArgs
 }
 else {
-    Invoke-NativeCommand $pipExe "install" "-e" $SourceRoot
+    Invoke-NativeCommand $pipExe "install" "-e" $SourceRoot @extraPipArgs
 }
 
 $env:CODEBASE_RAG_CONFIG = $ConfigPath

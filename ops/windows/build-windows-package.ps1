@@ -23,7 +23,13 @@ Ensure-Directory $OutputRoot
 
 # llm-sdk (multi-protocol-llm-client) 未发布到 PyPI，构建时从本地 wheel 目录解析依赖。
 if (-not $SdkWheelDir) {
-    $SdkWheelDir = Join-Path (Split-Path $defaultSourceRoot -Parent) "llm-sdk\pythonsdk\dist"
+    $repoWheelsDir = Join-Path $defaultSourceRoot "wheels"
+    if (Test-Path $repoWheelsDir) {
+        $SdkWheelDir = $repoWheelsDir
+    }
+    else {
+        $SdkWheelDir = Join-Path (Split-Path $defaultSourceRoot -Parent) "llm-sdk\pythonsdk\dist"
+    }
 }
 if (-not (Test-Path $SdkWheelDir)) {
     throw "llm-sdk wheel directory not found: $SdkWheelDir. Build it first or pass -SdkWheelDir."
