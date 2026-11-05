@@ -1,4 +1,4 @@
-"""Git operations service — structured Git data access with file filtering.
+"""Git operations service — structured Git data access with gitignore-style file filtering.
 
 Pure data layer wrapping git CLI. No business logic.
 All git commands run via asyncio.create_subprocess_exec with per-repo semaphore.
@@ -11,11 +11,12 @@ import hashlib
 import os
 import re
 import time
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.config.loader import ConfigManager
-from codebase_rag.config.schema import GitOperationsConfig
+from codebase_rag.config.schema import AppConfig, GitOperationsConfig
 from codebase_rag.services.git_operations.errors import (
     GitCommandError,
     GitFileNotFoundError,
@@ -24,8 +25,12 @@ from codebase_rag.services.git_operations.errors import (
     GitRepositoryError,
     GitTimeoutError,
 )
-from codebase_rag.services.git_operations.file_filter import FileFilter, FilterResult
-from codebase_rag.services.git_operations.gray_area_store import GrayAreaStore
+from codebase_rag.services.git_operations.file_filter import (
+    FileFilter,
+    FilterResult,
+    classify_file_modality,
+    compile_gitignore_lines,
+)
 from codebase_rag.services.git_operations.models import (
     BranchInfo,
     ChangedFiles,
@@ -39,20 +44,19 @@ from codebase_rag.services.git_operations.models import (
 
 logger = get_logger(__name__)
 
+_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
+
 
 class GitOperationsService:
     """Encapsulates all Git commands, providing structured data access.
 
     Args:
-        config: Git operations configuration section from AppConfig.
+        config_manager: Runtime configuration manager.
     """
 
     def __init__(self, config_manager: ConfigManager) -> None:
         self._config_manager = config_manager
         self._file_filter = FileFilter(self._config.file_filter)
-        self._gray_area_store = GrayAreaStore(
-            self._config.file_filter.uncertain.store_path,
-        )
         self._repo_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._git_version: Optional[str] = None
         self._initialized = False
@@ -72,6 +76,7 @@ class GitOperationsService:
         version = await self._check_git_version()
         self._git_version = version
         self._initialized = True
+        self._config_manager.register_reconciler("git_operations", self.reconcile)
 
         logger.info(
             "git_operations_service_initialized",
@@ -79,8 +84,14 @@ class GitOperationsService:
             git_executable=self._config.git_executable,
         )
 
+    async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Reconcile file filter rules on hot reload."""
+        self._file_filter.update_config(new_config.git_operations.file_filter)
+        logger.info("git_operations_service_reconciled")
+
     async def shutdown(self) -> None:
         """Release resources."""
+        self._config_manager.unregister_reconciler("git_operations")
         self._repo_semaphores.clear()
         self._initialized = False
         logger.info("git_operations_service_shutdown")
@@ -88,10 +99,110 @@ class GitOperationsService:
     def is_healthy(self) -> bool:
         return self._initialized
 
-    @property
-    def gray_area_store(self) -> GrayAreaStore:
-        """Expose gray-area store for L3 classification by workflow."""
-        return self._gray_area_store
+    # =========================================================================
+    # Per-repository .git/codebase-rag/ignore management
+    # =========================================================================
+
+    @staticmethod
+    def _resolve_git_dir(repo_path: str) -> Path:
+        """Resolve the actual .git directory for a repository (supports worktrees/submodules)."""
+        dot_git = Path(repo_path) / ".git"
+        if dot_git.is_file():
+            try:
+                content = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+                if content.startswith("gitdir:"):
+                    gitdir_raw = content[len("gitdir:") :].strip()
+                    gitdir_path = Path(gitdir_raw)
+                    if not gitdir_path.is_absolute():
+                        gitdir_path = (Path(repo_path) / gitdir_path).resolve()
+                    return gitdir_path
+            except OSError:
+                pass
+        return dot_git
+
+    def get_ignore_file_path(self, repo_path: str) -> str:
+        """Return absolute path to ``.git/codebase-rag/ignore`` for a repository."""
+        git_dir = self._resolve_git_dir(repo_path)
+        return str(git_dir / "codebase-rag" / "ignore")
+
+    def get_ignore_content(self, repo_path: str) -> str:
+        """Read raw content of ``.git/codebase-rag/ignore`` (returns empty string if absent)."""
+        ignore_path = Path(self.get_ignore_file_path(repo_path))
+        if not ignore_path.is_file():
+            return ""
+        try:
+            return ignore_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def get_ignore_rules(self, repo_path: str) -> List[str]:
+        """Return non-empty, non-comment rule lines from ``.git/codebase-rag/ignore``."""
+        content = self.get_ignore_content(repo_path)
+        rules: List[str] = []
+        for raw_line in content.splitlines():
+            stripped = raw_line.strip()
+            if stripped and not stripped.startswith("#"):
+                rules.append(stripped)
+        return rules
+
+    def set_ignore_content(self, repo_path: str, content: str) -> List[str]:
+        """Atomically overwrite ``.git/codebase-rag/ignore`` and return active rules."""
+        ignore_path = Path(self.get_ignore_file_path(repo_path))
+        ignore_path.parent.mkdir(parents=True, exist_ok=True)
+        normalized = content.replace("\r\n", "\n")
+        if normalized and not normalized.endswith("\n"):
+            normalized += "\n"
+        tmp_path = ignore_path.with_suffix(".tmp")
+        tmp_path.write_text(normalized, encoding="utf-8")
+        os.replace(tmp_path, ignore_path)
+        return self.get_ignore_rules(repo_path)
+
+    def add_ignore_rules(self, repo_path: str, patterns: List[str]) -> List[str]:
+        """Append new ignore rules to ``.git/codebase-rag/ignore`` (deduplicated)."""
+        existing_content = self.get_ignore_content(repo_path)
+        existing_lines = existing_content.splitlines()
+        existing_active = {
+            line.strip()
+            for line in existing_lines
+            if line.strip() and not line.strip().startswith("#")
+        }
+        to_add: List[str] = []
+        for pat in patterns:
+            for subline in pat.splitlines():
+                cleaned = subline.strip()
+                if not cleaned:
+                    continue
+                if cleaned not in existing_active and cleaned not in to_add:
+                    to_add.append(cleaned)
+        if to_add:
+            new_lines = existing_lines + to_add
+            self.set_ignore_content(repo_path, "\n".join(new_lines) + "\n")
+        return self.get_ignore_rules(repo_path)
+
+    def remove_ignore_rules(self, repo_path: str, patterns: List[str]) -> List[str]:
+        """Remove matching rule lines from ``.git/codebase-rag/ignore``."""
+        targets = {
+            subline.strip()
+            for pat in patterns
+            for subline in pat.splitlines()
+            if subline.strip()
+        }
+        if not targets:
+            return self.get_ignore_rules(repo_path)
+        existing_lines = self.get_ignore_content(repo_path).splitlines()
+        kept_lines = [line for line in existing_lines if line.strip() not in targets]
+        self.set_ignore_content(
+            repo_path,
+            ("\n".join(kept_lines) + "\n") if kept_lines else "",
+        )
+        return self.get_ignore_rules(repo_path)
+
+    def is_file_ignored(self, repo_path: str, file_path: str) -> bool:
+        """Check whether a repository file is ignored by global or project ignore rules."""
+        clean_path = normalize_repo_relative_path(repo_path, file_path)
+        repo_lines = self.get_ignore_content(repo_path).splitlines()
+        repo_rules = compile_gitignore_lines(repo_lines) if repo_lines else None
+        return self._file_filter.is_ignored(clean_path, repo_rules=repo_rules)
 
     # =========================================================================
     # 2.1 Get file tree
@@ -105,15 +216,13 @@ class GitOperationsService:
         Args:
             repo_path: Absolute path to the Git repository root.
             ref: Branch name or commit hash.
-            include_uncertain: If True, also include gray-area files
-                (useful for loading existing data from persistent storage).
+            include_uncertain: Retained for call-site compatibility (no-op).
 
         Returns:
-            List of FileEntry (files passing the filter).
+            List of FileEntry (files passing global + repo ignore rules).
         """
         stdout = await self._run_git(repo_path, ["ls-tree", "-r", "--full-tree", ref])
 
-        # Parse: "<mode> <type> <hash>\t<path>"
         raw_paths: List[str] = []
         blob_map: Dict[str, str] = {}
 
@@ -129,8 +238,8 @@ class GitOperationsService:
             raw_paths.append(normalized)
             blob_map[normalized] = blob_hash
 
-        # Apply file filter
-        result = self._file_filter.filter(raw_paths)
+        repo_ignore_lines = self.get_ignore_content(repo_path).splitlines()
+        result = self._file_filter.filter(raw_paths, repo_ignore_lines=repo_ignore_lines)
 
         logger.info(
             "get_file_tree_filtered",
@@ -139,17 +248,10 @@ class GitOperationsService:
             raw=len(raw_paths),
             included=len(result.included),
             excluded=len(result.excluded),
-            uncertain=len(result.uncertain),
-            include_uncertain=include_uncertain,
-            accepted=len(result.included) + (len(result.uncertain) if include_uncertain else 0),
         )
 
-        accepted = result.included
-        if include_uncertain:
-            accepted = result.included + result.uncertain
-
         entries = []
-        for path in accepted:
+        for path in result.included:
             blob = blob_map[path]
             entries.append(FileEntry(
                 file_path=path,
@@ -159,9 +261,16 @@ class GitOperationsService:
 
         return entries
 
-    def get_filter_result(self, file_paths: List[str]) -> FilterResult:
-        """Expose filter result (included + uncertain) for external gray-area processing."""
-        return self._file_filter.filter(file_paths)
+    def get_filter_result(
+        self, file_paths: List[str], repo_path: Optional[str] = None,
+    ) -> FilterResult:
+        """Apply global and optional repo-level ignore filtering."""
+        repo_lines = (
+            self.get_ignore_content(repo_path).splitlines()
+            if repo_path
+            else None
+        )
+        return self._file_filter.filter(file_paths, repo_ignore_lines=repo_lines)
 
     # =========================================================================
     # 2.2 Get changed files
@@ -170,15 +279,11 @@ class GitOperationsService:
     async def get_changed_files(
         self, repo_path: str, old_ref: str, new_ref: str,
     ) -> ChangedFilesResult:
-        """Get files changed between two refs, with L1+L2 filtering.
+        """Get files changed between two refs, with global + per-repo ignore filtering.
 
         Pure renames (R status with identical blob hash) are captured as
         ``RenamedFileEntry`` — no LLM / embedding regeneration needed.
         Renames with content changes are decomposed into delete + add.
-
-        Returns:
-            ChangedFilesResult with ``changes`` (L2 included) and
-            ``uncertain`` (gray area, needs L3 classification).
         """
         stdout = await self._run_git(
             repo_path, ["diff", "--name-status", f"{old_ref}..{new_ref}"]
@@ -187,14 +292,13 @@ class GitOperationsService:
         added_paths: List[str] = []
         modified_paths: List[str] = []
         deleted_paths: List[str] = []
-        # (old_path, new_path) pairs for R status — resolved after blob check
         rename_pairs: List[tuple] = []
 
         for line in stdout.splitlines():
             if not line:
                 continue
             parts = line.split("\t")
-            status = parts[0][0]  # First char: A, M, D, R, C, etc.
+            status = parts[0][0]
 
             if status == "A":
                 added_paths.append(parts[1].replace("\\", "/"))
@@ -207,28 +311,24 @@ class GitOperationsService:
                 new_path = parts[2].replace("\\", "/")
                 rename_pairs.append((old_path, new_path))
 
-        # Resolve rename pairs: check blob hashes to distinguish pure renames
-        # from renames-with-content-change.
-        pure_renames: List[tuple] = []  # (old_path, new_path, blob_hash)
+        pure_renames: List[tuple] = []
         for old_path, new_path in rename_pairs:
             old_blob = await self.get_blob_hash(repo_path, old_ref, old_path)
             new_blob = await self.get_blob_hash(repo_path, new_ref, new_path)
             if old_blob and new_blob and old_blob == new_blob:
-                # Pure rename: same content, only path changed
                 pure_renames.append((old_path, new_path, old_blob))
             else:
-                # Content also changed — decompose to D + A
                 deleted_paths.append(old_path)
                 added_paths.append(new_path)
 
-        # Filter all non-rename paths (L1 blacklist + L2 whitelist)
         all_paths = set(added_paths + modified_paths + deleted_paths)
-        # For renames, filter by new_path (the path going forward)
         rename_new_paths = [new_p for _, new_p, _ in pure_renames]
         all_paths.update(rename_new_paths)
-        filter_result = self._file_filter.filter(list(all_paths))
+        repo_ignore_lines = self.get_ignore_content(repo_path).splitlines()
+        filter_result = self._file_filter.filter(
+            list(all_paths), repo_ignore_lines=repo_ignore_lines,
+        )
         included_set = set(filter_result.included)
-        uncertain_set = set(filter_result.uncertain)
 
         async def _build_entries(
             paths: List[str], path_set: set, ref: str,
@@ -281,17 +381,10 @@ class GitOperationsService:
                 ))
             return entries
 
-        # Build included entries
         inc_added = await _build_entries(added_paths, included_set, new_ref)
         inc_modified = await _build_modified(modified_paths, included_set)
         inc_deleted = await _build_entries(deleted_paths, included_set, old_ref)
         inc_renamed = _build_renamed(pure_renames, included_set)
-
-        # Build uncertain entries
-        unc_added = await _build_entries(added_paths, uncertain_set, new_ref)
-        unc_modified = await _build_modified(modified_paths, uncertain_set)
-        unc_deleted = await _build_entries(deleted_paths, uncertain_set, old_ref)
-        unc_renamed = _build_renamed(pure_renames, uncertain_set)
 
         logger.info(
             "get_changed_files",
@@ -302,10 +395,6 @@ class GitOperationsService:
             included_mod=len(inc_modified),
             included_del=len(inc_deleted),
             included_ren=len(inc_renamed),
-            uncertain_add=len(unc_added),
-            uncertain_mod=len(unc_modified),
-            uncertain_del=len(unc_deleted),
-            uncertain_ren=len(unc_renamed),
             excluded=len(filter_result.excluded),
         )
 
@@ -313,10 +402,6 @@ class GitOperationsService:
             changes=ChangedFiles(
                 added=inc_added, modified=inc_modified, deleted=inc_deleted,
                 renamed=inc_renamed,
-            ),
-            uncertain=ChangedFiles(
-                added=unc_added, modified=unc_modified, deleted=unc_deleted,
-                renamed=unc_renamed,
             ),
             excluded_count=len(filter_result.excluded),
         )
@@ -334,7 +419,7 @@ class GitOperationsService:
         )
 
     # =========================================================================
-    # 2.4 Get file content
+    # 2.4 Get file content (text & binary + Git LFS resolution)
     # =========================================================================
 
     async def get_file_content(self, repo_path: str, blob_hash: str) -> str:
@@ -345,6 +430,98 @@ class GitOperationsService:
             if "not a valid object name" in e.stderr or "does not exist" in e.stderr:
                 raise GitFileNotFoundError(blob_hash, blob_hash) from e
             raise
+
+    async def get_file_bytes(
+        self,
+        repo_path: str,
+        blob_hash: str,
+        file_path: Optional[str] = None,
+    ) -> bytes:
+        """Get raw file bytes by blob hash, automatically resolving Git LFS pointers.
+
+        If the Git blob is a Git LFS pointer (``version https://git-lfs.github.com/spec/v1``):
+        1. Checks if the working tree file at ``file_path`` exists and is already
+           materialized (non-pointer bytes).
+        2. Otherwise pipes the pointer through ``git lfs smudge`` to retrieve
+           the actual binary bytes.
+        """
+        try:
+            raw = await self._run_git_bytes(repo_path, ["cat-file", "blob", blob_hash])
+        except GitCommandError as e:
+            if "not a valid object name" in e.stderr or "does not exist" in e.stderr:
+                raise GitFileNotFoundError(file_path or blob_hash, blob_hash) from e
+            raise
+
+        if raw.startswith(_LFS_POINTER_PREFIX):
+            raw = await self._resolve_lfs_pointer_bytes(repo_path, raw, file_path=file_path)
+
+        return raw
+
+    async def get_workdir_file_bytes(self, repo_path: str, file_path: str) -> bytes:
+        """Read raw bytes of a file in the working tree, resolving Git LFS pointers if needed."""
+        clean_path = normalize_repo_relative_path(repo_path, file_path)
+        abs_path = os.path.join(repo_path, clean_path)
+        if not os.path.isfile(abs_path):
+            raise GitFileNotFoundError(clean_path, "working directory")
+
+        raw = await asyncio.to_thread(Path(abs_path).read_bytes)
+        if raw.startswith(_LFS_POINTER_PREFIX):
+            raw = await self._resolve_lfs_pointer_bytes(repo_path, raw, file_path=clean_path)
+        return raw
+
+    async def _resolve_lfs_pointer_bytes(
+        self,
+        repo_path: str,
+        pointer_bytes: bytes,
+        file_path: Optional[str] = None,
+    ) -> bytes:
+        """Resolve a Git LFS pointer to actual binary bytes."""
+        # 1. Check working tree file if available and materialized
+        if file_path:
+            clean_path = normalize_repo_relative_path(repo_path, file_path)
+            abs_path = os.path.join(repo_path, clean_path)
+            if os.path.isfile(abs_path):
+                try:
+                    wt_bytes = await asyncio.to_thread(Path(abs_path).read_bytes)
+                    if wt_bytes and not wt_bytes.startswith(_LFS_POINTER_PREFIX):
+                        return wt_bytes
+                except OSError:
+                    pass
+
+        # 2. Try git lfs smudge
+        smudge_args = ["lfs", "smudge"]
+        if file_path:
+            smudge_args.append(normalize_repo_relative_path(repo_path, file_path))
+        try:
+            smudged = await self._run_git_bytes(
+                repo_path, smudge_args, stdin_bytes=pointer_bytes,
+            )
+            if smudged and not smudged.startswith(_LFS_POINTER_PREFIX):
+                return smudged
+        except Exception as e:
+            logger.warning(
+                "git_lfs_smudge_failed",
+                repo=repo_path,
+                file_path=file_path,
+                error=str(e)[:200],
+            )
+
+        raise GitCommandError(
+            command="git lfs smudge",
+            returncode=1,
+            stderr=(
+                f"文件 {file_path or ''} 是 Git LFS 指针文件且本地未检出真实二进制内容，"
+                "请先执行 git lfs pull 检出真实文件。"
+            ),
+        )
+
+    @staticmethod
+    def detect_file_modality(
+        file_path: str,
+        raw_bytes: Optional[bytes] = None,
+    ) -> Tuple[Literal["text", "image", "unsupported_binary"], Optional[str]]:
+        """Detect whether a file is text, supported image (.png/.jpg/.jpeg), or unsupported binary."""
+        return classify_file_modality(file_path, raw_bytes=raw_bytes)
 
     # =========================================================================
     # 2.5 Get HEAD info
@@ -366,7 +543,6 @@ class GitOperationsService:
                 is_detached=False,
             )
         except GitCommandError:
-            # Detached HEAD
             return HeadInfo(
                 commit_hash=commit_hash,
                 branch_name=None,
@@ -399,37 +575,18 @@ class GitOperationsService:
     # =========================================================================
 
     async def get_root_commit(self, repo_path: str) -> Optional[str]:
-        """Return the deterministic root commit hash of the repository.
-
-        Used as a stable, cross-clone identity anchor for the repository —
-        independent of remote URL, branch / tag refs, working directory, or
-        local config.  Any two clones of the same repository (regardless of
-        URL changes, renames, mirrors, or migrations) share the same root
-        commit, making this the only Git-native value that yields cross-user
-        consistent project identification without external coordination.
-
-        For repositories with multiple root commits (e.g. merged subtrees,
-        ``git replace`` grafts), the lexicographically smallest hash is
-        returned so the result is fully deterministic.
-
-        Returns:
-            Hex-encoded SHA-1 of the chosen root commit, or ``None`` if the
-            repository has no committed history yet (e.g. freshly
-            ``git init``'d with no commits).
-        """
+        """Return the deterministic root commit hash of the repository."""
         try:
             stdout = await self._run_git(
                 repo_path, ["rev-list", "--max-parents=0", "HEAD"],
             )
         except (GitCommandError, GitRefNotFoundError):
-            # Empty repo: HEAD points to an unborn branch and rev-list fails
             return None
 
         roots = [line.strip() for line in stdout.splitlines() if line.strip()]
         if not roots:
             return None
 
-        # Deterministic ordering: lexicographically smallest root commit hash
         return min(roots)
 
     # =========================================================================
@@ -454,7 +611,6 @@ class GitOperationsService:
         if not stdout:
             return None
 
-        # "<mode> <type> <hash>\t<path>"
         parts = stdout.split("\t", 1)
         if strict:
             fields = parts[0].split()
@@ -483,33 +639,25 @@ class GitOperationsService:
     async def get_workdir_blob_hash(
         self, repo_path: str, file_path: str,
     ) -> str:
-        """Compute blob hash for a working directory file via git hash-object.
+        """Compute blob hash for a working directory file via git hash-object --filters.
 
-        Unlike get_blob_hash() which queries committed refs, this operates
-        on the actual file in the working directory (potentially uncommitted).
-
-        The returned hash is identical to what git ls-tree would show
-        after the file is committed (assuming content doesn't change).
-
-        Args:
-            repo_path: Absolute path to the Git repository root.
-            file_path: File path relative to the repository root.
-
-        Returns:
-            Git blob SHA-1 hash string.
-
-        Raises:
-            GitFileNotFoundError: If the file does not exist in the working directory.
-            GitCommandError: If git hash-object fails.
+        Using ``--filters`` ensures that files tracked via Git LFS or clean filters
+        yield the exact same blob hash in the working directory as ``git ls-tree``
+        after commit. Falls back to plain ``hash-object`` if ``--filters`` fails.
         """
         clean_path = normalize_repo_relative_path(repo_path, file_path)
         abs_path = os.path.join(repo_path, clean_path)
         if not os.path.exists(abs_path):
             raise GitFileNotFoundError(clean_path, "working directory")
 
-        stdout = await self._run_git(
-            repo_path, ["hash-object", "--", clean_path],
-        )
+        try:
+            stdout = await self._run_git(
+                repo_path, ["hash-object", "--filters", "--", clean_path],
+            )
+        except GitCommandError:
+            stdout = await self._run_git(
+                repo_path, ["hash-object", "--", clean_path],
+            )
         blob_hash = stdout.strip()
         if not blob_hash:
             raise GitCommandError(
@@ -539,23 +687,16 @@ class GitOperationsService:
             return RepoValidation(is_valid=False, error=str(e))
 
     # =========================================================================
-    # 2.11 Compute file_version_id (also used internally)
-    # =========================================================================
-
-    # Exposed as module-level function below
-
-    # =========================================================================
     # Internal: git command executor
     # =========================================================================
 
-    async def _run_git(self, repo_path: str, args: List[str]) -> str:
-        """Unified git command executor.
-
-        - Builds command: [git_executable, -C, repo_path] + args
-        - Per-repo semaphore for concurrency control
-        - Timeout enforcement
-        - Stdout/stderr capture
-        """
+    async def _run_git_bytes(
+        self,
+        repo_path: str,
+        args: List[str],
+        stdin_bytes: Optional[bytes] = None,
+    ) -> bytes:
+        """Execute a git command and return raw stdout bytes without UTF-8 corruption."""
         sem = self._get_repo_semaphore(repo_path)
         cmd = [self._config.git_executable, "-C", repo_path] + args
         cmd_str = " ".join(cmd)
@@ -565,11 +706,12 @@ class GitOperationsService:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
+                    stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
+                    proc.communicate(input=stdin_bytes),
                     timeout=self._config.command_timeout,
                 )
             except asyncio.TimeoutError:
@@ -578,29 +720,31 @@ class GitOperationsService:
                 raise GitTimeoutError(cmd_str, self._config.command_timeout)
 
             elapsed = time.monotonic() - start
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
             stderr = stderr_bytes.decode("utf-8", errors="replace")
 
             logger.debug(
-                "git_command_executed",
+                "git_command_bytes_executed",
                 command=cmd_str,
                 elapsed_ms=round(elapsed * 1000, 1),
                 returncode=proc.returncode,
-                stdout_lines=stdout.count("\n"),
+                stdout_bytes=len(stdout_bytes),
             )
 
             if proc.returncode != 0:
-                # Detect specific error types
                 if "not a git repository" in stderr.lower():
                     raise GitRepositoryError(f"Not a Git repository: {repo_path}")
                 if "unknown revision" in stderr.lower() or "bad revision" in stderr.lower():
-                    # Extract ref from args
                     ref = args[1] if len(args) > 1 else "unknown"
                     raise GitRefNotFoundError(ref)
 
                 raise GitCommandError(cmd_str, proc.returncode, stderr)
 
-            return stdout
+            return stdout_bytes
+
+    async def _run_git(self, repo_path: str, args: List[str]) -> str:
+        """Unified git command executor returning UTF-8 decoded stdout."""
+        stdout_bytes = await self._run_git_bytes(repo_path, args)
+        return stdout_bytes.decode("utf-8", errors="replace")
 
     def _get_repo_semaphore(self, repo_path: str) -> asyncio.Semaphore:
         """Get or create a per-repo semaphore for concurrency control."""
@@ -627,7 +771,6 @@ class GitOperationsService:
             raise GitNotFoundError("Git version check timed out")
 
         version_str = stdout_bytes.decode("utf-8").strip()
-        # Parse "git version 2.x.x ..."
         match = re.search(r"(\d+)\.(\d+)", version_str)
         if not match:
             raise GitNotFoundError(f"Cannot parse git version: {version_str}")
@@ -647,29 +790,21 @@ class GitOperationsService:
 
 
 def normalize_repo_relative_path(repo_path: str, file_path: str) -> str:
-    """Normalize an incoming file path to a canonical repository-relative POSIX path.
-
-    Handles:
-      - Absolute paths matching repo_path (Windows backslash, POSIX forward slash, mixed, drive-letter case).
-      - Relative paths (with Windows backslash, POSIX forward slash, leading slashes).
-    """
+    """Normalize an incoming file path to a canonical repository-relative POSIX path."""
     if not file_path:
         return ""
 
     norm_file = os.path.normpath(file_path)
     norm_repo = os.path.normpath(repo_path)
 
-    # 1. If file_path is an absolute path within repo_path
     if os.path.isabs(norm_file):
         try:
             rel = os.path.relpath(norm_file, norm_repo)
             if not rel.startswith(".."):
                 return rel.replace("\\", "/").strip().lstrip("/")
         except ValueError:
-            # On Windows, relpath across different drives raises ValueError
             pass
 
-    # 2. Fallback string prefix stripping (handles POSIX paths, case-insensitive drive/path differences)
     clean_file = file_path.replace("\\", "/").strip()
     clean_repo = repo_path.replace("\\", "/").strip().rstrip("/")
     if clean_file.lower().startswith(clean_repo.lower() + "/"):
@@ -679,17 +814,9 @@ def normalize_repo_relative_path(repo_path: str, file_path: str) -> str:
 
 
 def compute_file_version_id(file_path: str, blob_hash: str) -> str:
-    """Compute file_version_id = sha256(filePath + blobHash).
-
-    Args:
-        file_path: Repository-relative path (/ separator).
-        blob_hash: Git blob SHA-1 hash.
-
-    Returns:
-        Hex-encoded SHA-256 hash string.
-    """
-    # Normalize to / separator
+    """Compute file_version_id = sha256(filePath + blobHash)."""
     normalized = file_path.replace("\\", "/")
     return hashlib.sha256(
         (normalized + blob_hash).encode("utf-8")
     ).hexdigest()
+

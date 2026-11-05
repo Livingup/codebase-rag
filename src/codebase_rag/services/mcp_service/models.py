@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 
+from codebase_rag.common.types import FileType
+
+
 @dataclass(frozen=True)
 class SearchResultPoint:
     """A single reranked search result returned to the MCP client.
@@ -14,11 +17,13 @@ class SearchResultPoint:
       - score: LLM reranker relevance score (0.0~1.0)
       - file_path: absolute path (project_path + relative)
       - business_description: full business description text
+      - file_type: "text" | "image"
     """
 
     score: float
     file_path: str
     business_description: str
+    file_type: FileType = "text"
 
 
 @dataclass
@@ -31,12 +36,13 @@ class RerankerScoreEntry:
 
 @dataclass
 class CandidatePoint:
-    """A candidate point from Stage 1 hybrid search, used as reranker input."""
+    """A candidate point from Stage 1 vector search, used as reranker input."""
 
     id: str                 # file_version_id — unique point identifier
     file_path: str          # relative path from Qdrant
     business_description: str
     vector_score: float     # original vector similarity score
+    file_type: FileType = "text"
 
 
 # =============================================================================

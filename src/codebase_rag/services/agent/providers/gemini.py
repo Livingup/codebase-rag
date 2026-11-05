@@ -156,7 +156,23 @@ class GeminiLLMProvider(LLMProvider):
             elif msg.content:
                 if msg.thinking_content:
                     parts.append({"text": msg.thinking_content, "thought": True})
-                parts.append({"text": msg.content})
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text":
+                            parts.append({"text": str(block.get("text", ""))})
+                        elif btype == "image_url":
+                            url = str((block.get("image_url") or {}).get("url", ""))
+                            if url.startswith("data:") and ";base64," in url:
+                                header, b64_data = url.split(";base64,", 1)
+                                mime = header[5:] or "image/png"
+                                parts.append(
+                                    {"inlineData": {"mimeType": mime, "data": b64_data}}
+                                )
+                else:
+                    parts.append({"text": msg.content})
 
             if parts:
                 contents.append({"role": role, "parts": parts})

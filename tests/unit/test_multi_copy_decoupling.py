@@ -68,7 +68,6 @@ def _point(file_path: str, point_id: int) -> models.PointStruct:
         id=point_id,
         vector={
             "dense": [1.0, 0.0],
-            "sparse": models.SparseVector(indices=[1], values=[1.0]),
         },
         payload={
             "file_version_id": f"version-{point_id}",

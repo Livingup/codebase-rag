@@ -27,8 +27,8 @@
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [knowledge_set_id]：`sha256(规范 JSON{project_id, file_version_id, payloads(排序键)})`——一次知识提交全部分块的确定性集合标识。
   2. [点 ID 公式]：`uuid5(NAMESPACE_URL, "codebase-rag:point:{project_id}:{file_version_id}:{knowledge_set_id}:{chunk_index}")`——同输入必得同点 ID，重写即覆盖。
-  3. [payload 规范]：每点附 knowledge_set_id / chunk_index / chunk_count。
-  4. [批量确认]：按 `upsert_batch_size=100` 分批 `upsert(wait=True)`；异常包装 QdrantOperationError 上抛；返回 True 即服务端确认。
+  3. [payload 与向量规范]：每点只写 `dense_vectors`（3072 维 Cosine），payload 含 `project_id`、`file_version_id`、`file_path`、`file_type`（`"text"` | `"image"`）、`entity_type`、`entity_name`、`business_description`、`blob_hash`、`knowledge_set_id`、`chunk_index`、`chunk_count`。
+  4. [批量确认]：按 `upsert_batch_size=100` 分批 `upsert(wait=True)`；异常包装 `QdrantOperationError` 上抛；返回 `True` 即服务端确认。
 - **级联依赖功能单元（Cascade Links）**：FEAT-KS-01（调用方）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无

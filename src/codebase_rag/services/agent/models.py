@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ class Message:
     """A single message in a conversation."""
 
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: Optional[str] = None
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     thinking_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None  # for role="tool"

@@ -68,10 +68,10 @@ class EmbeddingProviderConfig(BaseModel):
     """Base configuration for an embedding provider."""
 
     api_base_url: Optional[str] = None
-    model_name: str
+    model_name: str = "gemini-embedding-2"
     dimension: Optional[int] = None
     batch_size: int = 100
-    max_tokens_per_text: int = 2048
+    max_tokens_per_text: int = 8192
     request_timeout: int = 30
     api_keys: List[ApiKeyConfig] = Field(default_factory=list)
     retry: RetryConfig = Field(default_factory=RetryConfig)
@@ -84,18 +84,10 @@ class DenseEmbeddingConfig(BaseModel):
     providers: Dict[str, EmbeddingProviderConfig] = Field(default_factory=dict)
 
 
-class SparseEmbeddingConfig(BaseModel):
-    """Sparse vector embedding configuration."""
-
-    active_provider: str = "dashscope"
-    providers: Dict[str, EmbeddingProviderConfig] = Field(default_factory=dict)
-
-
 class EmbeddingConfig(BaseModel):
     """Full embedding service configuration."""
 
     dense: DenseEmbeddingConfig = Field(default_factory=DenseEmbeddingConfig)
-    sparse: SparseEmbeddingConfig = Field(default_factory=SparseEmbeddingConfig)
     max_concurrency: int = 3
 
 
@@ -121,10 +113,6 @@ class VectorConfig(BaseModel):
     distance: str = "Cosine"
 
 
-class SparseVectorConfig(BaseModel):
-    name: str = "sparse"
-
-
 class HnswConfig(BaseModel):
     enabled: bool = False
     m: int = 16
@@ -139,7 +127,6 @@ class PayloadIndexConfig(BaseModel):
 class CollectionConfig(BaseModel):
     name: str = "codebase"
     dense_vector: VectorConfig = Field(default_factory=VectorConfig)
-    sparse_vector: SparseVectorConfig = Field(default_factory=SparseVectorConfig)
     hnsw_config: HnswConfig = Field(default_factory=HnswConfig)
     payload_indexes: List[PayloadIndexConfig] = Field(default_factory=lambda: [
         PayloadIndexConfig(field="file_version_id"),
@@ -169,7 +156,6 @@ class MemoryCacheConfig(BaseModel):
 class MemoryInstanceConfig(BaseModel):
     collection_name: str = "codebase"
     dense_vector: VectorConfig = Field(default_factory=VectorConfig)
-    sparse_vector: SparseVectorConfig = Field(default_factory=SparseVectorConfig)
     hnsw_config: HnswConfig = Field(default_factory=lambda: HnswConfig(enabled=True))
     payload_indexes: List[PayloadIndexConfig] = Field(default_factory=lambda: [
         PayloadIndexConfig(field="file_version_id"),
@@ -183,8 +169,7 @@ class MemoryInstanceConfig(BaseModel):
 class SearchConfig(BaseModel):
     default_top_k: int = 10
     max_top_k: int = 50
-    dense_weight: float = 0.7
-    sparse_weight: float = 0.3
+    dense_weight: float = 1.0
     rrf_k: int = 60
     prefetch_limit: int = 50
 
@@ -349,18 +334,8 @@ class ManagementApiConfig(BaseModel):
 # =============================================================================
 
 
-class UncertainFilterConfig(BaseModel):
-    enabled: bool = True
-    binary_detection: bool = True
-    classify_batch_size: int = 50
-    store_path: str = ""
-
-
 class FileFilterConfig(BaseModel):
     exclude_patterns: List[str] = Field(default_factory=list)
-    include_extensions: List[str] = Field(default_factory=list)
-    include_filenames: List[str] = Field(default_factory=list)
-    uncertain: UncertainFilterConfig = Field(default_factory=UncertainFilterConfig)
 
 
 class GitOperationsConfig(BaseModel):
@@ -377,7 +352,7 @@ class GitOperationsConfig(BaseModel):
 
 class ContentCommitConfig(BaseModel):
     max_file_concurrency: int = 5
-    point_token_limit: int = 2048      # max tokens per knowledge point description
+    point_token_limit: int = 8192      # max tokens per knowledge point description
     skip_unchanged_hash: bool = True
 
 
@@ -405,13 +380,6 @@ class KnowledgeProducerConfig(BaseModel):
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
 
 
-class GrayAreaClassifierConfig(BaseModel):
-    """Config for the gray_area_classifier agent (file type classification)."""
-    providers: List[WorkflowProviderEntry] = Field(default_factory=list)
-    timeout: int = 30                   # agent timeout in seconds
-    max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
-
-
 class CompensationConfig(BaseModel):
     """Config for the background failed-file compensation task."""
     enabled: bool = True                # enable/disable compensation loop
@@ -428,7 +396,6 @@ class WorkflowConfig(BaseModel):
     branch_switch: BranchSwitchConfig = Field(default_factory=BranchSwitchConfig)
     initialization: InitializationConfig = Field(default_factory=InitializationConfig)
     knowledge_producer: KnowledgeProducerConfig = Field(default_factory=KnowledgeProducerConfig)
-    gray_area_classifier: GrayAreaClassifierConfig = Field(default_factory=GrayAreaClassifierConfig)
     compensation: CompensationConfig = Field(default_factory=CompensationConfig)
 
 
@@ -519,7 +486,7 @@ class MCPRerankerConfig(BaseModel):
 
 class KnowledgeSubmissionConfig(BaseModel):
     """MCP knowledge submission limits."""
-    point_token_limit: int = 2048  # 单条知识描述最大 tokens
+    point_token_limit: int = 8192  # 单条知识描述最大 tokens
 
 
 class MCPConfig(BaseModel):
@@ -539,7 +506,7 @@ class MCPConfig(BaseModel):
             return data
         migrated = dict(data)
         migrated["knowledge_submission"] = {
-            "point_token_limit": legacy.get("point_token_limit", 2048),
+            "point_token_limit": legacy.get("point_token_limit", 8192),
         }
         return migrated
 
@@ -588,14 +555,6 @@ class AppConfig(BaseModel):
             or not self.management_api.registry_path
         ):
             self.management_api.registry_path = _join_config_path(runtime_data_dir, "project_registry.json")
-
-        uncertain = self.git_operations.file_filter.uncertain
-        uncertain_fields = uncertain.model_fields_set
-        if (
-            "store_path" not in uncertain_fields
-            or not uncertain.store_path
-        ):
-            uncertain.store_path = _join_config_path(runtime_data_dir, "gray_area_classifications.json")
 
         workflow_fields = self.workflow.model_fields_set
         if (

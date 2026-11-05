@@ -511,7 +511,7 @@ class AgentService:
         agent_name: str,
         input_variables: Dict[str, str],
         tool_handlers: Optional[Dict[str, Callable[..., Coroutine]]] = None,
-        user_message: Optional[str] = None,
+        user_message: Optional[Union[str, List[Dict[str, object]]]] = None,
     ) -> AgentResult:
         """Run a registered Agent through the execution loop."""
         self._check_initialized()

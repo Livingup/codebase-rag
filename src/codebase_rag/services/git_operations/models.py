@@ -54,16 +54,13 @@ class ChangedFiles:
 
 @dataclass(frozen=True)
 class ChangedFilesResult:
-    """Full result of get_changed_files with L1+L2 filter breakdown.
-
-    ``changes`` contains files that passed the whitelist (L2).
-    ``uncertain`` contains gray-area files needing L3 classification.
-    ``excluded_count`` is the number of blacklisted files (L1), for logging.
-    """
+    """Result of get_changed_files after applying global and per-repo ignore rules."""
 
     changes: ChangedFiles
-    uncertain: ChangedFiles
-    excluded_count: int
+    excluded_count: int = 0
+    uncertain: ChangedFiles = field(
+        default_factory=lambda: ChangedFiles(added=[], modified=[], deleted=[], renamed=[])
+    )
 
 
 @dataclass(frozen=True)

@@ -12,17 +12,24 @@ branch-switch and knowledge-production workflows by coordinating:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 from qdrant_client import models
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.paths import normalize_repo_key
 from codebase_rag.common.token_counter import TokenCounter
-from codebase_rag.common.types import SparseVector
+from codebase_rag.common.types import (
+    EmbedInputItem,
+    FileType,
+    IMAGE_TOKEN_COST,
+    MultimodalEmbedInput,
+    SparseVector,
+)
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import WorkflowConfig
 from codebase_rag.services.agent.errors import AgentTaskComplete
@@ -31,7 +38,6 @@ from codebase_rag.services.agent.service import AgentService
 from codebase_rag.services.embedding.service import EmbeddingService
 from codebase_rag.services.event_detection.models import EventType, GitEvent
 from codebase_rag.services.git_operations.errors import GitFileNotFoundError
-from codebase_rag.services.git_operations.gray_area_store import GrayAreaStore
 from codebase_rag.services.git_operations.models import ChangedFiles, RenamedFileEntry
 from codebase_rag.services.git_operations.service import GitOperationsService
 from codebase_rag.services.knowledge_sync.models import KnowledgeSyncSource
@@ -56,7 +62,6 @@ from codebase_rag.services.workflow.task_queue import ProjectTaskQueue, Workflow
 logger = get_logger(__name__)
 
 _KP_AGENT_PREFIX = "knowledge_producer"
-_GRAY_AGENT_PREFIX = "gray_area_classifier"
 
 
 class WorkflowOrchestratorService:
@@ -115,13 +120,6 @@ class WorkflowOrchestratorService:
         self._kp_provider_order: List[str] = []
         # 服务商名称 → 该服务商下所有 agent 名称列表（按优先级排序）
         self._kp_provider_agents: Dict[str, List[str]] = {}
-
-        # gray_area_classifier agent 状态
-        self._gray_system_prompt: str = ""
-        self._gray_tools: List[ToolSchema] = []
-        self._gray_agent_names: List[str] = []
-        self._gray_provider_order: List[str] = []
-        self._gray_provider_agents: Dict[str, List[str]] = {}
 
         # Retry queue: project_id → list of FailedFileRecord
         self._retry_queues: Dict[str, List[FailedFileRecord]] = {}
@@ -196,7 +194,6 @@ class WorkflowOrchestratorService:
         logger.info(
             "workflow_service_reconciled",
             kp_providers=list(self._kp_provider_order),
-            gray_providers=list(self._gray_provider_order),
         )
 
     async def shutdown(self) -> None:
@@ -718,21 +715,15 @@ class WorkflowOrchestratorService:
             prev_commit=previous_commit[:8],
         )
 
-        # Step 1: Get changed files (L1 blacklist + L2 whitelist)
+        # Step 1: Get changed files (filtered by global exclude_patterns + .git/codebase-rag/ignore)
         result = await self._git_ops.get_changed_files(
             repo_path, previous_commit, commit_hash,
         )
 
-        # Step 1b: Apply L3 gray-area classification to uncertain files
-        l3_added, l3_modified, l3_deleted, l3_renamed = await self._classify_uncertain_files(
-            result.uncertain,
-        )
-
-        # Merge L2-included + L3-included
-        all_added = list(result.changes.added) + l3_added
-        all_modified = list(result.changes.modified) + l3_modified
-        all_deleted = list(result.changes.deleted) + l3_deleted
-        all_renamed = list(result.changes.renamed) + l3_renamed
+        all_added = list(result.changes.added)
+        all_modified = list(result.changes.modified)
+        all_deleted = list(result.changes.deleted)
+        all_renamed = list(result.changes.renamed)
 
         logger.info(
             "workflow_content_commit_diff",
@@ -741,10 +732,6 @@ class WorkflowOrchestratorService:
             modified_files=len(all_modified),
             deleted_files=len(all_deleted),
             renamed_files=len(all_renamed),
-            l3_added=len(l3_added),
-            l3_modified=len(l3_modified),
-            l3_deleted=len(l3_deleted),
-            l3_renamed=len(l3_renamed),
             excluded=result.excluded_count,
         )
 
@@ -1315,29 +1302,71 @@ class WorkflowOrchestratorService:
                 return (0, True, 0, True)
             return (sync_result.points_count, False, 0, True)
 
-        # Get file content
-        source_code = await self._git_ops.get_file_content(repo_path, blob_hash)
+        # Detect file modality (text vs supported image .png/.jpg/.jpeg)
+        raw_bytes = await self._git_ops.get_file_bytes(
+            repo_path, blob_hash, file_path=file_path,
+        )
+        modality, mime_type = self._git_ops.detect_file_modality(file_path, raw_bytes)
+        if modality == "unsupported_binary":
+            logger.info(
+                "workflow_file_unsupported_binary_skip",
+                file_path=file_path,
+                file_version_id=file_version_id[:16],
+            )
+            return (0, True, 0, False)
 
-        # Build user message
-        if is_new:
-            user_message = (
-                "请根据下面新建的源码文件信息和内容，调用创建知识点tool为该文件创建业务描述知识点。\n\n"
-                f"文件路径：{file_path}\n\n"
-                f"文件内容：\n```\n{source_code}\n```"
-            )
+        file_type: FileType = "image" if modality == "image" else "text"
+        user_message: Union[str, List[Dict[str, Any]]]
+
+        if file_type == "image":
+            assert mime_type is not None
+            b64_img = base64.b64encode(raw_bytes).decode("ascii")
+            if is_new:
+                prompt_text = (
+                    "请根据下面新建的图片文件信息和视觉内容，调用创建知识点tool为该图片文件创建业务描述知识点。\n\n"
+                    f"文件路径：{file_path}\n"
+                    f"文件类型：图片（{mime_type}，大小 {len(raw_bytes)} 字节）\n\n"
+                    "请仔细观察图片中的视觉信息（如架构图、流程图、UI界面、原型图、图标、图表、文字标注等），"
+                    "按照业务描述模板详细描述该图片在项目中的技术定位、业务域、核心视觉内容与业务用途。"
+                )
+            else:
+                old_desc_text = "\n---\n".join(old_descriptions or [])
+                prompt_text = (
+                    "请根据下面修改后的图片文件信息和最新视觉内容，调用创建知识点tool为该图片文件创建业务描述知识点。\n\n"
+                    f"文件路径：{file_path}\n"
+                    f"文件类型：图片（{mime_type}，大小 {len(raw_bytes)} 字节）\n\n"
+                    f"图片修改前的业务描述知识点的描述内容：\n{old_desc_text}\n\n"
+                    "注意是给出最新完整的业务描述，不是只描述修改内容，修改前的业务描述只是辅助你理解业务。"
+                )
+            user_message = [
+                {"type": "text", "text": prompt_text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64_img}"},
+                },
+            ]
         else:
-            old_desc_text = "\n---\n".join(old_descriptions or [])
-            user_message = (
-                "请根据下面修改后的源码文件信息和内容，调用创建知识点tool为该文件创建业务描述知识点。\n\n"
-                f"文件路径：{file_path}\n\n"
-                f"修改后的完整内容：\n```\n{source_code}\n```\n\n"
-                f"文件修改前的业务描述知识点的描述内容：\n{old_desc_text}\n\n"
-                "注意是给出最新完整的业务描述，不是只描述修改内容，修改前的业务描述只是辅助你理解业务。"
-            )
+            source_code = raw_bytes.decode("utf-8", errors="replace")
+            if is_new:
+                user_message = (
+                    "请根据下面新建的源码文件信息和内容，调用创建知识点tool为该文件创建业务描述知识点。\n\n"
+                    f"文件路径：{file_path}\n\n"
+                    f"文件内容：\n```\n{source_code}\n```"
+                )
+            else:
+                old_desc_text = "\n---\n".join(old_descriptions or [])
+                user_message = (
+                    "请根据下面修改后的源码文件信息和内容，调用创建知识点tool为该文件创建业务描述知识点。\n\n"
+                    f"文件路径：{file_path}\n\n"
+                    f"修改后的完整内容：\n```\n{source_code}\n```\n\n"
+                    f"文件修改前的业务描述知识点的描述内容：\n{old_desc_text}\n\n"
+                    "注意是给出最新完整的业务描述，不是只描述修改内容，修改前的业务描述只是辅助你理解业务。"
+                )
 
         # Mutable state captured by tool handler closures
         points_written: List[PointData] = []
         token_limit = self._config.content_commit.point_token_limit
+        image_token_overhead = IMAGE_TOKEN_COST if file_type == "image" else 0
 
         # ----- Tool handler: create_knowledge_points -----
         async def _handle_create_knowledge_points(points: list, **_kwargs) -> str:
@@ -1345,12 +1374,19 @@ class WorkflowOrchestratorService:
             violations = []
             for idx, p in enumerate(points):
                 desc = p.get("business_description", "")
-                tokens = await self._token_counter.count(desc)
-                if tokens > token_limit:
-                    violations.append(
-                        f"第{idx + 1}个知识点超过{token_limit}tokens上限"
-                        f"（实际{tokens}tokens）"
-                    )
+                text_tokens = await self._token_counter.count(desc)
+                total_tokens = text_tokens + image_token_overhead
+                if total_tokens > token_limit:
+                    if image_token_overhead > 0:
+                        violations.append(
+                            f"第{idx + 1}个知识点超过{token_limit}tokens上限"
+                            f"（文本{text_tokens}tokens + 图片{image_token_overhead}tokens = {total_tokens}tokens）"
+                        )
+                    else:
+                        violations.append(
+                            f"第{idx + 1}个知识点超过{token_limit}tokens上限"
+                            f"（实际{total_tokens}tokens）"
+                        )
             if violations:
                 detail = "；".join(violations)
                 return (
@@ -1358,14 +1394,27 @@ class WorkflowOrchestratorService:
                     f"请按业务垂直划分分片，重新生成。"
                 )
 
-            # All passed — embed descriptions
+            # All passed — embed descriptions (with image if file_type == "image")
             descriptions = [p["business_description"] for p in points]
+            if file_type == "image" and mime_type:
+                embed_inputs: List[EmbedInputItem] = [
+                    MultimodalEmbedInput(
+                        text=desc,
+                        image_bytes=raw_bytes,
+                        mime_type=mime_type,
+                    )
+                    for desc in descriptions
+                ]
+            else:
+                embed_inputs = list(descriptions)
+
             logger.debug(
                 "workflow_embedding_call",
                 file_path=file_path,
+                file_type=file_type,
                 descriptions_count=len(descriptions),
             )
-            embeddings = await self._embedding.embed(descriptions)
+            embeddings = await self._embedding.embed(embed_inputs)
 
             # Build PointData with non-LLM fields filled in
             point_data_list: List[PointData] = []
@@ -1379,6 +1428,7 @@ class WorkflowOrchestratorService:
                     blob_hash=blob_hash,
                     dense_vector=emb.dense_vector,
                     sparse_vector=emb.sparse_vector,
+                    file_type=file_type,
                 ))
 
             # Accumulate in memory — actual Qdrant write happens after agent completes
@@ -1582,19 +1632,20 @@ class WorkflowOrchestratorService:
     def _records_to_point_structs(records: list) -> List[models.PointStruct]:
         """Convert Qdrant Record objects to PointStruct for in-memory upsert."""
         points = []
-        sparse_count = 0
         for rec in records:
             payload = rec.payload or {}
             vectors = {}
 
             if rec.vector:
                 if isinstance(rec.vector, dict):
-                    for name, vec in rec.vector.items():
-                        if isinstance(vec, models.SparseVector):
-                            vectors[name] = vec
-                            sparse_count += 1
-                        else:
-                            vectors[name] = vec
+                    if "dense" in rec.vector:
+                        vectors["dense"] = rec.vector["dense"]
+                    else:
+                        vectors = {
+                            name: vec
+                            for name, vec in rec.vector.items()
+                            if isinstance(vec, list)
+                        }
                 elif isinstance(rec.vector, list):
                     vectors["dense"] = rec.vector
 
@@ -1608,7 +1659,6 @@ class WorkflowOrchestratorService:
             logger.debug(
                 "records_to_point_structs",
                 total=len(points),
-                with_sparse=sparse_count,
             )
         return points
 
@@ -1630,22 +1680,24 @@ class WorkflowOrchestratorService:
         blob_hash: str,
     ) -> List[PointData]:
         dense_name = self._config_manager.config.qdrant_storage.collection.dense_vector.name
-        sparse_name = self._config_manager.config.qdrant_storage.collection.sparse_vector.name
         entity_name = os.path.basename(new_file_path)
         points: List[PointData] = []
 
         for rec in records:
             payload = rec.payload or {}
-            vector = rec.vector if isinstance(rec.vector, dict) else {}
-            dense_vector = vector.get(dense_name)
-            sparse_vector = vector.get(sparse_name)
+            if isinstance(rec.vector, dict):
+                dense_vector = rec.vector.get(dense_name)
+            elif isinstance(rec.vector, list):
+                dense_vector = rec.vector
+            else:
+                dense_vector = None
             description = payload.get("business_description")
             if not isinstance(description, str) or not description:
                 continue
             if not isinstance(dense_vector, list):
                 continue
-            if not isinstance(sparse_vector, models.SparseVector):
-                continue
+            raw_ft = payload.get("file_type", "text")
+            file_type: FileType = "image" if raw_ft == "image" else "text"
             points.append(PointData(
                 file_path=new_file_path,
                 entity_type=str(payload.get("entity_type") or "file"),
@@ -1653,10 +1705,8 @@ class WorkflowOrchestratorService:
                 business_description=description,
                 blob_hash=blob_hash,
                 dense_vector=dense_vector,
-                sparse_vector=SparseVector(
-                    indices=list(sparse_vector.indices),
-                    values=list(sparse_vector.values),
-                ),
+                sparse_vector=None,
+                file_type=file_type,
             ))
 
         return points
@@ -1727,11 +1777,9 @@ class WorkflowOrchestratorService:
     # =========================================================================
 
     async def _register_agents(self) -> None:
-        """Build agent definitions and register first provider for each agent type."""
+        """Build agent definitions and register providers for knowledge_producer."""
         self._build_kp_defs()
-        self._build_gray_defs()
         await self._init_kp_providers()
-        await self._init_gray_providers()
 
     # ----- knowledge_producer agent defs -----
 
@@ -2022,282 +2070,7 @@ class WorkflowOrchestratorService:
                 queue_index=idx,
             )
 
-    # ----- gray_area_classifier agent defs -----
 
-    def _build_gray_defs(self) -> None:
-        """Build and store gray_area_classifier system prompt + tool schemas."""
-        self._gray_system_prompt = (
-            "你是文件类型分类专家。你的任务是判断给定的文件类型（按扩展名或文件名）是否应纳入代码知识库。\n\n"
-            "**纳入标准（include）：**\n"
-            "- 源代码文件（任何编程语言）\n"
-            "- 项目配置文件（构建、部署、CI/CD、环境变量等）\n"
-            "- 构建脚本\n"
-            "- 技术文档（README、API文档、设计文档等）\n"
-            "- API/协议定义文件（proto、graphql、openapi等）\n"
-            "- 数据库脚本（SQL、migration等）\n\n"
-            "**排除标准（exclude）：**\n"
-            "- 二进制文件（图片、字体、编译产物、压缩包等）\n"
-            "- 媒体文件（音频、视频、动画等）\n"
-            "- 生成的文件（minified JS/CSS、source map、compiled 等）\n"
-            "- 大型数据文件（CSV数据集、数据库文件等）\n"
-            "- 其他与代码理解无关的文件\n\n"
-            "请逐个分析，使用 submit_classifications 工具一次性提交所有分类结果，然后调用 end_task 结束。"
-        )
-
-        self._gray_tools = [
-            ToolSchema(
-                name="submit_classifications",
-                description="提交文件类型分类结果。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "classifications": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "type_key": {
-                                        "type": "string",
-                                        "description": "文件类型键，格式为 ext:<扩展名> 或 name:<文件名>",
-                                    },
-                                    "decision": {
-                                        "type": "string",
-                                        "enum": ["include", "exclude"],
-                                        "description": "分类决定：include=纳入知识库，exclude=排除",
-                                    },
-                                },
-                                "required": ["type_key", "decision"],
-                            },
-                        },
-                    },
-                    "required": ["classifications"],
-                },
-            ),
-            ToolSchema(
-                name="end_task",
-                description="分类完成后调用此工具结束任务。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "signal": {
-                            "type": "string",
-                            "enum": ["exit"],
-                            "description": "固定值 exit",
-                        },
-                    },
-                    "required": ["signal"],
-                },
-            ),
-        ]
-
-    async def _init_gray_providers(self) -> None:
-        """注册所有 gray_area_classifier agent 并构建服务商→agent 映射。"""
-        gray_cfg = self._config.gray_area_classifier
-        if not gray_cfg.providers:
-            logger.warning("gray_area_classifier_no_providers_configured")
-            return
-
-        sorted_providers = sorted(gray_cfg.providers, key=lambda e: e.priority)
-        self._gray_agent_names = []
-        self._gray_provider_order = []
-        self._gray_provider_agents = {}
-
-        for idx, entry in enumerate(sorted_providers):
-            agent_name = f"{_GRAY_AGENT_PREFIX}_{idx}"
-            agent_def = AgentDefinition(
-                name=agent_name,
-                description="判断灰区文件类型是否应纳入代码知识库",
-                system_prompt=self._gray_system_prompt,
-                provider=entry.provider,
-                model=entry.model,
-                tools=self._gray_tools,
-                timeout=self._config.gray_area_classifier.timeout,
-                max_rate_limit_retries=self._config.gray_area_classifier.max_rate_limit_retries,
-            )
-            await self._agent.register_agent(agent_def)
-            self._gray_agent_names.append(agent_name)
-
-            if entry.provider not in self._gray_provider_agents:
-                self._gray_provider_agents[entry.provider] = []
-                self._gray_provider_order.append(entry.provider)
-            self._gray_provider_agents[entry.provider].append(agent_name)
-
-            logger.info(
-                "gray_agent_registered",
-                agent_name=agent_name,
-                provider=entry.provider,
-                model=entry.model,
-                queue_index=idx,
-            )
-
-    # =========================================================================
-    # Internal: L3 gray-area classification
-    # =========================================================================
-
-    async def _classify_uncertain_files(
-        self, uncertain: ChangedFiles,
-    ) -> tuple:
-        """Apply L3 gray-area classification to uncertain changed files.
-
-        Flow: GrayAreaStore lookup → LLM fallback → persist → filter.
-
-        Returns:
-            ``(added, modified, deleted, renamed)`` — only L3-included file entries.
-        """
-        all_paths = (
-            [e.file_path for e in uncertain.added]
-            + [e.file_path for e in uncertain.modified]
-            + [e.file_path for e in uncertain.deleted]
-            + [e.new_file_path for e in uncertain.renamed]
-        )
-
-        if not all_paths:
-            return [], [], [], []
-
-        store = self._git_ops.gray_area_store
-
-        # Step 1: Resolve via persistent store
-        included_paths, excluded_paths, unknown_paths = store.resolve(all_paths)
-
-        logger.info(
-            "l3_store_resolve",
-            total_uncertain=len(all_paths),
-            store_included=len(included_paths),
-            store_excluded=len(excluded_paths),
-            still_unknown=len(unknown_paths),
-        )
-
-        # Step 2: LLM classify unknown types (if enabled and there are unknowns)
-        if unknown_paths and self._git_ops._config.file_filter.uncertain.enabled:
-            unknown_keys = store.get_unknown_keys(unknown_paths)
-            if unknown_keys:
-                classifications = await self._llm_classify_gray_area(
-                    unknown_keys, unknown_paths,
-                )
-                if classifications:
-                    store.update(classifications)
-
-                    # Re-resolve the unknown paths with new classifications
-                    newly_inc, newly_exc, still_unk = store.resolve(unknown_paths)
-                    included_paths.extend(newly_inc)
-
-                    logger.info(
-                        "l3_llm_classified",
-                        keys_classified=len(classifications),
-                        newly_included=len(newly_inc),
-                        newly_excluded=len(newly_exc),
-                        still_unknown=len(still_unk),
-                    )
-
-        included_set = set(included_paths)
-
-        added = [e for e in uncertain.added if e.file_path in included_set]
-        modified = [e for e in uncertain.modified if e.file_path in included_set]
-        deleted = [e for e in uncertain.deleted if e.file_path in included_set]
-        renamed = [e for e in uncertain.renamed if e.new_file_path in included_set]
-
-        return added, modified, deleted, renamed
-
-    async def _llm_classify_gray_area(
-        self, unknown_keys: Set[str], sample_paths: List[str],
-    ) -> Dict[str, str]:
-        """Call gray_area_classifier agent to classify unknown file types.
-
-        Args:
-            unknown_keys: Type keys like ``ext:pyx``, ``name:Makefile``.
-            sample_paths: Paths for building context examples.
-
-        Returns:
-            Mapping of type_key → ``"include"`` / ``"exclude"``.
-        """
-        # Build per-key sample paths for LLM context
-        key_samples: Dict[str, List[str]] = {}
-        for path in sample_paths:
-            key = GrayAreaStore.extract_type_key(path)
-            if key in unknown_keys:
-                key_samples.setdefault(key, []).append(path)
-
-        lines = ["以下是需要分类的文件类型，请判断每个类型是否应纳入代码知识库：\n"]
-        for key in sorted(unknown_keys):
-            samples = key_samples.get(key, [])[:3]
-            sample_str = ", ".join(samples)
-            lines.append(f"- **{key}** (示例路径: {sample_str})")
-
-        user_message = "\n".join(lines)
-
-        # Mutable state captured by tool handler closure
-        classifications: Dict[str, str] = {}
-
-        async def _handle_submit(classifications_list: list = None, **_kwargs) -> str:
-            items = classifications_list or _kwargs.get("classifications", [])
-            for item in items:
-                type_key = item.get("type_key", "")
-                decision = item.get("decision", "")
-                if type_key and decision in ("include", "exclude"):
-                    classifications[type_key] = decision
-            return f"已记录 {len(items)} 个分类结果。"
-
-        async def _handle_end_task(signal: str = "exit", **_kwargs) -> str:
-            raise AgentTaskComplete()
-
-        tool_handlers = {
-            "submit_classifications": _handle_submit,
-            "end_task": _handle_end_task,
-        }
-
-        # 容量感知的服务商选择 + 故障降级 fallback
-        last_error: Optional[Exception] = None
-        remaining_providers = list(self._gray_provider_order)
-        tried_agents: set = set()
-
-        while remaining_providers:
-            selected = await self._agent.select_provider(remaining_providers)
-            agent_candidates = self._gray_provider_agents.get(selected, [])
-
-            success = False
-            for agent_name in agent_candidates:
-                if agent_name in tried_agents:
-                    continue
-                tried_agents.add(agent_name)
-
-                try:
-                    await self._agent.run_agent(
-                        agent_name,
-                        {},
-                        tool_handlers=tool_handlers,
-                        user_message=user_message,
-                    )
-                    success = True
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        "gray_provider_failed",
-                        agent_name=agent_name,
-                        error=str(e)[:200],
-                    )
-                    classifications.clear()
-
-            if success:
-                break
-
-            remaining_providers.remove(selected)
-        else:
-            logger.warning(
-                "l3_llm_classify_all_providers_exhausted",
-                unknown_keys=len(unknown_keys),
-                last_error=str(last_error)[:200] if last_error else None,
-            )
-
-        logger.info(
-            "l3_llm_classify_result",
-            unknown_keys=len(unknown_keys),
-            classified=len(classifications),
-            include=sum(1 for v in classifications.values() if v == "include"),
-            exclude=sum(1 for v in classifications.values() if v == "exclude"),
-        )
-
-        return classifications
 
     # =========================================================================
     # Internal: retry queue / dead letter queue persistence
@@ -2578,8 +2351,8 @@ class WorkflowOrchestratorService:
 
         # Check blob availability (content is re-read inside _process_file_with_agent)
         try:
-            await self._git_ops.get_file_content(
-                repo_path, record.blob_hash,
+            await self._git_ops.get_file_bytes(
+                repo_path, record.blob_hash, file_path=record.file_path,
             )
         except GitFileNotFoundError:
             self._remove_from_retry_queue(record)

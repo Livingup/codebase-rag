@@ -320,6 +320,30 @@ class AnthropicProvider(LLMProvider):
             elif msg.role == "assistant" and msg.thinking_content:
                 # Omit thinking blocks (no signature available)
                 result.append({"role": "assistant", "content": msg.content or ""})
+            elif isinstance(msg.content, list):
+                anthropic_blocks: List[Dict[str, Any]] = []
+                for block in msg.content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        anthropic_blocks.append({"type": "text", "text": str(block.get("text", ""))})
+                    elif btype == "image_url":
+                        url = str((block.get("image_url") or {}).get("url", ""))
+                        if url.startswith("data:") and ";base64," in url:
+                            header, b64_data = url.split(";base64,", 1)
+                            mime = header[5:] or "image/png"
+                            anthropic_blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime,
+                                    "data": b64_data,
+                                },
+                            })
+                    else:
+                        anthropic_blocks.append(block)
+                result.append({"role": msg.role, "content": anthropic_blocks})
             else:
                 result.append({"role": msg.role, "content": msg.content or ""})
         return result

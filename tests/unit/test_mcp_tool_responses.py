@@ -151,6 +151,46 @@ class McpToolResponsesTest(unittest.IsolatedAsyncioTestCase):
         result = await handle_context_analysis({'git_repo_paths':['G:/demo'],'task_description':'task'},engine)
         self.assertEqual(result[0].text,report)
 
+    async def test_search_appends_image_content_for_image_points_and_manage_ignore(self):
+        async def search(project_path, query, top_k):
+            return [
+                SearchResultPoint(0.95, 'G:/good/docs/arch.png', 'arch diagram', file_type='image'),
+                SearchResultPoint(0.80, 'G:/good/src/main.py', 'main entry', file_type='text'),
+            ]
+
+        async def read_repo_image_base64(repo_path, abs_file_path):
+            return ('aGVsbG8=', 'image/png')
+
+        mcp_svc = SimpleNamespace(
+            search=search,
+            read_repo_image_base64=read_repo_image_base64,
+            manage_project_ignore=lambda project_path, action, patterns=None, content=None: {
+                'git_repo_path': project_path,
+                'ignore_file': f'{project_path}/.git/codebase-rag/ignore',
+                'action': action,
+                'rules': patterns or ['dist/'],
+                'content': '\n'.join(patterns or ['dist/']),
+            },
+        )
+        res = await handle_codebase_search(
+            {'queries': [{'query': 'diagram', 'git_repo_paths': ['G:/good']}]},
+            mcp_svc,
+        )
+        self.assertEqual(len(res), 2)
+        self.assertIn('[image]', res[0].text)
+        self.assertEqual(res[1].type, 'image')
+        self.assertEqual(res[1].data, 'aGVsbG8=')
+        self.assertEqual(res[1].mimeType, 'image/png')
+
+        ignore_res = await handle_call_tool(
+            'manage_project_ignore',
+            {'git_repo_path': 'G:/good', 'action': 'add', 'patterns': ['dist/']},
+            mcp_svc,
+            SimpleNamespace(),
+        )
+        self.assertIn('.git/codebase-rag/ignore', ignore_res[0].text)
+        self.assertIn('dist/', ignore_res[0].text)
+
 
 class ContextResultTextTest(unittest.IsolatedAsyncioTestCase):
     def engine(self, run):

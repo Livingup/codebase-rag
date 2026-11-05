@@ -1,9 +1,10 @@
-"""Embedding service — dense + sparse vector generation with KeyPool scheduling.
+"""Embedding service — dense vector generation (gemini-embedding-2) with KeyPool scheduling.
 
-Orchestrates dense (Gemini) and sparse (DashScope) providers with:
+Orchestrates dense (Gemini) provider with:
 - KeyPool round-robin + health tracking per provider
 - Two-level retry: L1 single-key retry → L2 key rotation
-- Strict validation: texts exceeding batch_size or token limit → error
+- Strict validation: inputs exceeding batch_size or token limit (8192) → error
+- Multimodal support: text + optional inline image (.png / .jpg / .jpeg, 258 tokens/image)
 - Concurrency control via asyncio.Semaphore
 
 This service is a pure infrastructure layer. It does NOT perform any automatic
@@ -14,20 +15,22 @@ and Workflow layers. If input violates provider constraints, an error is raised.
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from pythonsdk import ErrorKind, LLMClientError
 
 from codebase_rag.common.keypool import KeyPool
 from codebase_rag.common.logging import get_logger
-from codebase_rag.common.types import EmbeddingResult, SparseVector
-from codebase_rag.config.loader import ConfigManager
-from codebase_rag.config.schema import EmbeddingConfig, EmbeddingProviderConfig
-from codebase_rag.services.embedding.providers.base import (
-    DenseEmbeddingProvider,
-    SparseEmbeddingProvider,
+from codebase_rag.common.types import (
+    IMAGE_TOKEN_COST,
+    MAX_IMAGE_BYTES,
+    EmbedInputItem,
+    EmbeddingResult,
+    MultimodalEmbedInput,
 )
-from codebase_rag.services.embedding.providers.dashscope import DashScopeSparseProvider
+from codebase_rag.config.loader import ConfigManager
+from codebase_rag.config.schema import AppConfig, EmbeddingConfig, EmbeddingProviderConfig
+from codebase_rag.services.embedding.providers.base import DenseEmbeddingProvider
 from codebase_rag.services.embedding.providers.gemini import GeminiDenseProvider
 
 logger = get_logger(__name__)
@@ -40,18 +43,8 @@ logger = get_logger(__name__)
 _DENSE_PROVIDER_FACTORIES = {
     "gemini": lambda cfg: GeminiDenseProvider(
         api_base_url=cfg.api_base_url or "https://generativelanguage.googleapis.com",
-        model_name=cfg.model_name,
+        model_name=cfg.model_name or "gemini-embedding-2",
         dimension=cfg.dimension,
-        batch_size=cfg.batch_size,
-        request_timeout=cfg.request_timeout,
-    ),
-}
-
-_SPARSE_PROVIDER_FACTORIES = {
-    "dashscope": lambda cfg: DashScopeSparseProvider(
-        api_base_url=cfg.api_base_url or "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
-        model_name=cfg.model_name,
-        dimension=cfg.dimension or 2048,
         batch_size=cfg.batch_size,
         request_timeout=cfg.request_timeout,
     ),
@@ -59,24 +52,20 @@ _SPARSE_PROVIDER_FACTORIES = {
 
 
 class EmbeddingService:
-    """Embedding service providing dense + sparse vector generation.
+    """Embedding service providing dense vector generation (text + multimodal image).
 
     Manages provider lifecycle, KeyPool scheduling, retry, and concurrency.
 
     Args:
-        config: Embedding configuration section from AppConfig.
+        config_manager: Runtime configuration manager.
     """
 
     def __init__(self, config_manager: ConfigManager) -> None:
         self._config_manager = config_manager
         self._dense_provider: Optional[DenseEmbeddingProvider] = None
-        self._sparse_provider: Optional[SparseEmbeddingProvider] = None
         self._dense_keypool: Optional[KeyPool] = None
-        self._sparse_keypool: Optional[KeyPool] = None
         self._dense_cfg: Optional[EmbeddingProviderConfig] = None
-        self._sparse_cfg: Optional[EmbeddingProviderConfig] = None
         self._dense_semaphore: Optional[asyncio.Semaphore] = None
-        self._sparse_semaphore: Optional[asyncio.Semaphore] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._initialized = False
 
@@ -89,12 +78,10 @@ class EmbeddingService:
     # =========================================================================
 
     async def initialize(self) -> None:
-        """Initialize providers, KeyPools, and validate connectivity."""
+        """Initialize dense provider, KeyPool, and validate connectivity."""
         logger.info("embedding_service_initializing")
 
-        # Concurrency limiters (Dense and Sparse decoupled)
         self._dense_semaphore = asyncio.Semaphore(self._config.max_concurrency)
-        self._sparse_semaphore = asyncio.Semaphore(self._config.max_concurrency)
         self._semaphore = self._dense_semaphore
 
         # --- Dense provider ---
@@ -132,53 +119,16 @@ class EmbeddingService:
             keys=dense_keys,
         )
 
-        # --- Sparse provider ---
-        sparse_name = self._config.sparse.active_provider
-        sparse_cfg = self._config.sparse.providers.get(sparse_name)
-        if sparse_cfg is None:
-            raise ValueError(
-                f"Sparse active_provider '{sparse_name}' not found in providers: "
-                f"{list(self._config.sparse.providers.keys())}"
-            )
-
-        factory_s = _SPARSE_PROVIDER_FACTORIES.get(sparse_name)
-        if factory_s is None:
-            raise ValueError(
-                f"No sparse provider implementation for '{sparse_name}'. "
-                f"Available: {list(_SPARSE_PROVIDER_FACTORIES.keys())}"
-            )
-        self._sparse_provider = factory_s(sparse_cfg)
-
-        sparse_keys = [k.key for k in sparse_cfg.api_keys]
-        if not sparse_keys:
-            raise ValueError(f"Sparse provider '{sparse_name}' has no API keys configured")
-        self._sparse_cfg = sparse_cfg
-        self._sparse_keypool = KeyPool(
-            keys=sparse_keys,
-            cooldown_seconds=sparse_cfg.retry.key_cooldown_seconds,
-            max_consecutive_failures=sparse_cfg.retry.max_retries_per_key,
-        )
-
-        # Validate sparse keys
-        await self._validate_keys(
-            provider_name=f"sparse/{sparse_name}",
-            provider=self._sparse_provider,
-            keypool=self._sparse_keypool,
-            keys=sparse_keys,
-        )
-
         self._initialized = True
         self._config_manager.register_reconciler("embedding", self.reconcile)
         logger.info(
             "embedding_service_initialized",
             dense_provider=dense_name,
-            sparse_provider=sparse_name,
             dense_keys=self._dense_keypool.healthy_keys,
-            sparse_keys=self._sparse_keypool.healthy_keys,
         )
 
     async def reconcile(self, old_config: AppConfig, new_config: AppConfig) -> None:
-        """Reconcile embedding providers, KeyPools, and concurrency limits."""
+        """Reconcile embedding provider, KeyPool, and concurrency limits."""
         logger.info("embedding_service_reconciling")
 
         new_emb = new_config.embedding
@@ -187,7 +137,6 @@ class EmbeddingService:
         # 1. Concurrency limit
         if new_emb.max_concurrency != old_emb.max_concurrency or self._dense_semaphore is None:
             self._dense_semaphore = asyncio.Semaphore(new_emb.max_concurrency)
-            self._sparse_semaphore = asyncio.Semaphore(new_emb.max_concurrency)
             self._semaphore = self._dense_semaphore
 
         # 2. Dense provider reconciliation
@@ -209,43 +158,17 @@ class EmbeddingService:
                             max_consecutive_failures=dense_cfg.retry.max_retries_per_key,
                         )
             elif dense_keys and self._dense_keypool:
+                self._dense_cfg = dense_cfg
                 await self._dense_keypool.update_keys(
                     keys=dense_keys,
                     cooldown_seconds=dense_cfg.retry.key_cooldown_seconds,
                     max_consecutive_failures=dense_cfg.retry.max_retries_per_key,
                 )
 
-        # 3. Sparse provider reconciliation
-        sparse_name = new_emb.sparse.active_provider
-        sparse_cfg = new_emb.sparse.providers.get(sparse_name)
-        if sparse_cfg is not None:
-            sparse_keys = [k.key for k in sparse_cfg.api_keys if k.key]
-            if sparse_name != old_emb.sparse.active_provider or self._sparse_provider is None:
-                factory_s = _SPARSE_PROVIDER_FACTORIES.get(sparse_name)
-                if factory_s:
-                    if self._sparse_provider and hasattr(self._sparse_provider, "close"):
-                        await self._sparse_provider.close()
-                    self._sparse_provider = factory_s(sparse_cfg)
-                    self._sparse_cfg = sparse_cfg
-                    if sparse_keys:
-                        self._sparse_keypool = KeyPool(
-                            keys=sparse_keys,
-                            cooldown_seconds=sparse_cfg.retry.key_cooldown_seconds,
-                            max_consecutive_failures=sparse_cfg.retry.max_retries_per_key,
-                        )
-            elif sparse_keys and self._sparse_keypool:
-                await self._sparse_keypool.update_keys(
-                    keys=sparse_keys,
-                    cooldown_seconds=sparse_cfg.retry.key_cooldown_seconds,
-                    max_consecutive_failures=sparse_cfg.retry.max_retries_per_key,
-                )
-
         logger.info(
             "embedding_service_reconciled",
             dense_provider=dense_name,
-            sparse_provider=sparse_name,
             dense_healthy_keys=self._dense_keypool.healthy_keys if self._dense_keypool else 0,
-            sparse_healthy_keys=self._sparse_keypool.healthy_keys if self._sparse_keypool else 0,
         )
 
     async def shutdown(self) -> None:
@@ -253,8 +176,6 @@ class EmbeddingService:
         self._config_manager.unregister_reconciler("embedding")
         if self._dense_provider and hasattr(self._dense_provider, "close"):
             await self._dense_provider.close()
-        if self._sparse_provider and hasattr(self._sparse_provider, "close"):
-            await self._sparse_provider.close()
         self._initialized = False
         logger.info("embedding_service_shutdown")
 
@@ -264,12 +185,10 @@ class EmbeddingService:
             return False
         if self._dense_keypool and self._dense_keypool.healthy_keys == 0:
             return False
-        if self._sparse_keypool and self._sparse_keypool.healthy_keys == 0:
-            return False
         return True
 
     def get_client_status_snapshot(self) -> dict:
-        """Return current dense/sparse provider availability without external calls."""
+        """Return current dense provider availability without external calls."""
         return {
             "dense": self._build_provider_status(
                 kind="dense",
@@ -277,13 +196,6 @@ class EmbeddingService:
                 cfg=self._dense_cfg,
                 keypool=self._dense_keypool,
                 initialized=self._initialized and self._dense_provider is not None,
-            ),
-            "sparse": self._build_provider_status(
-                kind="sparse",
-                active_provider=self._config.sparse.active_provider,
-                cfg=self._sparse_cfg,
-                keypool=self._sparse_keypool,
-                initialized=self._initialized and self._sparse_provider is not None,
             ),
         }
 
@@ -295,95 +207,57 @@ class EmbeddingService:
             timeout=timeout,
         )
 
-    async def probe_sparse_provider(self, timeout: float) -> dict:
-        """Run a real sparse embedding provider heartbeat with one available key."""
-        return await self._probe_provider(
-            provider=self._sparse_provider,
-            keypool=self._sparse_keypool,
-            timeout=timeout,
-        )
-
     # =========================================================================
     # Public API
     # =========================================================================
 
-    async def embed_dense(self, texts: List[str]) -> List[List[float]]:
-        """Generate dense vectors for a list of texts.
+    async def embed_dense(
+        self,
+        inputs: Sequence[EmbedInputItem],
+        is_query: bool = False,
+    ) -> List[List[float]]:
+        """Generate dense vectors for a list of text or multimodal inputs.
 
         Raises:
-            ValueError: If len(texts) exceeds batch_size or any text exceeds max_tokens_per_text.
+            ValueError: If len(inputs) exceeds batch_size or any input exceeds max_tokens_per_text.
         """
         self._check_initialized()
         assert self._dense_provider is not None
         assert self._dense_keypool is not None
         assert self._dense_cfg is not None
 
-        self._validate_batch_size(texts, self._dense_cfg, "dense")
-        await self._validate_tokens(texts, self._dense_cfg, "dense")
+        self._validate_batch_size(inputs, self._dense_cfg, "dense")
+        await self._validate_tokens(inputs, self._dense_cfg, "dense")
 
         return await self._call_with_retry(
             keypool=self._dense_keypool,
-            call_fn=lambda key: self._dense_provider.embed_batch(key, texts),
+            call_fn=lambda key: self._dense_provider.embed_batch(key, inputs, is_query=is_query),
             provider_name="dense",
         )
 
-    async def embed_sparse(
-        self, texts: List[str], is_query: bool = False
-    ) -> List[SparseVector]:
-        """Generate sparse vectors for a list of texts.
-
-        Args:
-            texts: Texts to embed.
-            is_query: If True, use text_type=query (for search queries).
-                     If False, use text_type=document (for indexing).
-
-        Raises:
-            ValueError: If len(texts) exceeds batch_size or any text exceeds max_tokens_per_text.
-        """
-        self._check_initialized()
-        assert self._sparse_provider is not None
-        assert self._sparse_keypool is not None
-        assert self._sparse_cfg is not None
-
-        self._validate_batch_size(texts, self._sparse_cfg, "sparse")
-
-        if is_query and isinstance(self._sparse_provider, DashScopeSparseProvider):
-            return await self._call_with_retry(
-                keypool=self._sparse_keypool,
-                call_fn=lambda key: self._sparse_provider.embed_batch_for_query(key, texts),
-                provider_name="sparse",
-            )
-        return await self._call_with_retry(
-            keypool=self._sparse_keypool,
-            call_fn=lambda key: self._sparse_provider.embed_batch(key, texts),
-            provider_name="sparse",
-        )
-
     async def embed(
-        self, texts: List[str], is_query: bool = False
+        self,
+        inputs: Sequence[EmbedInputItem],
+        is_query: bool = False,
     ) -> List[EmbeddingResult]:
-        """Generate both dense and sparse vectors for texts (parallel).
+        """Generate dense vectors for text or multimodal inputs.
 
         Args:
-            texts: Texts to embed.
-            is_query: If True, sparse uses text_type=query.
+            inputs: Texts or MultimodalEmbedInput items to embed.
+            is_query: If True, uses taskType=RETRIEVAL_QUERY; otherwise RETRIEVAL_DOCUMENT.
         """
-        dense_task = self.embed_dense(texts)
-        sparse_task = self.embed_sparse(texts, is_query=is_query)
-
-        dense_vectors, sparse_vectors = await asyncio.gather(dense_task, sparse_task)
+        dense_vectors = await self.embed_dense(inputs, is_query=is_query)
 
         logger.debug(
             "embed_complete",
-            text_count=len(texts),
+            input_count=len(inputs),
             is_query=is_query,
             dense_dim=len(dense_vectors[0]) if dense_vectors else 0,
-            sparse_nnz=len(sparse_vectors[0].indices) if sparse_vectors else 0,
         )
 
         return [
-            EmbeddingResult(dense_vector=d, sparse_vector=s)
-            for d, s in zip(dense_vectors, sparse_vectors)
+            EmbeddingResult(dense_vector=d, sparse_vector=None)
+            for d in dense_vectors
         ]
 
     async def count_tokens(self, text: str) -> int:
@@ -449,7 +323,7 @@ class EmbeddingService:
 
     async def _probe_provider(
         self,
-        provider: DenseEmbeddingProvider | SparseEmbeddingProvider | None,
+        provider: DenseEmbeddingProvider | None,
         keypool: KeyPool | None,
         timeout: float,
     ) -> dict:
@@ -482,12 +356,12 @@ class EmbeddingService:
                 "key_suffix": api_key[-6:],
             }
         elapsed = asyncio.get_running_loop().time() - started
-        
+
         if ok:
             await keypool.report_success(api_key)
         else:
             await keypool.report_failure(api_key)
-            
+
         return {
             "ok": bool(ok),
             "status": "available" if ok else "unavailable",
@@ -501,43 +375,55 @@ class EmbeddingService:
             raise RuntimeError("EmbeddingService is not initialized. Call initialize() first.")
 
     def _validate_batch_size(
-        self, texts: List[str], cfg: EmbeddingProviderConfig, provider_name: str
+        self, inputs: Sequence[EmbedInputItem], cfg: EmbeddingProviderConfig, provider_name: str
     ) -> None:
-        """Raise ValueError if texts exceed the configured batch_size."""
-        if len(texts) > cfg.batch_size:
+        """Raise ValueError if inputs exceed the configured batch_size."""
+        if len(inputs) > cfg.batch_size:
             raise ValueError(
                 f"{provider_name} embedding batch size exceeded: "
-                f"got {len(texts)} texts, max {cfg.batch_size}. "
+                f"got {len(inputs)} items, max {cfg.batch_size}. "
                 f"Text chunking is the caller's responsibility."
             )
 
     async def _validate_tokens(
-        self, texts: List[str], cfg: EmbeddingProviderConfig, provider_name: str
+        self, inputs: Sequence[EmbedInputItem], cfg: EmbeddingProviderConfig, provider_name: str
     ) -> None:
-        """Raise ValueError if any text exceeds max_tokens_per_text.
+        """Raise ValueError if any input exceeds max_tokens_per_text (including 258 tokens per image).
 
         Uses the dense provider's countTokens API for validation.
         """
         assert self._dense_provider is not None
         assert self._dense_keypool is not None
 
-        for i, text in enumerate(texts):
+        for i, item in enumerate(inputs):
+            if isinstance(item, MultimodalEmbedInput):
+                text = item.text
+                has_image = bool(item.image_bytes)
+                if has_image and len(item.image_bytes or b"") > MAX_IMAGE_BYTES:
+                    raise ValueError(
+                        f"Input[{i}] image exceeds maximum size of {MAX_IMAGE_BYTES} bytes."
+                    )
+            else:
+                text = str(item)
+                has_image = False
+
             token_count = await self._call_with_retry(
                 keypool=self._dense_keypool,
                 call_fn=lambda key, t=text: self._dense_provider.count_tokens(key, t),
                 provider_name="dense/count_tokens",
             )
-            if token_count > cfg.max_tokens_per_text:
+            total_tokens = token_count + (IMAGE_TOKEN_COST if has_image else 0)
+            if total_tokens > cfg.max_tokens_per_text:
                 raise ValueError(
                     f"Text[{i}] exceeds max_tokens_per_text: "
-                    f"{token_count} tokens > {cfg.max_tokens_per_text} limit. "
+                    f"{total_tokens} tokens > {cfg.max_tokens_per_text} limit. "
                     f"Text must be chunked by the Agent/Workflow layer before embedding."
                 )
 
     async def _validate_keys(
         self,
         provider_name: str,
-        provider: DenseEmbeddingProvider | SparseEmbeddingProvider,
+        provider: DenseEmbeddingProvider,
         keypool: KeyPool,
         keys: List[str],
     ) -> None:
@@ -592,9 +478,7 @@ class EmbeddingService:
 
         Uses the global concurrency semaphore.
         """
-        sem = self._dense_semaphore if "dense" in provider_name else self._sparse_semaphore
-        if sem is None:
-            sem = self._semaphore
+        sem = self._dense_semaphore or self._semaphore
         assert sem is not None
 
         retry_cfg = self._get_retry_config(provider_name)
@@ -642,7 +526,6 @@ class EmbeddingService:
                         error=err_str[:120],
                     )
 
-                # L1: Retry delay with exponential backoff (rate limits back off with at least 1.5s)
                 delay = base_delay * (backoff ** (attempt % max_retries))
                 if is_rate_limit:
                     delay = max(delay, 1.5)
@@ -662,17 +545,12 @@ class EmbeddingService:
         )
 
     def _get_retry_config(self, provider_name: str):
-        """Get retry config for the specified provider."""
-        if "dense" in provider_name:
-            active = self._config.dense.active_provider
-            cfg = self._config.dense.providers.get(active)
-        else:
-            active = self._config.sparse.active_provider
-            cfg = self._config.sparse.providers.get(active)
-
+        """Get retry config for the dense provider."""
+        active = self._config.dense.active_provider
+        cfg = self._config.dense.providers.get(active)
         if cfg:
             return cfg.retry
 
-        # Fallback defaults
         from codebase_rag.config.schema import RetryConfig
         return RetryConfig()
+

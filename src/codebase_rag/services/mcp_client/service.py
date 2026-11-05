@@ -129,6 +129,10 @@ class _ServerConnection:
                 for block in (result.content or []):
                     if hasattr(block, "text"):
                         texts.append(block.text)
+                    elif getattr(block, "type", None) == "image":
+                        mime = getattr(block, "mimeType", "image/png")
+                        data = getattr(block, "data", "")
+                        texts.append(f"[ImageContent mimeType={mime} base64_len={len(data)}]")
                 return "\n".join(texts) if texts else ""
 
 

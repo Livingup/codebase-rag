@@ -18,13 +18,13 @@ class QdrantWriteAckTest(unittest.IsolatedAsyncioTestCase):
         service._semaphore = asyncio.Semaphore(1)
         service._client = SimpleNamespace(upsert=AsyncMock(return_value=SimpleNamespace(status='completed')))
         service._config_manager = SimpleNamespace(config=SimpleNamespace(qdrant_storage=SimpleNamespace(
-            collection=SimpleNamespace(name='test', dense_vector=SimpleNamespace(name='dense'), sparse_vector=SimpleNamespace(name='sparse')),
+            collection=SimpleNamespace(name='test', dense_vector=SimpleNamespace(name='dense')),
             upsert_batch_size=2,
         )))
         return service
 
     def points(self):
-        return [PointData('demo.py','file','demo.py',f'description {i}','blob',[0.1,0.2],SparseVector(indices=[1],values=[1.0])) for i in range(3)]
+        return [PointData('demo.py','file','demo.py',f'description {i}','blob',[0.1,0.2]) for i in range(3)]
 
     async def test_all_batches_wait_for_ack_and_preserve_payload(self):
         service = self.make_service()
@@ -34,6 +34,7 @@ class QdrantWriteAckTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([len(c.kwargs['points']) for c in calls], [2,1])
         self.assertTrue(all(c.kwargs['wait'] is True for c in calls))
         self.assertEqual(calls[0].kwargs['points'][0].payload['project_id'], 'project')
+        self.assertEqual(calls[0].kwargs['points'][0].payload['file_type'], 'text')
 
     async def test_any_batch_error_is_not_success(self):
         service = self.make_service()

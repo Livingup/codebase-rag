@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
-from codebase_rag.common.types import SparseVector
+from codebase_rag.common.types import FileType, SparseVector
 
 
 @dataclass
@@ -22,4 +22,6 @@ class PointData:
     business_description: str
     blob_hash: str
     dense_vector: List[float]
-    sparse_vector: SparseVector
+    sparse_vector: Optional[SparseVector] = None
+    file_type: FileType = "text"
+

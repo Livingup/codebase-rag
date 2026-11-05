@@ -254,14 +254,10 @@ class MemoryQdrantService:
                     hnsw_config=hnsw,
                 ),
             }
-            sparse_vectors_config = {
-                inst_cfg.sparse_vector.name: models.SparseVectorParams(),
-            }
 
             await client.create_collection(
                 collection_name=inst_cfg.collection_name,
                 vectors_config=vectors_config,
-                sparse_vectors_config=sparse_vectors_config,
             )
 
             # Register in cache
@@ -383,89 +379,17 @@ class MemoryQdrantService:
         self,
         repo_key: str,
         query_dense: List[float],
-        query_sparse: SparseVector,
+        query_sparse: Optional[SparseVector] = None,
         top_k: Optional[int] = None,
         filters: Optional[SearchFilters] = None,
     ) -> List[SearchResult]:
-        """Hybrid search with Prefetch + RRF fusion on the copy's active instance."""
-        self._check_initialized()
-        inst, handle = await self._get_active_instance_or_rebuild(repo_key)
-        coll = self._config.instance.collection_name
-        search_cfg = self._config.search
-
-        k = min(top_k or search_cfg.default_top_k, search_cfg.max_top_k)
-        prefetch_limit = search_cfg.prefetch_limit
-
-        # Build Qdrant filter
-        qdrant_filter = self._build_filter(filters)
-
-        dense_name = self._config.instance.dense_vector.name
-        sparse_name = self._config.instance.sparse_vector.name
-
-        start = time.monotonic()
-
-        # Prefetch 1: dense search
-        dense_results = await inst.client.query_points(
-            collection_name=coll,
-            query=query_dense,
-            using=dense_name,
-            limit=prefetch_limit,
-            query_filter=qdrant_filter,
-            with_payload=True,
-        )
-
-        # Prefetch 2: sparse search
-        sparse_results = await inst.client.query_points(
-            collection_name=coll,
-            query=models.SparseVector(
-                indices=query_sparse.indices,
-                values=query_sparse.values,
-            ),
-            using=sparse_name,
-            limit=prefetch_limit,
-            query_filter=qdrant_filter,
-            with_payload=True,
-        )
-
-        dense_hit_count = len(dense_results.points)
-        sparse_hit_count = len(sparse_results.points)
-
-        # RRF fusion
-        fused = self._rrf_fusion(
-            dense_results.points,
-            sparse_results.points,
-            search_cfg.dense_weight,
-            search_cfg.sparse_weight,
-            search_cfg.rrf_k,
-        )
-
-        # Return sorted top_k — no threshold filtering at search layer
-        results = []
-        for point_id, score, payload in fused[:k]:
-            results.append(SearchResult(
-                score=score,
-                file_version_id=payload.get("file_version_id", ""),
-                file_path=payload.get("file_path", ""),
-                entity_type=payload.get("entity_type", ""),
-                entity_name=payload.get("entity_name", ""),
-                business_description=payload.get("business_description", ""),
-            ))
-
-        elapsed = time.monotonic() - start
-        logger.info(
-            "hybrid_search",
+        """Vector search on the copy's active instance (delegates to dense_search)."""
+        return await self.dense_search(
             repo_key=repo_key,
-            top_k=k,
-            dense_hits=dense_hit_count,
-            sparse_hits=sparse_hit_count,
-            fused_candidates=len(fused),
-            results=len(results),
-            top_score=round(results[0].score, 4) if results else 0,
-            elapsed_ms=round(elapsed * 1000, 1),
+            query_dense=query_dense,
+            top_k=top_k,
+            filters=filters,
         )
-
-        inst.touch_search()
-        return results
 
     # =========================================================================
     # 2.6 Dense-only search
@@ -478,7 +402,7 @@ class MemoryQdrantService:
         top_k: Optional[int] = None,
         filters: Optional[SearchFilters] = None,
     ) -> List[SearchResult]:
-        """Dense-only vector search on the copy's active instance (no RRF)."""
+        """Dense-only vector search on the copy's active instance."""
         self._check_initialized()
         inst, handle = await self._get_active_instance_or_rebuild(repo_key)
         coll = self._config.instance.collection_name
@@ -488,6 +412,7 @@ class MemoryQdrantService:
         qdrant_filter = self._build_filter(filters)
         dense_name = self._config.instance.dense_vector.name
 
+        start = time.monotonic()
         results_raw = await inst.client.query_points(
             collection_name=coll,
             query=query_dense,
@@ -501,6 +426,8 @@ class MemoryQdrantService:
         for pt in results_raw.points:
             score = pt.score if hasattr(pt, "score") else 0.0
             p = pt.payload or {}
+            raw_ft = p.get("file_type", "text")
+            file_type = "image" if raw_ft == "image" else "text"
             results.append(SearchResult(
                 score=score,
                 file_version_id=p.get("file_version_id", ""),
@@ -508,7 +435,18 @@ class MemoryQdrantService:
                 entity_type=p.get("entity_type", ""),
                 entity_name=p.get("entity_name", ""),
                 business_description=p.get("business_description", ""),
+                file_type=file_type,
             ))
+
+        elapsed = time.monotonic() - start
+        logger.info(
+            "dense_search",
+            repo_key=repo_key,
+            top_k=k,
+            results=len(results),
+            top_score=round(results[0].score, 4) if results else 0,
+            elapsed_ms=round(elapsed * 1000, 1),
+        )
 
         inst.touch_search()
         return results

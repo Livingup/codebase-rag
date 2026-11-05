@@ -20,7 +20,7 @@ class _ConfigManager:
         self.config = SimpleNamespace(
             mcp=SimpleNamespace(
                 reranker=SimpleNamespace(recall_limit=20),
-                knowledge_submission=SimpleNamespace(point_token_limit=8000),
+                knowledge_submission=SimpleNamespace(point_token_limit=8192),
             )
         )
 
@@ -29,17 +29,19 @@ class _Embedding:
     def __init__(self) -> None:
         self.count_tokens_calls = 0
         self.embed_calls = 0
+        self.last_embed_inputs = None
 
     async def count_tokens(self, text: str) -> int:
         self.count_tokens_calls += 1
         return len(text.split())
 
-    async def embed(self, texts: list[str], is_query: bool):
+    async def embed(self, texts: list, is_query: bool):
         self.embed_calls += 1
+        self.last_embed_inputs = list(texts)
         return [
             SimpleNamespace(
                 dense_vector=[0.1, 0.2],
-                sparse_vector=SimpleNamespace(indices=[1], values=[1.0]),
+                sparse_vector=None,
             )
             for _ in texts
         ]
@@ -356,6 +358,66 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(git_ops.calls, [(project_path, "src/example.py")])
             self.assertEqual(knowledge_sync.try_skip_calls[0]["file_path"], "src/example.py")
             self.assertEqual(knowledge_sync.try_skip_calls[0]["file_version_id"], file_version_id)
+
+    async def test_image_file_knowledge_uses_multimodal_embed_and_258_token_cost(self) -> None:
+        from codebase_rag.common.types import MultimodalEmbedInput
+        from codebase_rag.services.git_operations.file_filter import FileFilter, classify_file_modality
+
+        png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        modality, mime_type = classify_file_modality("docs/arch.png", png_bytes)
+        self.assertEqual(modality, "image")
+        self.assertEqual(mime_type, "image/png")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            file_path = "docs/arch.png"
+            blob_hash = "imgblob123"
+            embedding = _Embedding()
+            knowledge_sync = _KnowledgeSync()
+
+            class _ImageGitOps(_GitOps):
+                def is_file_ignored(self, repo_path: str, rel_path: str) -> bool:
+                    return False
+
+                async def get_workdir_file_bytes(self, repo_path: str, rel_path: str) -> bytes:
+                    return png_bytes
+
+                def detect_file_modality(self, rel_path: str, raw_bytes: bytes):
+                    return classify_file_modality(rel_path, raw_bytes)
+
+            config = _ConfigManager()
+            service = McpService(
+                config_manager=config,
+                embedding=embedding,
+                memory_qdrant=SimpleNamespace(),
+                agent=SimpleNamespace(),
+                git_ops=_ImageGitOps(blob_hash),
+                knowledge_sync=knowledge_sync,
+            )
+
+            result = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["architecture diagram description"],
+            )
+            self.assertEqual(len(result.succeeded), 1)
+            self.assertEqual(len(embedding.last_embed_inputs), 1)
+            self.assertIsInstance(embedding.last_embed_inputs[0], MultimodalEmbedInput)
+            self.assertEqual(embedding.last_embed_inputs[0].mime_type, "image/png")
+            submitted_point = knowledge_sync.submit_calls[0]["points"][0]
+            self.assertEqual(submitted_point.file_type, "image")
+
+            # Verify 258 image token cost is enforced against limit
+            config.config.mcp.knowledge_submission.point_token_limit = 259
+            result_over = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["two words"],
+            )
+            self.assertEqual(len(result_over.failed), 1)
+            self.assertIn("260 tokens > 259 limit", result_over.failed[0].error)
+
+            # Verify .gitignore-style FileFilter with negation and directory rules
+            ff = FileFilter(exclude_patterns=["node_modules/**", "*.lock"], extra_ignore_lines=["assets/raw/", "!assets/raw/keep.png"])
+            self.assertTrue(ff.is_ignored("assets/raw/drop.png"))
+            self.assertFalse(ff.is_ignored("assets/raw/keep.png"))
+            self.assertFalse(ff.is_ignored("docs/arch.png"))
 
 
 class _Store:

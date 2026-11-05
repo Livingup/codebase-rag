@@ -437,7 +437,6 @@ class KnowledgeSyncService:
         points_data: List[PointData],
     ) -> List[models.PointStruct]:
         dense_name = self._config_manager.config.memory_qdrant.instance.dense_vector.name
-        sparse_name = self._config_manager.config.memory_qdrant.instance.sparse_vector.name
         knowledge_set_id = self._knowledge_set_id(project_id, file_version_id, points_data)
         chunk_count = len(points_data)
         points: List[models.PointStruct] = []
@@ -446,14 +445,11 @@ class KnowledgeSyncService:
                 id=self._point_id(project_id, file_version_id, knowledge_set_id, idx),
                 vector={
                     dense_name: pd.dense_vector,
-                    sparse_name: models.SparseVector(
-                        indices=pd.sparse_vector.indices,
-                        values=pd.sparse_vector.values,
-                    ),
                 },
                 payload={
                     "file_version_id": file_version_id,
                     "file_path": pd.file_path,
+                    "file_type": pd.file_type,
                     "entity_type": pd.entity_type,
                     "entity_name": pd.entity_name,
                     "business_description": pd.business_description,
@@ -474,7 +470,13 @@ class KnowledgeSyncService:
             vectors = {}
             if rec.vector:
                 if isinstance(rec.vector, dict):
-                    vectors = rec.vector
+                    if "dense" in rec.vector:
+                        vectors["dense"] = rec.vector["dense"]
+                    else:
+                        vectors = {
+                            k: v for k, v in rec.vector.items()
+                            if isinstance(v, list)
+                        }
                 elif isinstance(rec.vector, list):
                     vectors["dense"] = rec.vector
             points.append(models.PointStruct(

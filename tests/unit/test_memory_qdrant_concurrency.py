@@ -24,7 +24,6 @@ def _point(project_id: str) -> models.PointStruct:
         id=1,
         vector={
             "dense": [1.0, 0.0],
-            "sparse": models.SparseVector(indices=[1], values=[1.0]),
         },
         payload={
             "file_version_id": f"version-{project_id}",

@@ -176,7 +176,6 @@ class QdrantStorageService:
             "timeout": conn.timeout,
             "collection": collection.name,
             "dense_vector": collection.dense_vector.name,
-            "sparse_vector": collection.sparse_vector.name,
             "api_key_configured": api_key_configured,
             "key_status": key_status,
         }
@@ -244,6 +243,7 @@ class QdrantStorageService:
                     {
                         "file_version_id": file_version_id,
                         "file_path": pd.file_path,
+                        "file_type": pd.file_type,
                         "entity_type": pd.entity_type,
                         "entity_name": pd.entity_name,
                         "business_description": pd.business_description,
@@ -264,10 +264,6 @@ class QdrantStorageService:
                         ),
                         vector={
                             self._config.collection.dense_vector.name: pd.dense_vector,
-                            self._config.collection.sparse_vector.name: models.SparseVector(
-                                indices=pd.sparse_vector.indices,
-                                values=pd.sparse_vector.values,
-                            ),
                         },
                         payload={
                             **base_payloads[idx],
@@ -857,14 +853,9 @@ class QdrantStorageService:
                 ),
             }
 
-            sparse_vectors_config = {
-                coll_cfg.sparse_vector.name: models.SparseVectorParams(),
-            }
-
             await self._client.create_collection(
                 collection_name=collection_name,
                 vectors_config=vectors_config,
-                sparse_vectors_config=sparse_vectors_config,
             )
 
             logger.info(
@@ -919,12 +910,3 @@ class QdrantStorageService:
                     f"collection has {actual_size}, config expects {expected_size}. "
                     f"This must match the Embedding service's dense dimension."
                 )
-
-        # Check sparse vector exists
-        sparse_name = coll_cfg.sparse_vector.name
-        sparse_config = info.config.params.sparse_vectors
-        if sparse_config and sparse_name not in sparse_config:
-            raise QdrantSchemaError(
-                f"Sparse vector '{sparse_name}' not found in collection. "
-                f"Available: {list(sparse_config.keys())}"
-            )

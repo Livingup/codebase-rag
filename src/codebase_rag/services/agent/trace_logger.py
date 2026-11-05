@@ -85,7 +85,20 @@ class AgentTraceLogger:
 
         if msg.role == "user":
             lines.append("```")
-            lines.append(msg.content or "")
+            if isinstance(msg.content, list):
+                formatted_parts = []
+                for part in msg.content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        formatted_parts.append(str(part.get("text", "")))
+                    elif isinstance(part, dict) and part.get("type") == "image_url":
+                        url = str((part.get("image_url") or {}).get("url", ""))
+                        preview = url[:64] + "...[truncated]" if len(url) > 64 else url
+                        formatted_parts.append(f"[image_url: {preview}]")
+                    else:
+                        formatted_parts.append(json.dumps(part, ensure_ascii=False))
+                lines.append("\n".join(formatted_parts))
+            else:
+                lines.append(msg.content or "")
             lines.append("```")
 
         elif msg.role == "assistant":

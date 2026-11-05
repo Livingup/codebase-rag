@@ -34,7 +34,6 @@ class _Embedding:
     def __init__(self) -> None:
         self._initialized = True
         self.dense_probe_calls = 0
-        self.sparse_probe_calls = 0
 
     def get_client_status_snapshot(self):
         return {
@@ -43,7 +42,7 @@ class _Embedding:
                 "status": "available",
                 "initialized": True,
                 "endpoint": "https://generativelanguage.googleapis.com",
-                "model": "gemini-embedding-001",
+                "model": "gemini-embedding-2",
                 "dimension": 3072,
                 "batch_size": 100,
                 "request_timeout": 30,
@@ -51,28 +50,11 @@ class _Embedding:
                 "healthy_keys": 1,
                 "key_status": [{"key_suffix": "EMINI1", "healthy": True}],
             },
-            "sparse": {
-                "provider": "dashscope",
-                "status": "available",
-                "initialized": True,
-                "endpoint": "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
-                "model": "text-embedding-v4",
-                "dimension": 2048,
-                "batch_size": 10,
-                "request_timeout": 30,
-                "total_keys": 1,
-                "healthy_keys": 1,
-                "key_status": [{"key_suffix": "SCOPE1", "healthy": True}],
-            },
         }
 
     async def probe_dense_provider(self, timeout: float):
         self.dense_probe_calls += 1
         return {"ok": True, "status": "available", "message": "dense ok", "latency_ms": 1.0}
-
-    async def probe_sparse_provider(self, timeout: float):
-        self.sparse_probe_calls += 1
-        return {"ok": True, "status": "available", "message": "sparse ok", "latency_ms": 1.0}
 
 
 class _Agent:
@@ -160,7 +142,6 @@ class _Qdrant:
             "timeout": 60,
             "collection": "codebase",
             "dense_vector": "dense_vectors",
-            "sparse_vector": "sparse_vectors",
             "api_key_configured": True,
             "key_status": [
                 {
@@ -217,7 +198,6 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "available")
         self.assertFalse(response.live_probe)
         self.assertEqual([client.id for client in response.clients], [
-            "dashscope_embedding",
             "gemini_embedding",
             "qdrant",
             "llm_provider:zhipu",
@@ -262,7 +242,6 @@ class ManagementAdminStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service._agent.single_probe_calls, ["zhipu"])
         self.assertEqual(service._agent.all_probe_calls, 0)
         self.assertEqual(service._embedding.dense_probe_calls, 0)
-        self.assertEqual(service._embedding.sparse_probe_calls, 0)
         self.assertEqual(service._qdrant.probe_calls, 0)
 
     async def test_single_client_probe_rejects_unknown_item(self):

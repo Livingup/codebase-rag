@@ -233,15 +233,20 @@ class KnowledgeSyncStore:
             "points": [
                 {
                     "file_path": p.file_path,
+                    "file_type": p.file_type,
                     "entity_type": p.entity_type,
                     "entity_name": p.entity_name,
                     "business_description": p.business_description,
                     "blob_hash": p.blob_hash,
                     "dense_vector": p.dense_vector,
-                    "sparse_vector": {
-                        "indices": p.sparse_vector.indices,
-                        "values": p.sparse_vector.values,
-                    },
+                    "sparse_vector": (
+                        {
+                            "indices": p.sparse_vector.indices,
+                            "values": p.sparse_vector.values,
+                        }
+                        if p.sparse_vector is not None
+                        else None
+                    ),
                 }
                 for p in job.points
             ],
@@ -251,7 +256,9 @@ class KnowledgeSyncStore:
     def _deserialize_job(data: dict) -> KnowledgeSyncJob:
         points = []
         for p in data["points"]:
-            sv = p["sparse_vector"]
+            sv = p.get("sparse_vector")
+            raw_ft = p.get("file_type", "text")
+            file_type = "image" if raw_ft == "image" else "text"
             points.append(PointData(
                 file_path=p["file_path"],
                 entity_type=p["entity_type"],
@@ -259,10 +266,15 @@ class KnowledgeSyncStore:
                 business_description=p["business_description"],
                 blob_hash=p["blob_hash"],
                 dense_vector=p["dense_vector"],
-                sparse_vector=SparseVector(
-                    indices=sv["indices"],
-                    values=sv["values"],
+                sparse_vector=(
+                    SparseVector(
+                        indices=sv["indices"],
+                        values=sv["values"],
+                    )
+                    if isinstance(sv, dict) and "indices" in sv and "values" in sv
+                    else None
                 ),
+                file_type=file_type,
             ))
         return KnowledgeSyncJob(
             project_id=data["project_id"],

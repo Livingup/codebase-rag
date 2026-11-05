@@ -820,18 +820,15 @@ class ManagementApiService:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         # Step 1: Embed query
-        embeddings = await self._embedding.embed([query])
+        embeddings = await self._embedding.embed([query], is_query=True)
         if not embeddings:
             raise ServiceUnavailableError("Embedding service returned no results")
         emb = embeddings[0]
 
-        has_sparse = emb.sparse_vector is not None and len(emb.sparse_vector.indices) > 0
         logger.debug(
             "search_embedding_done",
             project_id=project_id,
             dense_dim=len(emb.dense_vector),
-            has_sparse=has_sparse,
-            sparse_nnz=len(emb.sparse_vector.indices) if has_sparse else 0,
         )
 
         # Step 2: Build filters
@@ -844,11 +841,11 @@ class ManagementApiService:
                 file_paths=file_paths,
             )
 
-        # Step 3: Hybrid search
+        # Step 3: Vector search
         results = await self._memory.hybrid_search(
             record.repo_key,
             query_dense=emb.dense_vector,
-            query_sparse=emb.sparse_vector,
+            query_sparse=None,
             top_k=top_k,
             filters=filters,
         )
@@ -1043,7 +1040,6 @@ class ManagementApiService:
         llm_status = self._agent.get_llm_provider_status_snapshot()
 
         probe_results: Dict[str, Optional[Dict[str, Any]]] = {
-            "dashscope_embedding": None,
             "gemini_embedding": None,
             "qdrant": None,
         }
@@ -1052,14 +1048,12 @@ class ManagementApiService:
         }
         live_probe = live or self._config.client_status.live_probe_enabled
         if live_probe:
-            dashscope_probe, gemini_probe, qdrant_probe, llm_probe_results = await asyncio.gather(
-                self._embedding.probe_sparse_provider(timeout),
+            gemini_probe, qdrant_probe, llm_probe_results = await asyncio.gather(
                 self._embedding.probe_dense_provider(timeout),
                 self._qdrant.probe_client(timeout),
                 self._agent.probe_llm_providers(timeout),
             )
             probe_results = {
-                "dashscope_embedding": dashscope_probe,
                 "gemini_embedding": gemini_probe,
                 "qdrant": qdrant_probe,
             }
@@ -1080,7 +1074,6 @@ class ManagementApiService:
         llm_status = self._agent.get_llm_provider_status_snapshot()
         llm_provider_names = {str(item["id"]) for item in llm_status}
         valid_client_ids = {
-            "dashscope_embedding",
             "gemini_embedding",
             "qdrant",
             *(f"llm_provider:{provider_name}" for provider_name in llm_provider_names),
@@ -1089,7 +1082,6 @@ class ManagementApiService:
             raise InvalidRequestError(f"Client status item is not available for probing: {client_id}")
 
         probe_results: Dict[str, Optional[Dict[str, Any]]] = {
-            "dashscope_embedding": None,
             "gemini_embedding": None,
             "qdrant": None,
         }
@@ -1097,9 +1089,7 @@ class ManagementApiService:
             str(item["id"]): None for item in llm_status
         }
 
-        if client_id == "dashscope_embedding":
-            probe_results["dashscope_embedding"] = await self._embedding.probe_sparse_provider(timeout)
-        elif client_id == "gemini_embedding":
+        if client_id == "gemini_embedding":
             probe_results["gemini_embedding"] = await self._embedding.probe_dense_provider(timeout)
         elif client_id == "qdrant":
             probe_results["qdrant"] = await self._qdrant.probe_client(timeout)
@@ -1126,14 +1116,6 @@ class ManagementApiService:
         live_probe: bool,
     ) -> ClientStatusResponse:
         clients = [
-            self._build_embedding_client_item(
-                data=embedding_status["sparse"],
-                client_id="dashscope_embedding",
-                name="DashScope embedding",
-                expected_provider="dashscope",
-                proxy_policy="不读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY（trust_env=False）",
-                live_probe=probe_results["dashscope_embedding"],
-            ),
             self._build_embedding_client_item(
                 data=embedding_status["dense"],
                 client_id="gemini_embedding",
@@ -1249,7 +1231,6 @@ class ManagementApiService:
             "prefer_grpc": data.get("prefer_grpc"),
             "timeout": data.get("timeout"),
             "dense_vector": data.get("dense_vector"),
-            "sparse_vector": data.get("sparse_vector"),
             "api_key_configured": data.get("api_key_configured", False),
             "proxy_policy": "未配置项目级代理；不需要 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY",
         }

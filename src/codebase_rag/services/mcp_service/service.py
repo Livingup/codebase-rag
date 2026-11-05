@@ -19,12 +19,19 @@ Internal dependencies:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from codebase_rag.common.logging import get_logger
 from codebase_rag.common.paths import normalize_repo_key
+from codebase_rag.common.types import (
+    EmbedInputItem,
+    FileType,
+    IMAGE_TOKEN_COST,
+    MultimodalEmbedInput,
+)
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import KnowledgeSubmissionConfig, MCPRerankerConfig
 from codebase_rag.services.agent.errors import AgentTaskComplete
@@ -182,11 +189,10 @@ class McpService:
         # ---- Stage 1: Vector recall ----
         recall_limit = self._reranker_config.recall_limit
 
-        # Embed query (dense + sparse)
+        # Embed query (dense)
         embeddings = await self._embedding.embed([query], is_query=True)
         emb = embeddings[0]
 
-        has_sparse = emb.sparse_vector is not None and len(emb.sparse_vector.indices) > 0
         logger.info(
             "mcp_search_start",
             project_id=project_id,
@@ -195,15 +201,14 @@ class McpService:
             top_k=top_k,
             recall_limit=recall_limit,
             dense_dim=len(emb.dense_vector),
-            has_sparse=has_sparse,
         )
 
-        # Hybrid search
+        # Vector search
         try:
             candidates_raw = await self._memory.hybrid_search(
                 repo_key,
                 query_dense=emb.dense_vector,
-                query_sparse=emb.sparse_vector,
+                query_sparse=None,
                 top_k=recall_limit,
             )
         except NoActiveInstanceError as e:
@@ -224,7 +229,7 @@ class McpService:
                 candidates_raw = await self._memory.hybrid_search(
                     normalize_repo_key(project_path),
                     query_dense=emb.dense_vector,
-                    query_sparse=emb.sparse_vector,
+                    query_sparse=None,
                     top_k=recall_limit,
                 )
             except NoActiveInstanceError as e2:
@@ -244,6 +249,7 @@ class McpService:
                 file_path=r.file_path,
                 business_description=r.business_description,
                 vector_score=r.score,
+                file_type=getattr(r, "file_type", "text"),
             )
             for r in candidates_raw
         ]
@@ -269,6 +275,7 @@ class McpService:
                     score=c.vector_score,
                     file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                     business_description=c.business_description,
+                    file_type=c.file_type,
                 )
                 for c in candidates
             ]
@@ -301,6 +308,7 @@ class McpService:
                     score=c.vector_score,
                     file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                     business_description=c.business_description,
+                    file_type=c.file_type,
                 )
                 for c in candidates[:top_k]
             ]
@@ -319,6 +327,7 @@ class McpService:
                 score=round(s.score, 4),
                 file_path=os.path.normpath(os.path.join(project_path, c.file_path)),
                 business_description=c.business_description,
+                file_type=c.file_type,
             ))
 
         logger.info(
@@ -825,6 +834,13 @@ class McpService:
         # Normalize file_path to canonical POSIX relative path
         canon_path = normalize_repo_relative_path(project_path, file_path)
 
+        # Check ignore rules (.git/codebase-rag/ignore + global exclude_patterns)
+        if hasattr(self._git_ops, "is_file_ignored") and self._git_ops.is_file_ignored(project_path, canon_path):
+            raise ValueError(
+                f"文件 '{canon_path}' 被忽略规则（全局 exclude_patterns 或 .git/codebase-rag/ignore）拦截，"
+                "无需提交知识点；如需跟踪该文件，请通过 manage_project_ignore 工具调整忽略规则。"
+            )
+
         # Verify the client-provided blob hash against current worktree content
         # before accepting any idempotent skip.
         current_blob_hash = await self._git_ops.get_workdir_blob_hash(
@@ -836,6 +852,20 @@ class McpService:
                 f"{canon_path}: client={blob_hash}, current_worktree={current_blob_hash}. "
                 "请读取当前文件并重新计算 Git blob hash 后提交。"
             )
+
+        # Detect file modality (only text + .png/.jpg/.jpeg images <= 20MB are supported)
+        file_type: FileType = "text"
+        raw_bytes: Optional[bytes] = None
+        mime_type: Optional[str] = None
+        if hasattr(self._git_ops, "get_workdir_file_bytes") and hasattr(self._git_ops, "detect_file_modality"):
+            raw_bytes = await self._git_ops.get_workdir_file_bytes(project_path, canon_path)
+            modality, mime_type = self._git_ops.detect_file_modality(canon_path, raw_bytes)
+            if modality == "unsupported_binary":
+                raise ValueError(
+                    f"不支持的文件类型 '{canon_path}'：仅支持文本文件与 .png / .jpg / .jpeg 图片文件（且单张图片不超过 20MB）。"
+                )
+            file_type = "image" if modality == "image" else "text"
+
         fvid = compute_file_version_id(canon_path, blob_hash)
 
         try:
@@ -868,13 +898,15 @@ class McpService:
                 )
                 return existing_result
 
-        # Token validation
+        # Token validation (image files consume an additional 258 tokens per point)
+        image_token_extra = IMAGE_TOKEN_COST if file_type == "image" else 0
         over_limit: List[str] = []
         for idx, desc in enumerate(descriptions):
             token_count = await self._embedding.count_tokens(desc)
-            if token_count > token_limit:
+            total_tokens = token_count + image_token_extra
+            if total_tokens > token_limit:
                 over_limit.append(
-                    f"[{idx}] {token_count} tokens > {token_limit} limit"
+                    f"[{idx}] {total_tokens} tokens > {token_limit} limit"
                 )
         if over_limit:
             raise ValueError(
@@ -882,8 +914,20 @@ class McpService:
                 + "。请缩短所列描述或拆分后重新提交。"
             )
 
-        # Generate embeddings (dense + sparse) for all descriptions
-        embeddings = await self._embedding.embed(descriptions, is_query=False)
+        # Generate embeddings (dense; for image files combine business_description + image)
+        if file_type == "image" and raw_bytes is not None and mime_type is not None:
+            embed_inputs: List[EmbedInputItem] = [
+                MultimodalEmbedInput(
+                    text=desc,
+                    image_bytes=raw_bytes,
+                    mime_type=mime_type,
+                )
+                for desc in descriptions
+            ]
+        else:
+            embed_inputs = list(descriptions)
+
+        embeddings = await self._embedding.embed(embed_inputs, is_query=False)
         if len(embeddings) != len(descriptions):
             raise McpServiceError("知识描述处理结果不完整，请稍后重试；本次未受理。")
 
@@ -898,7 +942,8 @@ class McpService:
                 business_description=desc,
                 blob_hash=blob_hash,
                 dense_vector=emb.dense_vector,
-                sparse_vector=emb.sparse_vector,
+                sparse_vector=None,
+                file_type=file_type,
             ))
 
         sync_result = await self._knowledge_sync.submit_points(
@@ -920,10 +965,88 @@ class McpService:
             file_path=canon_path,
             file_version_id=fvid[:16],
             points=len(points),
+            file_type=file_type,
             published=sync_result.published,
             skipped_existing=sync_result.skipped_existing,
         )
         return sync_result
+
+    async def read_repo_image_base64(
+        self, repo_path: str, abs_file_path: str,
+    ) -> Optional[Tuple[str, str]]:
+        """Read an image file from the repository and return (base64_str, mime_type)."""
+        try:
+            if self._git_ops is not None and hasattr(self._git_ops, "get_workdir_file_bytes"):
+                rel_path = normalize_repo_relative_path(repo_path, abs_file_path)
+                raw_bytes = await self._git_ops.get_workdir_file_bytes(repo_path, rel_path)
+                modality, mime_type = self._git_ops.detect_file_modality(rel_path, raw_bytes)
+                if modality == "image" and mime_type:
+                    return base64.b64encode(raw_bytes).decode("ascii"), mime_type
+            if os.path.isfile(abs_file_path):
+                with open(abs_file_path, "rb") as f:
+                    raw_bytes = f.read()
+                ext = os.path.splitext(abs_file_path)[1].lower()
+                mime_type = "image/png" if ext == ".png" else "image/jpeg"
+                return base64.b64encode(raw_bytes).decode("ascii"), mime_type
+        except Exception as e:
+            logger.warning(
+                "read_repo_image_base64_failed",
+                repo_path=repo_path,
+                file_path=abs_file_path,
+                error=str(e)[:200],
+            )
+        return None
+
+    # =========================================================================
+    # 2.7 Project ignore rule management (.git/codebase-rag/ignore)
+    # =========================================================================
+
+    def manage_project_ignore(
+        self,
+        project_path: str,
+        action: str,
+        patterns: Optional[List[str]] = None,
+        content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """View or update per-repository ignore rules in .git/codebase-rag/ignore."""
+        assert self._git_ops is not None, "git_ops dependency required"
+        # Ensure project_path is a valid registered Git repository root
+        self._resolve_project_id(project_path)
+
+        ignore_file = self._git_ops.get_ignore_file_path(project_path)
+        act = (action or "get").strip().lower()
+        if act == "get":
+            rules = self._git_ops.get_ignore_rules(project_path)
+            raw_content = self._git_ops.get_ignore_content(project_path)
+        elif act == "add":
+            if not patterns:
+                raise ValueError("action='add' requires non-empty 'patterns' array.")
+            rules = self._git_ops.add_ignore_rules(project_path, patterns)
+            raw_content = self._git_ops.get_ignore_content(project_path)
+        elif act == "remove":
+            if not patterns:
+                raise ValueError("action='remove' requires non-empty 'patterns' array.")
+            rules = self._git_ops.remove_ignore_rules(project_path, patterns)
+            raw_content = self._git_ops.get_ignore_content(project_path)
+        elif act == "set":
+            if content is None and patterns is not None:
+                content = "\n".join(patterns)
+            if content is None:
+                raise ValueError("action='set' requires 'content' string or 'patterns' array.")
+            rules = self._git_ops.set_ignore_content(project_path, content)
+            raw_content = self._git_ops.get_ignore_content(project_path)
+        else:
+            raise ValueError(
+                f"Unsupported action '{action}'. Must be one of: get, add, remove, set."
+            )
+
+        return {
+            "git_repo_path": project_path,
+            "ignore_file": ignore_file,
+            "action": act,
+            "rules": rules,
+            "content": raw_content,
+        }
 
     # =========================================================================
     # Internal helpers

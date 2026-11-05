@@ -22,31 +22,13 @@ embedding:
     providers:
       gemini:
         api_base_url: "https://generativelanguage.googleapis.com"
-        model_name: "gemini-embedding-001"
+        model_name: "gemini-embedding-2"
         dimension: 3072
         batch_size: 100
-        max_tokens_per_text: 2048
+        max_tokens_per_text: 8192
         request_timeout: 30
         api_keys:
           - key: "${GEMINI_EMBED_KEY_1}"
-        retry:
-          max_retries_per_key: 3
-          retry_base_delay: 1.0
-          retry_backoff_multiplier: 2.0
-          key_cooldown_seconds: 60
-
-  sparse:
-    active_provider: "dashscope"
-    providers:
-      dashscope:
-        api_base_url: "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding"
-        model_name: "text-embedding-v4"
-        dimension: 2048
-        batch_size: 10
-        max_tokens_per_text: 2048
-        request_timeout: 30
-        api_keys:
-          - key: "${DASHSCOPE_API_KEY}"
         retry:
           max_retries_per_key: 3
           retry_base_delay: 1.0
@@ -71,8 +53,6 @@ qdrant_storage:
       name: "dense_vectors"
       size: 3072                           # 必须与 embedding dense dimension 一致
       distance: "Cosine"
-    sparse_vector:
-      name: "sparse_vectors"               # 必须与已有集合一致
 
 # --- 02-内存 Qdrant 服务 ---
 memory_qdrant:
@@ -84,8 +64,6 @@ memory_qdrant:
       name: "dense_vectors"
       size: 3072                           # 必须与上方一致
       distance: "Cosine"
-    sparse_vector:
-      name: "sparse_vectors"               # 必须与上方一致
 
 # --- 03-Agent 服务 ---
 # api_format: "gemini" | "openai_chat" | "openai_responses" | "anthropic" | "zhipu" | "deepseek"
@@ -616,9 +594,6 @@ git_operations:
       - "*.csv"
       - "*.tsv"
       - "*.svg"
-      - "*.png"
-      - "*.jpg"
-      - "*.jpeg"
       - "*.gif"
       - "*.ico"
       - "*.woff"
@@ -641,108 +616,12 @@ git_operations:
       - "*.dll"
       - "*.exe"
 
-    # Layer 2 白名单
-    include_extensions:
-      - py
-      - js
-      - mjs
-      - cjs
-      - ts
-      - mts
-      - cts
-      - tsx
-      - jsx
-      - java
-      - go
-      - rs
-      - cpp
-      - c
-      - h
-      - cs
-      - rb
-      - php
-      - swift
-      - kt
-      - scala
-      - vue
-      - svelte
-      - dart
-      - lua
-      - r
-      - m
-      - ex
-      - exs
-      - erl
-      - hrl
-      - hs
-      - clj
-      - cljs
-      - groovy
-      - pl
-      - pm
-      - proto
-      - graphql
-      - gql
-      - sol
-      - zig
-      - yml
-      - yaml
-      - toml
-      - json
-      - jsonc
-      - xml
-      - ini
-      - cfg
-      - conf
-      - env
-      - properties
-      - tf
-      - hcl
-      - dockerfile
-      - gradle
-      - cmake
-      - md
-      - rst
-      - sh
-      - bash
-      - ps1
-      - bat
-      - html
-      - css
-      - scss
-      - less
-      - sql
-
-    include_filenames:
-      - Dockerfile
-      - Makefile
-      - Jenkinsfile
-      - Procfile
-      - Gemfile
-      - Rakefile
-      - .gitignore
-      - .env.example
-      - .env.local
-      - .env.production
-      - requirements.txt
-      - setup.py
-      - setup.cfg
-      - pyproject.toml
-      - package.json
-      - tsconfig.json
-      - docker-compose.yml
-      - docker-compose.yaml
-
-    # Layer 3 灰区 LLM 判断
-    uncertain:
-      enabled: true
-      binary_detection: true
-      classify_batch_size: 50
-      store_path: "${CODEBASE_RAG_DATA_DIR}/data/gray_area_classifications.json"  # 灰区分类经验持久化
-
 # --- 08-工作流编排服务 ---
 workflow:
   data_dir: "${CODEBASE_RAG_DATA_DIR}/data"             # 重试队列/死信队列持久化目录
+  content_commit:
+    max_file_concurrency: 5
+    point_token_limit: 8192              # 单条知识描述最大 tokens（含图片固定 258 tokens）
   initialization:
     mode: "incremental"          # "incremental" = 仅跟踪增量（默认） | "full" = 全量初始化
     max_file_concurrency: 5     # 全量初始化时并发处理的文件数（通过 asyncio.Semaphore 控制）
@@ -750,13 +629,6 @@ workflow:
   knowledge_producer:                   # 源码业务描述生成 agent 的 LLM 负载配置
     timeout: 3600                        # agent 超时（秒）
     max_points_per_call: 10              # 单次工具调用最多创建的知识点数量
-    max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
-    providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
-      - provider: "local_deepseek"
-        model: "deepseek-v4.1-flash"
-        priority: 50
-  gray_area_classifier:                 # 灰区文件分类 agent 的 LLM 负载配置
-    timeout: 30                         # agent 超时（秒）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
     providers:                          # 服务商队列：按 priority 升序排列，值越小优先级越高
       - provider: "local_deepseek"
@@ -835,4 +707,4 @@ mcp:
     timeout: 600                          # 重排序 agent 超时（秒，10 分钟）
     max_rate_limit_retries: 1            # 单 key 429 重试上限；-1 = 无限（受 timeout 约束）
   knowledge_submission:
-    point_token_limit: 2048              # 单条知识描述最大 tokens
+    point_token_limit: 8192              # 单条知识描述最大 tokens（含图片固定 258 tokens）

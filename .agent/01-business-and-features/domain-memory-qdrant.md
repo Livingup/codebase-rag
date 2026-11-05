@@ -1,4 +1,4 @@
-﻿# 内存检索实例 memory_qdrant
+# 内存检索实例 memory_qdrant
 
 ## 一、业务域职责边界与域内铁律
 
@@ -15,7 +15,7 @@
   2. [缓存命中]：非 staging 创建命中缓存 → touch + move_to_end 后直接返回既有实例。
   3. [staging 键规则]：staging 实例 key = `{base_key}#staging:{uuid4}`，永不复用；创建后加入 `_loading` 保护集合。
   4. [容量保护]：缓存满时先淘汰（FEAT-MQ-04）；staging 创建传 `protected_repo_key` 防止淘汰同副本当前活跃实例，且 `allow_over_capacity=True` 允许超容量（无安全淘汰对象时沿用允许超容量策略，不新增硬上限；提升后不主动缩容）。
-  5. [向量配置]：按配置建 dense（含 HNSW m/ef_construct，未启用则 None）+ sparse 双向量。
+  5. [向量配置]：按配置建 `dense` 单一稠密向量（3072 维 Cosine，含 HNSW `m`/`ef_construct`，未启用则 `None`）。
 - **级联依赖功能单元（Cascade Links）**：FEAT-WF-02（staging 创建方）、FEAT-COMMON-06（repo_key 规范化）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
@@ -24,19 +24,18 @@
   - 域服务门面（services/memory_qdrant/service.py）：`src/codebase_rag/services/memory_qdrant/service.py`（create_instance 段）
   - 域数据模型（services/memory_qdrant/models.py）：`src/codebase_rag/services/memory_qdrant/models.py`
 
-### [FEAT-MQ-02] 混合检索（dense+sparse RRF 融合）
-- **业务目标**：副本活跃实例上稠密+稀疏双路召回并 RRF 融合排序。
+### [FEAT-MQ-02] 稠密向量检索
+- **业务目标**：副本活跃实例上执行 3072 维 Cosine 稠密向量相似度召回，并透传 `file_type`。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [实例获取]：`hybrid_search(repo_key, ...)` / `dense_search(repo_key, ...)` 取该副本的活跃实例；无活跃实例 → 触发懒重建（FEAT-MQ-05）。
+  1. [实例获取]：`hybrid_search(repo_key, ...)` / `dense_search(repo_key, ...)` 取该副本的活跃实例（`hybrid_search` 直接委托 `dense_search`）；无活跃实例 → 触发懒重建（FEAT-MQ-05）。
   2. [top_k 钳制]：`k = min(top_k or default_top_k, max_top_k)`。
-  3. [双路召回]：dense、sparse 各自 `query_points(limit=prefetch_limit, with_payload=True)`。
-  4. [RRF 融合]：`score += weight/(rrf_k + rank + 1)`（两路累加同 ID）；取前 k；**不做分数阈值过滤**；`touch_search()` 更新检索活跃时间。
+  3. [向量召回]：对 `dense` 命名向量执行 `query_points(limit=k, with_payload=True)`，构造 `SearchResult`（含 `file_type=payload.get("file_type", "text")`）；**不做分数阈值过滤**；`touch_search()` 更新检索活跃时间。
 - **级联依赖功能单元（Cascade Links）**：FEAT-MCPS-02（检索消费方）、FEAT-MGMT-04（REST 搜索消费方）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
   - 技术架构抉择：`.agent/04-tech-decisions/tech-repo-copy-identity.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
-  - 域服务门面（services/memory_qdrant/service.py）：`src/codebase_rag/services/memory_qdrant/service.py`（hybrid_search 段）
+  - 域服务门面（services/memory_qdrant/service.py）：`src/codebase_rag/services/memory_qdrant/service.py`（dense_search / hybrid_search 段）
 
 ### [FEAT-MQ-03] 活跃实例管理与 staging 晋升
 - **业务目标**：维护 repo_key→活跃实例映射，完成 staging 实例原地转正。

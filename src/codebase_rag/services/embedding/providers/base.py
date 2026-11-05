@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Sequence
 
-from codebase_rag.common.types import SparseVector
+from codebase_rag.common.types import EmbedInputItem
 
 
 class DenseEmbeddingProvider(ABC):
@@ -16,15 +16,22 @@ class DenseEmbeddingProvider(ABC):
     """
 
     @abstractmethod
-    async def embed_batch(self, api_key: str, texts: List[str]) -> List[List[float]]:
-        """Generate dense vectors for a batch of texts.
+    async def embed_batch(
+        self,
+        api_key: str,
+        inputs: Sequence[EmbedInputItem],
+        is_query: bool = False,
+    ) -> List[List[float]]:
+        """Generate dense vectors for a batch of text or multimodal inputs.
 
         Args:
             api_key: API key to use for this call.
-            texts: Batch of texts to embed.
+            inputs: Batch of texts or MultimodalEmbedInput items to embed.
+            is_query: Whether the inputs are search queries (RETRIEVAL_QUERY)
+                or documents (RETRIEVAL_DOCUMENT).
 
         Returns:
-            List of dense vectors, one per input text.
+            List of dense vectors, one per input item.
         """
         ...
 
@@ -53,24 +60,3 @@ class DenseEmbeddingProvider(ABC):
         """
         ...
 
-
-class SparseEmbeddingProvider(ABC):
-    """Abstract interface for sparse vector embedding providers."""
-
-    @abstractmethod
-    async def embed_batch(self, api_key: str, texts: List[str]) -> List[SparseVector]:
-        """Generate sparse vectors for a batch of texts.
-
-        Args:
-            api_key: API key to use for this call.
-            texts: Batch of texts to embed.
-
-        Returns:
-            List of SparseVector, one per input text.
-        """
-        ...
-
-    @abstractmethod
-    async def health_check(self, api_key: str) -> bool:
-        """Verify API key is valid and service is reachable."""
-        ...

@@ -87,7 +87,6 @@ def _collect_unique_provider_models(
         ("context_compression", cfg.agent.context_compression.providers),
         ("context_engine", cfg.context_engine.providers),
         ("knowledge_producer", cfg.workflow.knowledge_producer.providers),
-        ("gray_area_classifier", cfg.workflow.gray_area_classifier.providers),
         ("reranker", cfg.mcp.reranker.providers),
     )
 

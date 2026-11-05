@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
+from codebase_rag.common.types import FileType
+
 
 @dataclass(frozen=True)
 class SearchFilters:
-    """Optional filters for hybrid search."""
+    """Optional filters for vector search."""
 
     entity_types: Optional[List[str]] = None
     file_paths: Optional[List[str]] = None
@@ -18,7 +20,7 @@ class SearchFilters:
 
 @dataclass(frozen=True)
 class SearchResult:
-    """A single search result from hybrid or dense search."""
+    """A single search result from vector search."""
 
     score: float
     file_version_id: str
@@ -26,6 +28,7 @@ class SearchResult:
     entity_type: str
     entity_name: str
     business_description: str
+    file_type: FileType = "text"
 
 
 @dataclass(frozen=True)

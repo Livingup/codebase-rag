@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 from mcp.server import Server
 from mcp.types import (
     CallToolResult,
+    ImageContent,
     TextContent,
     Tool,
 )
@@ -36,7 +37,7 @@ from codebase_rag.services.mcp_service.service import McpService
 
 logger = get_logger(__name__)
 
-ToolHandlerResult = list[TextContent] | CallToolResult
+ToolHandlerResult = list[TextContent | ImageContent] | CallToolResult
 
 
 # =============================================================================
@@ -163,8 +164,10 @@ TOOL_DEFINITIONS: list[Tool] = [
             "提交单个文件版本的知识点描述。"
             "用于编程 Agent 修改或创建文件后、git commit 之前，"
             "主动提供该文件当前工作区版本的业务知识描述。"
+            "仅支持文本文件与 .png / .jpg / .jpeg 图片文件（单张图片不超过 20MB）。"
+            "单条知识点最大支持 8192 tokens（图片文件每条知识点固定占用 258 图片 tokens，服务端对每条知识点以「文字描述 + 原始图片」一起生成多模态向量）。"
             "调用方必须提供当前文件内容对应的 git blob hash，"
-            "后端会校验 blob_hash、生成嵌入向量并通过统一同步协调器落地。"
+            "后端会校验 blob_hash、自动识别文件类型（text / image）、生成嵌入向量并通过统一同步协调器落地。"
             "已受理不代表立即可检索；同一文件版本已有知识时不覆盖已有内容。"
         ),
         inputSchema={
@@ -176,7 +179,7 @@ TOOL_DEFINITIONS: list[Tool] = [
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "文件的绝对路径。服务端将根据 git_repo_path 动态计算相对路径",
+                    "description": "文件的绝对路径（仅支持文本文件或 .png / .jpg / .jpeg 图片文件）。服务端将根据 git_repo_path 动态计算相对路径并自动识别文件类型",
                 },
                 "blob_hash": {
                     "type": "string",
@@ -189,7 +192,7 @@ TOOL_DEFINITIONS: list[Tool] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "该文件的知识描述文本列表，每条对应一个独立知识点。"
+                        "该文件的知识描述文本列表，每条对应一个独立知识点（单条上限 8192 tokens；图片文件额外计入 258 tokens）。"
                         "描述应遵循 5 层结构化模板"
                         "（项目结构域/业务域/功能描述/目的描述/业务逻辑细节）。"
                     ),
@@ -201,6 +204,38 @@ TOOL_DEFINITIONS: list[Tool] = [
                 "blob_hash",
                 "knowledge_descriptions",
             ],
+        },
+    ),
+    Tool(
+        name="manage_project_ignore",
+        description=(
+            "查看或编辑指定 Git 仓库的知识点跟踪忽略规则文件（存放在 .git/codebase-rag/ignore）。"
+            "语法规则与 .gitignore 完全一致（支持通配符 *、**、目录后缀 /、注释 # 以及 ! 反选规则），"
+            "仅用于控制 codebase-rag 是否拦截该仓库中文件的知识点生成与提交，不影响 Git 本身的 .gitignore。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "git_repo_path": {
+                    "type": "string",
+                    "description": "Git 仓库根目录的绝对路径（即 .git/ 所在的父目录）",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "add", "remove", "set"],
+                    "description": "操作类型：get（查看当前规则）、add（追加规则）、remove（移除指定规则）、set（整体替换规则内容）",
+                },
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "当 action 为 add / remove / set 时传入的 .gitignore 语法规则列表（例如 ['assets/raw/', '*.psd', '!assets/raw/keep.png']）",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "当 action 为 set 时可选直接传入完整的 .git/codebase-rag/ignore 多行文本内容",
+                },
+            },
+            "required": ["git_repo_path", "action"],
         },
     ),
     Tool(
@@ -264,13 +299,15 @@ async def handle_call_tool(
         return await handle_get_file_knowledge(arguments, mcp_service)
     elif name == "add_file_knowledge":
         return await handle_add_file_knowledge(arguments, mcp_service)
+    elif name == "manage_project_ignore":
+        return await handle_manage_project_ignore(arguments, mcp_service)
     else:
         raise ValueError(f"Unknown tool: '{name}'")
 
 
 async def handle_codebase_search(
     args: dict, mcp_service: McpService,
-) -> list[TextContent]:
+) -> list[TextContent | ImageContent]:
     """Handle codebase_search tool call.
 
     Accepts a list of queries, each targeting one or more Git repos.
@@ -337,7 +374,30 @@ async def handle_codebase_search(
             repo_group.results = res
 
     text = _format_grouped_results(grouped)
-    return [TextContent(type="text", text=text)]
+    contents: list[TextContent | ImageContent] = [TextContent(type="text", text=text)]
+
+    # Append multimodal ImageContent parts for any matched image knowledge points
+    seen_image_paths: set[str] = set()
+    if hasattr(mcp_service, "read_repo_image_base64"):
+        for qg in grouped:
+            for rg in qg.repos:
+                if rg.error:
+                    continue
+                for r in rg.results:
+                    if getattr(r, "file_type", "text") == "image" and r.file_path not in seen_image_paths:
+                        seen_image_paths.add(r.file_path)
+                        img_data = await mcp_service.read_repo_image_base64(rg.repo_path, r.file_path)
+                        if img_data is not None:
+                            b64_str, mime_type = img_data
+                            contents.append(
+                                ImageContent(
+                                    type="image",
+                                    data=b64_str,
+                                    mimeType=mime_type,
+                                )
+                            )
+
+    return contents
 
 
 async def handle_project_status(
@@ -534,6 +594,43 @@ async def handle_add_file_knowledge(
     raise McpServiceError("知识提交返回了不一致的单文件结果，不能确认本次提交。")
 
 
+async def handle_manage_project_ignore(
+    args: dict, mcp_service: McpService,
+) -> list[TextContent]:
+    """Handle manage_project_ignore tool call."""
+    git_repo_path = args.get("git_repo_path", "")
+    action = args.get("action", "")
+    patterns = args.get("patterns")
+    content = args.get("content")
+
+    if not git_repo_path or not isinstance(git_repo_path, str):
+        raise ValueError("Missing required parameter: 'git_repo_path'.")
+    if not action or not isinstance(action, str):
+        raise ValueError("Missing required parameter: 'action'.")
+    if patterns is not None and not isinstance(patterns, list):
+        raise ValueError("Optional parameter 'patterns' must be an array of strings.")
+
+    info = mcp_service.manage_project_ignore(
+        project_path=git_repo_path,
+        action=action,
+        patterns=patterns,
+        content=content,
+    )
+    rules = info.get("rules") or []
+    lines = [
+        f"仓库：{info['git_repo_path']}",
+        f"忽略规则文件：{info['ignore_file']}",
+        f"操作：{info['action']}",
+        f"当前生效自定义规则数：{len(rules)}",
+    ]
+    raw_content = (info.get("content") or "").strip()
+    if raw_content:
+        lines.append("\n```gitignore\n" + raw_content + "\n```")
+    else:
+        lines.append("\n（当前无自定义忽略规则，仅使用全局默认 exclude_patterns）")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 # =============================================================================
 # MCP Server factory
 # =============================================================================
@@ -635,8 +732,9 @@ def _format_grouped_results(groups: List[QuerySearchGroup]) -> str:
             )
 
             for i, r in enumerate(rg.results, 1):
+                file_type_tag = " [image]" if getattr(r, "file_type", "text") == "image" else ""
                 parts.append(
-                    f"### [{i}] {r.file_path}\n\n"
+                    f"### [{i}] {r.file_path}{file_type_tag}\n\n"
                     f"{r.business_description}\n"
                 )
 
