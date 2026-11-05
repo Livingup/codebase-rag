@@ -1,6 +1,9 @@
-# Environment variables (API keys)
+# Environment variables & runtime config (API keys & local paths)
 .env
+.env.*
+!.env.example
 /.env.qdrant.bak
+/config.yaml
 
 # Python
 __pycache__/
@@ -9,6 +12,8 @@ __pycache__/
 dist/
 build/
 *.egg
+*.zip
+*.sha256
 
 # IDE
 .idea/
@@ -20,9 +25,14 @@ build/
 .DS_Store
 Thumbs.db
 
-# Data
+# Data & Logs
 data/
 data-temp/
+logs/
+*.log
+backups/
+runtime/
+downloads/
 docs/
 
 # Test / Coverage
@@ -40,3 +50,15 @@ htmlcov/
 view-logs.ps1
 /CodebaseRAG-LiveLog.ps1
 *.lnk
+
+# AI Studio platform & agent runtime generated files
+/public/
+/assets/
+/.aistudio/
+/metadata.json
+/package.json
+/package-lock.json
+/node_modules/
+/.playwright-cli/
+/playwright-report/
+/test-results/
