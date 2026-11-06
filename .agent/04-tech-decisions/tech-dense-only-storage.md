@@ -20,7 +20,7 @@
 ## 3. 已执行的迁移与验证证据
 
 1. 迁移前停止 CodebaseRAG Windows 服务，避免并发写入。
-2. 创建源集合快照并下载至容器外：`C:\ProgramData\CodebaseRAG\backups\upgrade-cleanup-20261106-053625\codebase-6337435039344044-2026-11-06-13-49-06.snapshot`；文件大小 257171456 bytes，SHA-256 `e828d9f60e66dab93914d5524ee5e581f9fb3f9f9839dc0a560ab73caa4a5650`。
+2. 迁移前创建源集合快照并下载到容器外完成校验；**验证通过后已按用户要求删除该快照文件，当前不保留迁移快照副本**。
 3. 新集合复制全部 8887 个 Point 的 ID、payload 与 `dense_vectors`，并复制源 payload 索引定义；不复制任何稀疏向量或稀疏 Schema。
 4. 对全部 8887 个 Point 逐一比较 ID、规范化 payload 与完整稠密向量 SHA-256，全部一致；目标集合与 `codebase` 别名的稠密查询均返回结果。
 5. 全量验证通过后删除旧 `codebase` 物理集合并建立同名 Alias；最终 Point 数仍为 8887，稀疏 Schema 不存在。
@@ -28,6 +28,6 @@
 ## 4. 回滚与禁止项
 
 - 配置与环境备份目录：`C:\ProgramData\CodebaseRAG\backups\upgrade-cleanup-20261106-053625`。安装版旧 release 保留用于应用回滚。
-- 数据回滚必须从上述容器外快照恢复到独立集合并重新指向 Alias，禁止在唯一数据副本上直接试验恢复。
+- 迁移快照已删除，不存在数据级回滚点。若需回到旧结构，只能回退安装版 release 并重新从 Git 仓库全量重建知识库（知识可由源码与 Git 历史重新生成，不依赖快照）。
 - 禁止重新引入 `SparseVector`、`sparse_vector`、`query_sparse`、`hybrid_search`、RRF 参数或只转发 `dense_search` 的无意义混合检索包装。
 - 禁止为兼容旧 Schema 而跳过启动校验；发现旧集合时必须显式迁移，不得静默接受。
