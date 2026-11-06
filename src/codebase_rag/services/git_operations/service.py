@@ -236,15 +236,12 @@ class GitOperationsService:
     # 2.1 Get file tree
     # =========================================================================
 
-    async def get_file_tree(
-        self, repo_path: str, ref: str, *, include_uncertain: bool = False,
-    ) -> List[FileEntry]:
+    async def get_file_tree(self, repo_path: str, ref: str) -> List[FileEntry]:
         """Get filtered file list from a Git ref.
 
         Args:
             repo_path: Absolute path to the Git repository root.
             ref: Branch name or commit hash.
-            include_uncertain: Retained for call-site compatibility (no-op).
 
         Returns:
             List of FileEntry (files passing global + repo ignore rules).

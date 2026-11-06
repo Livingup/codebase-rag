@@ -34,7 +34,7 @@
 ### [FEAT-MCPS-02] 两阶段检索引擎（向量召回 + 自愈重试 + LLM 重排）
 - **业务目标**：先稠密向量召回粗筛，再由 LLM/Jev 重排精选 top_k。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [Stage 1 召回]：query 经 `embedding.embed([query], is_query=True)` 向量化（`gemini-embedding-2` `RETRIEVAL_QUERY`）→ `hybrid_search(repo_key, top_k=recall_limit=400)`——`repo_key` 为调用方仓库根的规范化键（`project_id` 仍从 `.git` 缓存解析用于分区与自愈信号）。
+  1. [Stage 1 召回]：query 经 `embedding.embed([query], is_query=True)` 向量化（`gemini-embedding-2` `RETRIEVAL_QUERY`）→ `dense_search(repo_key, top_k=recall_limit=400)`——`repo_key` 为调用方仓库根的规范化键（`project_id` 仍从 `.git` 缓存解析用于分区与自愈信号）。
   2. [无实例自愈重试]：IF 抛 `NoActiveInstanceError` THEN 同步自愈重试一次——调移动自愈 handler；自愈失败或重试仍抛错 THEN 转 `ProjectNotIndexedError`（"no active index and lazy rebuild failed. Ensure the project is registered..."）；IF 召回为空 THEN 返回 `[]`。
   3. [跳过重排]：IF 召回数 ≤ `top_k` THEN 跳过重排直接按向量分返回（`reason="candidates_leq_top_k"`），保留 `file_type`。
   4. [Stage 2 重排]：`pick_n = min(top_k+5, 候选数)`；重排器基于候选点的 `business_description` 按 `providers` priority 顺序迭代：`api_format=="jev"` 走 `JevRerankerClient`，否则走 Agent 工具调用式重排（`submit_scores`/`end_task` 工具，分数 clamp 到 `[0,1]`，同一 id 取最高分）；单 provider 失败降级下一个；全部耗尽抛 `RerankerError`。

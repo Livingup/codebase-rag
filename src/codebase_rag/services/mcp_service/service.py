@@ -1,7 +1,7 @@
 """MCP Service — two-stage semantic search with LLM reranking + knowledge sync.
 
 Provides the core search logic used by the MCP Server tools:
-  Stage 1: Hybrid vector search (dense + sparse) → recall up to recall_limit candidates
+  Stage 1: Dense vector search → recall up to recall_limit candidates
   Stage 2: LLM reranker agent scores candidates → return top_k results
 
 Also provides knowledge point management:
@@ -10,7 +10,7 @@ Also provides knowledge point management:
 
 Internal dependencies:
   - 01-Qdrant Storage Service (committed knowledge query)
-  - 02-Memory Qdrant Service (hybrid search)
+  - 02-Memory Qdrant Service (dense search)
   - 03-Agent Service (reranker agent execution)
   - 04-Embedding Service (query vectorization + knowledge embedding)
   - 07-Git Operations Service (workdir blob hash)
@@ -83,7 +83,7 @@ class McpService:
     Args:
         config_manager: Configuration manager.
         embedding: Embedding service for query vectorization and knowledge embedding.
-        memory_qdrant: Memory Qdrant service for hybrid search.
+        memory_qdrant: Memory Qdrant service for dense search.
         agent: Agent service for reranker execution.
         git_ops: Git operations service for workdir blob hash computation.
         qdrant_storage: Qdrant storage service for committed knowledge query.
@@ -205,10 +205,9 @@ class McpService:
 
         # Vector search
         try:
-            candidates_raw = await self._memory.hybrid_search(
+            candidates_raw = await self._memory.dense_search(
                 repo_key,
                 query_dense=emb.dense_vector,
-                query_sparse=None,
                 top_k=recall_limit,
             )
         except NoActiveInstanceError as e:
@@ -226,10 +225,9 @@ class McpService:
                     f"Ensure the project is registered and indexed via the management API."
                 ) from e
             try:
-                candidates_raw = await self._memory.hybrid_search(
+                candidates_raw = await self._memory.dense_search(
                     normalize_repo_key(project_path),
                     query_dense=emb.dense_vector,
-                    query_sparse=None,
                     top_k=recall_limit,
                 )
             except NoActiveInstanceError as e2:
@@ -942,7 +940,6 @@ class McpService:
                 business_description=desc,
                 blob_hash=blob_hash,
                 dense_vector=emb.dense_vector,
-                sparse_vector=None,
                 file_type=file_type,
             ))
 

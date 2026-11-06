@@ -39,10 +39,7 @@ class _Embedding:
         self.embed_calls += 1
         self.last_embed_inputs = list(texts)
         return [
-            SimpleNamespace(
-                dense_vector=[0.1, 0.2],
-                sparse_vector=None,
-            )
+            SimpleNamespace(dense_vector=[0.1, 0.2])
             for _ in texts
         ]
 
@@ -361,7 +358,7 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_file_knowledge_uses_multimodal_embed_and_258_token_cost(self) -> None:
         from codebase_rag.common.types import MultimodalEmbedInput
-        from codebase_rag.services.git_operations.file_filter import FileFilter, classify_file_modality
+        from codebase_rag.services.git_operations.file_filter import classify_file_modality
 
         png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
         modality, mime_type = classify_file_modality("docs/arch.png", png_bytes)
@@ -412,15 +409,6 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(result_over.failed), 1)
             self.assertIn("260 tokens > 259 limit", result_over.failed[0].error)
-
-            # A file negation cannot re-include a path whose parent directory is excluded.
-            ff = FileFilter(
-                exclude_patterns=["node_modules/**", "*.lock"],
-                extra_ignore_lines=["assets/raw/", "!assets/raw/keep.png"],
-            )
-            self.assertTrue(ff.is_ignored("assets/raw/drop.png"))
-            self.assertTrue(ff.is_ignored("assets/raw/keep.png"))
-            self.assertFalse(ff.is_ignored("docs/arch.png"))
 
 
 

@@ -30,7 +30,7 @@
   1. [失败落盘]：_publish_locked 捕获任意异常后：retry_count += 1（无上限累计）、last_error 截断 500 字符、status="ready" 落盘，返回 retry_job_saved=True。
   2. [重试门控]：retry_ready_jobs 受 `set_retry_availability_provider` 可用性探测门控——provider 异常或未初始化时 `can_retry_pending()` 返回 False（补偿循环正在跑时避免并发重试）。
   3. [重试防重]：仅取 status=="ready" 的 job，逐个持版本锁后二次校验当前仍为 ready 才发布（防并发重复发布）；成功/跳过计 succeeded，出错计 failed；批量上限 batch_size=10。
-  4. [存储结构]：job 落盘 `{store_dir}/jobs/{project_id}/{file_version_id}.json`（含全量 points 与 dense/sparse 向量）；最新版本索引落盘 `{store_dir}/latest/{project_id}/{sha256(归一化file_path)}.json`；写入均走 `path+".tmp"` + `os.replace` 原子替换。
+  4. [存储结构]：job 落盘 `{store_dir}/jobs/{project_id}/{file_version_id}.json`（含全量 points、`dense_vector` 与 `file_type`；不再序列化稀疏向量，读取旧 JSON 时额外字段自然忽略）；最新版本索引落盘 `{store_dir}/latest/{project_id}/{sha256(归一化file_path)}.json`；写入均走 `path+".tmp"` + `os.replace` 原子替换。
   5. [读容错]：JSONDecodeError / OSError / KeyError → 返回 None（视为无 job）；get_latest 额外校验 project_id/file_path 匹配。
   6. [旧任务取消]：cancel_stale_file_jobs 遍历项目全部 job，同 file_path 且 file_version_id != latest → 置 cancelled 并回写。
   7. [外发箱目录]：`{workflow.data_dir}/knowledge_sync/`。

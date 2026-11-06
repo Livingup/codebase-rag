@@ -58,9 +58,6 @@ class ChangedFilesResult:
 
     changes: ChangedFiles
     excluded_count: int = 0
-    uncertain: ChangedFiles = field(
-        default_factory=lambda: ChangedFiles(added=[], modified=[], deleted=[], renamed=[])
-    )
 
 
 @dataclass(frozen=True)

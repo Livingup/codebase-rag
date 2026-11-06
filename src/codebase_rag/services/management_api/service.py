@@ -857,10 +857,9 @@ class ManagementApiService:
             )
 
         # Step 3: Vector search
-        results = await self._memory.hybrid_search(
+        results = await self._memory.dense_search(
             record.repo_key,
             query_dense=emb.dense_vector,
-            query_sparse=None,
             top_k=top_k,
             filters=filters,
         )

@@ -31,7 +31,7 @@
   1. [双重门禁]：`_validate_batch_size`（`len(inputs) > batch_size`（默认 100）→ `ValueError`，提示"分块是调用方责任"）+ `_validate_tokens`（逐项经 `count_tokens` 校验文本 token，若为 `MultimodalEmbedInput` 图片输入则额外加 `IMAGE_TOKEN_COST = 258` tokens，且校验图片字节 ≤ 20MB 且 MIME 属于 `image/png` 或 `image/jpeg`；总 token 超 `max_tokens_per_text=8192` → `ValueError`）；门禁失败直接阻断请求，不得截断后送入。
   2. [多模态报文构造]：纯文本输入构造 `parts=[{"text": item}]`；图片输入 `MultimodalEmbedInput` 在同一个 `Content` 的 `parts` 中同时传入 `[{"text": item.text}, {"inlineData": {"mimeType": item.mime_type, "data": base64(item.image_bytes)}}]`，将文字描述与图片共同编码为单个 3072 维向量。
   3. [检索/索引双任务类型]：`is_query=True` 时传 `taskType="RETRIEVAL_QUERY"`；`is_query=False` 时传 `taskType="RETRIEVAL_DOCUMENT"`。
-  4. [合成接口]：`embed(inputs, is_query)` 返回 `List[EmbeddingResult]`（`dense_vector` 必填，`sparse_vector=None`）；`count_tokens` 对外提供 token 计数。
+  4. [合成接口]：`embed(inputs, is_query)` 返回仅含 `dense_vector` 的 `List[EmbeddingResult]`；`count_tokens` 对外提供 token 计数。
   5. [重试规则]：总尝试数 = `keypool.total_keys × max_retries`；429 判定（llm-sdk `LLMClientError.kind ∈ {RATE_LIMIT, OVERLOADED}` / `status_code==429` / `"429"` / `RESOURCE_EXHAUSTED` / `Too Many Requests`）→ 不 `report_failure` 仅退避（`delay=max(base_delay×backoff^(attempt%max_retries), 1.5)`）；非 429 → `report_failure` 计入熔断。
   6. [热更新]：`max_concurrency` 变化重建信号量；`active_provider` 切换则 close 旧实例重建 provider+KeyPool；同 provider 仅 Key 变化则 `update_keys` 保态。
 - **级联依赖功能单元（Cascade Links）**：FEAT-COMMON-01（KeyPool）、FEAT-COMMON-02（TokenCounter）。

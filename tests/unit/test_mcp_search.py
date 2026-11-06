@@ -25,10 +25,7 @@ class _ConfigManager:
 class _Embedding:
     async def embed(self, texts, is_query: bool):
         return [
-            SimpleNamespace(
-                dense_vector=[0.1, 0.2],
-                sparse_vector=SimpleNamespace(indices=[1], values=[1.0]),
-            )
+            SimpleNamespace(dense_vector=[0.1, 0.2])
             for _ in texts
         ]
 
@@ -37,14 +34,14 @@ class _Memory:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.active_info_calls = 0
-        self.hybrid_search_calls = 0
+        self.dense_search_calls = 0
 
     async def get_active_instance_info(self, project_id: str):
         self.active_info_calls += 1
         return None
 
-    async def hybrid_search(self, project_id: str, query_dense, query_sparse, top_k: int):
-        self.hybrid_search_calls += 1
+    async def dense_search(self, project_id: str, query_dense, top_k: int):
+        self.dense_search_calls += 1
         if self.error is not None:
             raise self.error
         return [
@@ -67,7 +64,7 @@ def _create_project_path(tmp: str, project_id: str = "project-1") -> str:
 
 
 class McpSearchTest(unittest.IsolatedAsyncioTestCase):
-    async def test_search_delegates_to_hybrid_search_without_active_precheck(self) -> None:
+    async def test_search_delegates_to_dense_search_without_active_precheck(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_path = _create_project_path(tmp)
             memory = _Memory()
@@ -81,7 +78,7 @@ class McpSearchTest(unittest.IsolatedAsyncioTestCase):
             results = await service.search(project_path, "find example", top_k=10)
 
             self.assertEqual(memory.active_info_calls, 0)
-            self.assertEqual(memory.hybrid_search_calls, 1)
+            self.assertEqual(memory.dense_search_calls, 1)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].file_path, os.path.normpath(os.path.join(project_path, "src/example.py")))
 
@@ -100,5 +97,5 @@ class McpSearchTest(unittest.IsolatedAsyncioTestCase):
                 await service.search(project_path, "find example", top_k=10)
 
             self.assertEqual(memory.active_info_calls, 0)
-            self.assertEqual(memory.hybrid_search_calls, 1)
+            self.assertEqual(memory.dense_search_calls, 1)
             self.assertIn("lazy rebuild failed", str(ctx.exception))

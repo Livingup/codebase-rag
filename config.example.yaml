@@ -521,7 +521,7 @@ git_operations:
   command_timeout: 30
   max_concurrency: 4
   file_filter:
-    # Layer 1 黑名单
+    # 全局 gitignore 排除规则；仓库规则见 .git/codebase-rag/ignore
     exclude_patterns:
       - "node_modules/**"
       - "vendor/**"

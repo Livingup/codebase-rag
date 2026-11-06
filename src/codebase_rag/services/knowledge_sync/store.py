@@ -7,7 +7,6 @@ import time
 from typing import List, Optional
 
 from codebase_rag.common.logging import get_logger
-from codebase_rag.common.types import SparseVector
 from codebase_rag.services.knowledge_sync.models import KnowledgeSyncJob
 from codebase_rag.services.qdrant_storage.models import PointData
 
@@ -239,14 +238,6 @@ class KnowledgeSyncStore:
                     "business_description": p.business_description,
                     "blob_hash": p.blob_hash,
                     "dense_vector": p.dense_vector,
-                    "sparse_vector": (
-                        {
-                            "indices": p.sparse_vector.indices,
-                            "values": p.sparse_vector.values,
-                        }
-                        if p.sparse_vector is not None
-                        else None
-                    ),
                 }
                 for p in job.points
             ],
@@ -256,7 +247,6 @@ class KnowledgeSyncStore:
     def _deserialize_job(data: dict) -> KnowledgeSyncJob:
         points = []
         for p in data["points"]:
-            sv = p.get("sparse_vector")
             raw_ft = p.get("file_type", "text")
             file_type = "image" if raw_ft == "image" else "text"
             points.append(PointData(
@@ -266,14 +256,6 @@ class KnowledgeSyncStore:
                 business_description=p["business_description"],
                 blob_hash=p["blob_hash"],
                 dense_vector=p["dense_vector"],
-                sparse_vector=(
-                    SparseVector(
-                        indices=sv["indices"],
-                        values=sv["values"],
-                    )
-                    if isinstance(sv, dict) and "indices" in sv and "values" in sv
-                    else None
-                ),
                 file_type=file_type,
             ))
         return KnowledgeSyncJob(

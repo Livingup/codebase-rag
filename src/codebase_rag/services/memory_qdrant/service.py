@@ -21,7 +21,6 @@ from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from qdrant_client import AsyncQdrantClient, models
 
 from codebase_rag.common.logging import get_logger
-from codebase_rag.common.types import SparseVector
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import MemoryQdrantConfig
 from codebase_rag.services.memory_qdrant.errors import (
@@ -89,7 +88,7 @@ class _CachedInstance:
 
 
 class MemoryQdrantService:
-    """In-memory repo-copy-specific Qdrant instances with LRU caching + hybrid search.
+    """In-memory repo-copy-specific Qdrant instances with LRU caching + dense search.
 
     Args:
         config: Memory Qdrant configuration section from AppConfig.
@@ -372,27 +371,7 @@ class MemoryQdrantService:
         return fvids
 
     # =========================================================================
-    # 2.5 Hybrid search (RRF fusion)
-    # =========================================================================
-
-    async def hybrid_search(
-        self,
-        repo_key: str,
-        query_dense: List[float],
-        query_sparse: Optional[SparseVector] = None,
-        top_k: Optional[int] = None,
-        filters: Optional[SearchFilters] = None,
-    ) -> List[SearchResult]:
-        """Vector search on the copy's active instance (delegates to dense_search)."""
-        return await self.dense_search(
-            repo_key=repo_key,
-            query_dense=query_dense,
-            top_k=top_k,
-            filters=filters,
-        )
-
-    # =========================================================================
-    # 2.6 Dense-only search
+    # 2.5 Dense search
     # =========================================================================
 
     async def dense_search(
@@ -978,37 +957,3 @@ class MemoryQdrantService:
             return None
 
         return models.Filter(must=conditions)
-
-    @staticmethod
-    def _rrf_fusion(
-        dense_points: list,
-        sparse_points: list,
-        dense_weight: float,
-        sparse_weight: float,
-        rrf_k: int,
-    ) -> List[Tuple]:
-        """Reciprocal Rank Fusion.
-
-        Returns list of (point_id, fused_score, payload) sorted by score desc.
-        """
-        scores: Dict[str, float] = {}
-        payloads: Dict[str, dict] = {}
-
-        # Dense ranking
-        for rank, pt in enumerate(dense_points):
-            pid = str(pt.id)
-            scores[pid] = scores.get(pid, 0.0) + dense_weight / (rrf_k + rank + 1)
-            if pid not in payloads:
-                payloads[pid] = pt.payload or {}
-
-        # Sparse ranking
-        for rank, pt in enumerate(sparse_points):
-            pid = str(pt.id)
-            scores[pid] = scores.get(pid, 0.0) + sparse_weight / (rrf_k + rank + 1)
-            if pid not in payloads:
-                payloads[pid] = pt.payload or {}
-
-        # Sort by fused score
-        fused = [(pid, score, payloads[pid]) for pid, score in scores.items()]
-        fused.sort(key=lambda x: x[1], reverse=True)
-        return fused

@@ -28,7 +28,6 @@ from codebase_rag.common.types import (
     FileType,
     IMAGE_TOKEN_COST,
     MultimodalEmbedInput,
-    SparseVector,
 )
 from codebase_rag.config.loader import ConfigManager
 from codebase_rag.config.schema import WorkflowConfig
@@ -501,10 +500,8 @@ class WorkflowOrchestratorService:
                 diff_unchanged=0, duration_ms=duration,
             )
 
-        # Step 2: Get new branch file list (include uncertain for loading existing data)
-        file_tree = await self._git_ops.get_file_tree(
-            repo_path, branch_name, include_uncertain=True,
-        )
+        # Step 2: Get new branch file list
+        file_tree = await self._git_ops.get_file_tree(repo_path, branch_name)
         new_versions: Set[str] = {e.file_version_id for e in file_tree}
 
         # Step 3: Get current in-memory file_version_ids (if active instance exists)
@@ -644,9 +641,7 @@ class WorkflowOrchestratorService:
             return
 
         # Step 3: Get file tree for current branch
-        file_tree = await self._git_ops.get_file_tree(
-            repo_path, branch_name, include_uncertain=True,
-        )
+        file_tree = await self._git_ops.get_file_tree(repo_path, branch_name)
         all_fvids = [e.file_version_id for e in file_tree]
 
         # Step 4: Create a staging instance so an existing active instance is
@@ -1150,10 +1145,8 @@ class WorkflowOrchestratorService:
             commit=commit_hash[:8],
         )
 
-        # Step 1: Get current file tree (include uncertain for loading existing data)
-        file_tree = await self._git_ops.get_file_tree(
-            repo_path, branch_name, include_uncertain=True,
-        )
+        # Step 1: Get current file tree
+        file_tree = await self._git_ops.get_file_tree(repo_path, branch_name)
         all_fvids = [e.file_version_id for e in file_tree]
 
         # Step 2: Check which already exist in persistent storage
@@ -1454,7 +1447,6 @@ class WorkflowOrchestratorService:
                     business_description=p["business_description"],
                     blob_hash=blob_hash,
                     dense_vector=emb.dense_vector,
-                    sparse_vector=emb.sparse_vector,
                     file_type=file_type,
                 ))
 
@@ -1732,7 +1724,6 @@ class WorkflowOrchestratorService:
                 business_description=description,
                 blob_hash=blob_hash,
                 dense_vector=dense_vector,
-                sparse_vector=None,
                 file_type=file_type,
             ))
 

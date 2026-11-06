@@ -5,7 +5,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from codebase_rag.common.types import SparseVector
 from codebase_rag.services.qdrant_storage.errors import QdrantOperationError
 from codebase_rag.services.qdrant_storage.models import PointData
 from codebase_rag.services.qdrant_storage.service import QdrantStorageService

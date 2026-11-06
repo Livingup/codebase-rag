@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Literal, Optional, Union
 
 FileType = Literal["text", "image"]
@@ -27,19 +27,10 @@ EmbedInputItem = Union[str, MultimodalEmbedInput]
 
 
 @dataclass(frozen=True)
-class SparseVector:
-    """Qdrant-compatible sparse vector representation (legacy/optional)."""
-
-    indices: List[int]
-    values: List[float]
-
-
-@dataclass(frozen=True)
 class EmbeddingResult:
     """Dense embedding result for a single knowledge point."""
 
     dense_vector: List[float]
-    sparse_vector: Optional[SparseVector] = None
 
 
 @dataclass(frozen=True)

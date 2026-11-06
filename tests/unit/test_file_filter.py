@@ -34,6 +34,18 @@ def test_backslash_escape_is_not_rewritten_as_a_path_separator():
     assert not ff.is_ignored("foo/bar")
 
 
+def test_global_and_repository_rules_are_combined():
+    ff = FileFilter(
+        exclude_patterns=["node_modules/**", "*.lock"],
+        extra_ignore_lines=["assets/raw/", "!assets/raw/keep.png"],
+    )
+    assert ff.is_ignored("node_modules/pkg/index.js")
+    assert ff.is_ignored("package.lock")
+    assert ff.is_ignored("assets/raw/drop.png")
+    assert ff.is_ignored("assets/raw/keep.png")
+    assert not ff.is_ignored("docs/arch.png")
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
 def test_supported_cases_match_git_check_ignore(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)

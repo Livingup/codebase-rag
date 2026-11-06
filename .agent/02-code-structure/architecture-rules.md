@@ -13,6 +13,8 @@
 - 配置：`ConfigManager`（`config/loader.py`）是运行时配置唯一持有者；各服务通过注册 reconciler 支持热重载。
 - 测试：`tests/unit/` 与 `tests/integration/`；异步单测用 `unittest.IsolatedAsyncioTestCase` + `SimpleNamespace` 伪造依赖；pytest `asyncio_mode=auto`。
 - 第三方能力边界：LLM/向量协议统一委托 `pythonsdk`（llm-sdk），`.gitignore` 语义统一委托 `pathspec.GitIgnoreSpec`（`pathspec>=1.1`，wheel 随仓置于 `wheels/`）；禁止在业务代码内重写协议客户端或 glob→正则 翻译器。源码直装/发布包安装均需保留 `--find-links wheels` 以离线解析这两类 wheel。
+- 向量模型边界：`EmbeddingResult`、`PointData`、Outbox 与 Qdrant Schema 仅携带稠密向量；检索入口统一为 `dense_search`，禁止重新引入稀疏向量模型、空兼容字段、混合检索包装或 RRF 死代码。持久化集合必须只含配置指定的唯一稠密向量，存在稀疏 Schema 时启动校验直接失败。
+- 过滤结果边界：`FilterResult` 仅含 `included` / `excluded`，文件树接口不接收灰区兼容参数；禁止恢复白名单、灰区分类或恒空 no-op 字段。
 - 测试运行环境：项目为 src 布局，单测必须以 `PYTHONPATH=src`（或已安装包）执行，否则报 `No module named 'codebase_rag'`。
 
 ## 2. 目录职责映射

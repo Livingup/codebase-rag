@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from codebase_rag.common.types import SparseVector
 from codebase_rag.services.knowledge_sync.models import KnowledgeSyncJob
 from codebase_rag.services.knowledge_sync.service import KnowledgeSyncService
 from codebase_rag.services.knowledge_sync.store import KnowledgeSyncStore
@@ -16,7 +15,7 @@ from codebase_rag.services.qdrant_storage.models import PointData
 
 
 def point(description='complete description'):
-    return PointData('demo.py','file','demo.py',description,'blob',[0.1,0.2],SparseVector(indices=[1],values=[1.0]))
+    return PointData('demo.py','file','demo.py',description,'blob',[0.1,0.2])
 
 
 class KnowledgeSyncReceiptTest(unittest.IsolatedAsyncioTestCase):

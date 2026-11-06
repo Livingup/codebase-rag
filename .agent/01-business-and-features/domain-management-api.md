@@ -57,11 +57,11 @@
 - **业务目标**：本地管理面 HTTP API。
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [路由全量清单]（错误体统一 `ErrorResponse{error:{code,message}}`）：`POST /projects`（201/400 INVALID_REQUEST）、`POST /projects/batch`（201）、`GET /projects`（每副本一条）、`GET /projects/{project_id}`（404 PROJECT_NOT_FOUND，多副本时取首个注册副本）、`DELETE /projects/{project_id}`（unregister_project，404）、`DELETE /repos`（unregister_repo，body UnregisterRepoRequest{git_repo_path}，404/400 INVALID_REQUEST）、`POST /projects/{project_id}/search`（404/503 SERVICE_UNAVAILABLE，搜索首个注册副本实例）、`POST /projects/{project_id}/rebuild`（RebuildRequest.force，作用于首个注册副本）、`POST /projects/{project_id}/sync`（首个注册副本）、`GET /projects/{project_id}/status`（首个注册副本）、`GET /health`（无鉴权）、`GET /status/clients`（仅本机，?live= 实探）、`POST /status/clients/{client_id}/probe`（仅本机，404 CLIENT_STATUS_ITEM_NOT_FOUND）、`POST /config/reload`（失败 500 RELOAD_ERROR）。
-  2. [REST 搜索]：embed 查询（空结果→503）→ hybrid_search(top_k) → 按 score_threshold（默认 0.0）过滤并统计 below_threshold；filters.entity_type / file_path_prefix 转 MemorySearchFilters；top_k 默认 10。
+  2. [REST 搜索]：embed 查询（空结果→503）→ dense_search(top_k) → 按 score_threshold（默认 0.0）过滤并统计 below_threshold；filters.entity_type / file_path_prefix 转 MemorySearchFilters；top_k 默认 10。
   3. [状态汇总规则]：有当前任务 → initializing；有活跃实例 → ready；否则 → registered。
   4. [配置重载]：POST /config/reload 调 ConfigManager.reload()（重读 config.yaml + .env、校验、执行各服务 reconciler、替换内存 AppConfig），返回 requires_restart / restart_reasons / reconciled_services。
   5. [本地访问控制]：/status/clients 系列与 Admin UI 均 require_local_request——client.host 不在 {127.0.0.1, ::1, ::ffff:127.0.0.1, localhost, testclient} 则 403（无密码本地后台）。
-- **级联依赖功能单元（Cascade Links）**：FEAT-MGMT-01/02/03、FEAT-EMB-02（搜索向量化）、FEAT-MQ-02（hybrid_search）、FEAT-COMMON-04（ConfigManager.reload）。
+- **级联依赖功能单元（Cascade Links）**：FEAT-MGMT-01/02/03、FEAT-EMB-02（搜索向量化）、FEAT-MQ-02（dense_search）、FEAT-COMMON-04（ConfigManager.reload）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无（Admin UI 见 FEAT-MGMT-05）
   - 技术架构抉择：`.agent/04-tech-decisions/tech-config-reconcile.md`

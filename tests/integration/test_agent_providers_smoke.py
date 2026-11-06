@@ -1,7 +1,7 @@
 """Smoke test for all agent provider/model configurations.
 
 For each agent's ``providers`` fallback queue — context_compression,
-context_engine, knowledge_producer, gray_area_classifier, reranker —
+context_engine, knowledge_producer, reranker —
 iterate every unique ``(provider, model)`` pair and issue a minimal LLM
 call to verify the provider is reachable and the model responds.
 

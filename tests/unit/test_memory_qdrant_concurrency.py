@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 from qdrant_client import models
 
-from codebase_rag.common.types import SparseVector
 from codebase_rag.config.schema import (
     HnswConfig,
     MemoryCacheConfig,
@@ -285,13 +284,7 @@ class MemoryQdrantConcurrencyTest(unittest.IsolatedAsyncioTestCase):
         requests = []
         for project_id in calls:
             for index in range(3):
-                if index == 0:
-                    query = self.service.dense_search(project_id, [1.0, 0.0])
-                else:
-                    query = self.service.hybrid_search(
-                        project_id, [1.0, 0.0],
-                        SparseVector(indices=[1], values=[1.0]),
-                    )
+                query = self.service.dense_search(project_id, [1.0, 0.0])
                 requests.append(asyncio.create_task(query))
 
         await asyncio.wait_for(

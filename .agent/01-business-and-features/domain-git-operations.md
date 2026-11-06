@@ -29,7 +29,7 @@
   1. [双层 `.gitignore` 规则链]：按顺序先评估全局 `exclude_patterns`，再评估目标仓库 `.git/codebase-rag/ignore` 中的自定义规则；完整支持 `#` 注释、目录后缀 `/`、`*`、`**`、`!pattern` 反选覆盖（后命中的规则覆盖先命中的规则）及反斜杠转义（如 `foo\ bar`、`\#literal`）；任一父目录被规则排除时，文件级 `!pattern` 不得单独重新包含其后代，必须先解除父目录排除。通配符与转义匹配统一委托 `pathspec.GitIgnoreSpec`（GitWildMatch 语义，依赖 `pathspec>=1.1`），禁止再自研 glob→正则 翻译器；`pathspec` 未实现的 Git 祖先目录规则（父目录仍排除时文件不可重新包含）由 `FileFilter._has_ignored_ancestor` 在 spec 之上补充，并以目录尾斜杠形式探测。
   2. [模态准入范围]：`classify_file_modality` 自动识别文件模态——仅允许非忽略的 UTF-8 文本文件（`text`）与 `gemini-embedding-2` 支持的 `.png`（`image/png`，校验 PNG 魔数 `\x89PNG\r\n\x1a\n`）、`.jpg` / `.jpeg`（`image/jpeg`，校验 JPEG 魔数 `\xff\xd8\xff`）图片文件（`image`，且单张图片 ≤ 20MB）；其余已知二进制扩展名或包含 NUL 字节的未知二进制文件统一归为 `unsupported_binary` 并拦截。
   3. [仓库级忽略规则管理]：`GitOperationsService` 提供 `get_ignore_file_path`、`get_ignore_content`、`get_ignore_rules`、`set_ignore_content`、`add_ignore_rules`、`remove_ignore_rules`、`is_file_ignored` 接口读写 `.git/codebase-rag/ignore`。
-  4. [性能与热更新]：预编译正则匹配，10k 文件过滤 < 10ms；`update_config` 支持配置热重载。
+  4. [规则编译与热更新]：全局规则在初始化与 `update_config` 时编译为 `GitIgnoreSpec`；仓库规则按调用读取并叠加到全局规则之后，`update_config` 支持配置热重载。
 - **级联依赖功能单元（Cascade Links）**：FEAT-MCPS-06（`manage_project_ignore` 工具调用方）、FEAT-MCPS-05（`add_file_knowledge` 忽略与模态校验）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无

@@ -13,7 +13,7 @@
 - **双命名空间**：持久层按 (project_id, file_version_id) 寻址与隔离（不变）；注册/实例/任务/事件全部改用 repo_key（`normalize_repo_key(path)` = normcase(realpath(abspath(normpath(path)))），结果本身是可用路径，git 操作直接复用）。
 - **实现落点**：`src/codebase_rag/common/paths.py`（唯一规范化实现，严禁各域自写路径归一）；management_api 注册表 `Dict[repo_key, ProjectRecord]`（ProjectRecord.project_id 降为分区指针）；memory_qdrant `_active: Dict[repo_key, cache_key]`、cache key = `repo_key:branch@commit`、`_CachedInstance.project_id` 仅为分区销毁元数据；workflow `_project_repos: Dict[repo_key, project_id]`、`WorkflowTask.repo_key`、队列键 `task.repo_key or task.project_id`；event_detection `_projects`/`_watchers`/`_dedup_timestamps` 键为 repo_key、hook payload 携带 repo_path、GitEvent/HookEvent 携带 git_repo_path。
 - **注册/注销语义**：同 repo_key 重复注册 = 刷新；同 project_id 新路径 = 新增副本（project_copy_registered）；`unregister_repo(path)` 单副本注销、`unregister_project(project_id)` 整分区注销——两者恒不删 Qdrant points（deleted_points=0）。
-- **MCP/管理调用链**：MCP 工具以客户端传入的仓库根路径解析 project_id（分区）+ repo_key（实例），search/hybrid_search 传 repo_key；管理面按 project_id 寻址的端点（search/rebuild/sync/status）取首个注册副本（确定性管理视图，多副本消歧走 MCP 路径层）。
+- **MCP/管理调用链**：MCP 工具以客户端传入的仓库根路径解析 project_id（分区）+ repo_key（实例），search/dense_search 传 repo_key；管理面按 project_id 寻址的端点（search/rebuild/sync/status）取首个注册副本（确定性管理视图，多副本消歧走 MCP 路径层）。
 - **管理面 REST 按 project_id 的端点语义**：多副本时为"首个注册副本"的确定性管理视图；面向用户的多副本操作走 MCP 工具（路径寻址）或 DELETE /repos（单副本注销）。
 
 ## 3. 核心不变量与禁止项（Invariants & Prohibitions）

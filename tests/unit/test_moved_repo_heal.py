@@ -51,10 +51,7 @@ class _ConfigManager:
 class _Embedding:
     async def embed(self, texts, is_query: bool):
         return [
-            SimpleNamespace(
-                dense_vector=[0.1, 0.2],
-                sparse_vector=SimpleNamespace(indices=[1], values=[1.0]),
-            )
+            SimpleNamespace(dense_vector=[0.1, 0.2])
             for _ in texts
         ]
 
@@ -245,16 +242,16 @@ class ReadProjectIdContractTest(unittest.TestCase):
 
 
 class _HealThenOkMemory:
-    """hybrid_search fails once with NoActiveInstanceError, then succeeds."""
+    """dense_search fails once with NoActiveInstanceError, then succeeds."""
 
     def __init__(self) -> None:
-        self.hybrid_search_calls = 0
+        self.dense_search_calls = 0
 
-    async def hybrid_search(
-        self, project_id: str, query_dense, query_sparse, top_k: int,
+    async def dense_search(
+        self, project_id: str, query_dense, top_k: int,
     ):
-        self.hybrid_search_calls += 1
-        if self.hybrid_search_calls == 1:
+        self.dense_search_calls += 1
+        if self.dense_search_calls == 1:
             raise NoActiveInstanceError("no active instance")
         return [
             SearchResult(
@@ -270,12 +267,12 @@ class _HealThenOkMemory:
 
 class _AlwaysFailingMemory:
     def __init__(self) -> None:
-        self.hybrid_search_calls = 0
+        self.dense_search_calls = 0
 
-    async def hybrid_search(
-        self, project_id: str, query_dense, query_sparse, top_k: int,
+    async def dense_search(
+        self, project_id: str, query_dense, top_k: int,
     ):
-        self.hybrid_search_calls += 1
+        self.dense_search_calls += 1
         raise NoActiveInstanceError("no active instance")
 
 
@@ -314,7 +311,7 @@ class McpHealIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
             results = await service.search(project_path, "find example", top_k=10)
 
-            self.assertEqual(memory.hybrid_search_calls, 2)
+            self.assertEqual(memory.dense_search_calls, 2)
             self.assertEqual(len(results), 1)
             # The background kick-off task may not have been scheduled yet
             # (no suspension point inside the mocked search path) — drain
@@ -335,7 +332,7 @@ class McpHealIntegrationTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProjectNotIndexedError) as ctx:
                 await service.search(project_path, "find example", top_k=10)
 
-            self.assertEqual(memory.hybrid_search_calls, 1)  # no retry
+            self.assertEqual(memory.dense_search_calls, 1)  # no retry
             self.assertIn("lazy rebuild failed", str(ctx.exception))
             tasks = list(service._heal_tasks)
             if tasks:
@@ -350,7 +347,7 @@ class McpHealIntegrationTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProjectNotIndexedError):
                 await service.search(project_path, "find example", top_k=10)
 
-            self.assertEqual(memory.hybrid_search_calls, 1)
+            self.assertEqual(memory.dense_search_calls, 1)
 
 
 if __name__ == "__main__":

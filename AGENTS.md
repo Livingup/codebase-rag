@@ -31,12 +31,12 @@
 | `FEAT-KS-02` | 外发箱持久化与失败重试 | 外发箱, outbox, ready, 重试, 原子写, tmp replace | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-02` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
 | `FEAT-KS-03` | 幂等快路径与最新版本管理 | 幂等, 跳过, 存在性, stale, 最新版本 | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
 | `FEAT-KS-04` | 内存镜像刷新与迁移 | 内存刷新, best-effort, rebrand, 镜像 | `.agent/01-business-and-features/domain-knowledge-sync.md#FEAT-KS-04` | 无 |
-| `FEAT-QS-01` | 连接生命周期与自愈 | 连接, 自愈, PoolTimeout, 客户端重建, 探活 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-01` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
+| `FEAT-QS-01` | 连接生命周期与自愈 | 连接, 自愈, PoolTimeout, 客户端重建, 探活 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-01` | `.agent/04-tech-decisions/tech-config-reconcile.md`、`.agent/04-tech-decisions/tech-dense-only-storage.md` |
 | `FEAT-QS-02` | 确定性点写入 | upsert, 确认, uuid5, knowledge_set_id, point ID | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-02` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
 | `FEAT-QS-03` | 完整知识集读取 | scroll, 完整知识集, chunk, 字典序最小, 读取 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
-| `FEAT-QS-04` | 存在性检查与迁移 | check_existence, 内容寻址, 去重, rebrand, set_payload, rewrite_dense_vectors, 向量迁移 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-04` | 无 |
+| `FEAT-QS-04` | 存在性检查与迁移 | check_existence, 内容寻址, 去重, rebrand, set_payload, 向量迁移 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-04` | 无 |
 | `FEAT-MQ-01` | 实例创建与 LRU 缓存 | 实例创建, LRU, staging, 缓存命中, 容量, repo_key, 副本实例 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-01` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
-| `FEAT-MQ-02` | 稠密向量检索 | 稠密检索, dense_search, hybrid_search, Cosine, top_k | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-02` | 无 |
+| `FEAT-MQ-02` | 稠密向量检索 | 稠密检索, dense_search, Cosine, top_k | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-02` | `.agent/04-tech-decisions/tech-dense-only-storage.md` |
 | `FEAT-MQ-03` | 活跃实例管理与 staging 晋升 | 活跃实例, 提升, staging, active, 转正 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-03` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
 | `FEAT-MQ-04` | LRU 淘汰与空闲清扫 | 淘汰, 空闲清扫, 超容量, idle_timeout | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-04` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
 | `FEAT-MQ-05` | 懒加载单飞重建 | 懒加载, 单飞, shield, NoActiveInstance, 共享重建 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-05` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
@@ -142,7 +142,7 @@ ${CODEBASE_RAG_DATA_DIR}/
    - 测试代码：`tests/`；
    - 设计文档与规范文档：`docs/`、`.agent/`、`*.md`（含 `AGENTS.md`、`README.md` 等，避免将高频变更的规范与设计文档当做代码知识库索引）。
 3. **知识描述质量与容量约定**：
-   - 新版 codebase-rag 单条知识点支持上限由 2048 tokens 提升至 8192 tokens（图片固定占用 258 tokens）；
+   - codebase-rag 单条知识点支持上限为 8192 tokens（图片固定占用 258 tokens）；
    - 对纳入跟踪的每个文件，应尽量详尽描述其在系统架构中的技术坐标、业务核心职责、上下游调用关系以及关键业务逻辑细节，提供高信噪比的自包含语义快照。
 
 ## 2. Windows 运维脚本目录

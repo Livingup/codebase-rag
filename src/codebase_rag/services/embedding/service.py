@@ -255,10 +255,7 @@ class EmbeddingService:
             dense_dim=len(dense_vectors[0]) if dense_vectors else 0,
         )
 
-        return [
-            EmbeddingResult(dense_vector=d, sparse_vector=None)
-            for d in dense_vectors
-        ]
+        return [EmbeddingResult(dense_vector=d) for d in dense_vectors]
 
     async def count_tokens(self, text: str) -> int:
         """Count tokens using the dense provider's tokenizer.

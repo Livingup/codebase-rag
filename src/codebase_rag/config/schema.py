@@ -169,9 +169,6 @@ class MemoryInstanceConfig(BaseModel):
 class SearchConfig(BaseModel):
     default_top_k: int = 10
     max_top_k: int = 50
-    dense_weight: float = 1.0
-    rrf_k: int = 60
-    prefetch_limit: int = 50
 
 
 class MemoryQdrantConfig(BaseModel):
@@ -480,7 +477,7 @@ class MCPRerankerProviderEntry(BaseModel):
 class MCPRerankerConfig(BaseModel):
     """Reranker business config (RAG search logic, sibling of servers)."""
     providers: List[MCPRerankerProviderEntry] = Field(default_factory=list)
-    recall_limit: int = 400             # max candidates from hybrid search (Stage 1)
+    recall_limit: int = 400             # max candidates from dense search (Stage 1)
     timeout: int = 60                   # reranker timeout in seconds (default 60s)
     max_rate_limit_retries: int = -1    # per-key 429 retry cap; -1 = unlimited
 

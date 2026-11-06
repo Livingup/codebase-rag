@@ -2,7 +2,7 @@
 
 ## 一、业务域职责边界与域内铁律
 
-- 负责：内存 Qdrant 实例生命周期与缓存状态的统一管理（创建/提升/淘汰/销毁/懒重建）、活跃实例映射、混合检索。
+- 负责：内存 Qdrant 实例生命周期与缓存状态的统一管理（创建/提升/淘汰/销毁/懒重建）、活跃实例映射、稠密向量检索。
 - 不负责：实例创建、数据加载、提升、清理这一整条工作流的编排（→ workflow）；持久化读写（→ qdrant_storage）。
 - 域内铁律：本服务独占内存实例生命周期与缓存状态；等待共享懒加载任务时不得持有实例缓存锁（重建回调自身会操作实例缓存）；实例身份键是本地仓库副本 repo_key（`normalize_repo_key` 规范化路径，见 FEAT-COMMON-05）而非 project_id——同一 project_id 的多个本地副本各持独立实例，严禁共用或互相顶替。
 
@@ -15,7 +15,7 @@
   2. [缓存命中]：非 staging 创建命中缓存 → touch + move_to_end 后直接返回既有实例。
   3. [staging 键规则]：staging 实例 key = `{base_key}#staging:{uuid4}`，永不复用；创建后加入 `_loading` 保护集合。
   4. [容量保护]：缓存满时先淘汰（FEAT-MQ-04）；staging 创建传 `protected_repo_key` 防止淘汰同副本当前活跃实例，且 `allow_over_capacity=True` 允许超容量（无安全淘汰对象时沿用允许超容量策略，不新增硬上限；提升后不主动缩容）。
-  5. [向量配置]：按配置建 `dense` 单一稠密向量（3072 维 Cosine，含 HNSW `m`/`ef_construct`，未启用则 `None`）。
+  5. [向量配置]：按配置建 `dense_vectors` 单一稠密向量（3072 维 Cosine，含 HNSW `m`/`ef_construct`，未启用则 `None`）。
 - **级联依赖功能单元（Cascade Links）**：FEAT-WF-02（staging 创建方）、FEAT-COMMON-06（repo_key 规范化）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
@@ -27,15 +27,15 @@
 ### [FEAT-MQ-02] 稠密向量检索
 - **业务目标**：副本活跃实例上执行 3072 维 Cosine 稠密向量相似度召回，并透传 `file_type`。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [实例获取]：`hybrid_search(repo_key, ...)` / `dense_search(repo_key, ...)` 取该副本的活跃实例（`hybrid_search` 直接委托 `dense_search`）；无活跃实例 → 触发懒重建（FEAT-MQ-05）。
+  1. [实例获取]：`dense_search(repo_key, query_dense, top_k=None, filters=None)` 取该副本的活跃实例；无活跃实例 → 触发懒重建（FEAT-MQ-05）。
   2. [top_k 钳制]：`k = min(top_k or default_top_k, max_top_k)`。
-  3. [向量召回]：对 `dense` 命名向量执行 `query_points(limit=k, with_payload=True)`，构造 `SearchResult`（含 `file_type=payload.get("file_type", "text")`）；**不做分数阈值过滤**；`touch_search()` 更新检索活跃时间。
+  3. [向量召回]：对 `dense_vectors` 命名向量执行 `query_points(limit=k, with_payload=True)`，构造 `SearchResult`（含 `file_type=payload.get("file_type", "text")`）；**不做分数阈值过滤**；`touch_search()` 更新检索活跃时间。
 - **级联依赖功能单元（Cascade Links）**：FEAT-MCPS-02（检索消费方）、FEAT-MGMT-04（REST 搜索消费方）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
-  - 技术架构抉择：`.agent/04-tech-decisions/tech-repo-copy-identity.md`
+  - 技术架构抉择：`.agent/04-tech-decisions/tech-repo-copy-identity.md`、`.agent/04-tech-decisions/tech-dense-only-storage.md`
 - **【本功能全栈源码文件清单（Source File Manifest）】**：
-  - 域服务门面（services/memory_qdrant/service.py）：`src/codebase_rag/services/memory_qdrant/service.py`（dense_search / hybrid_search 段）
+  - 域服务门面（services/memory_qdrant/service.py）：`src/codebase_rag/services/memory_qdrant/service.py`（dense_search 段）
 
 ### [FEAT-MQ-03] 活跃实例管理与 staging 晋升
 - **业务目标**：维护 repo_key→活跃实例映射，完成 staging 实例原地转正。
@@ -105,7 +105,4 @@
 | 缓存容量上限 | 5 | `memory_qdrant.cache.max_branches` |
 | 默认检索 top_k | 10 | `memory_qdrant.search.default_top_k` |
 | 检索 top_k 上限 | 50 | `memory_qdrant.search.max_top_k` |
-| 双路 prefetch 上限 | 50 | `memory_qdrant.search.prefetch_limit` |
-| dense / sparse 权重 | 0.7 / 0.3 | `memory_qdrant.search.dense_weight / sparse_weight` |
-| RRF k 常数 | 60 | `memory_qdrant.search.rrf_k` |
 | 空闲超时 | 30 分钟（0=永不） | `memory_qdrant.cache.idle_timeout_minutes` |

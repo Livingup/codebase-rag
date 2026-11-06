@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock, Mock
 from qdrant_client import models
 
 from codebase_rag.common.paths import normalize_repo_key
-from codebase_rag.common.types import SparseVector
 from codebase_rag.config.schema import (
     HnswConfig,
     MemoryCacheConfig,
@@ -117,12 +116,8 @@ class MultiCopyMemoryIsolationTest(unittest.IsolatedAsyncioTestCase):
             for inst in self.service._cache.values():
                 self.assertEqual(inst.project_id, _PROJECT_ID)
 
-            results_a = await self.service.hybrid_search(
-                copy_a, [1.0, 0.0], SparseVector(indices=[1], values=[1.0]),
-            )
-            results_b = await self.service.hybrid_search(
-                copy_b, [1.0, 0.0], SparseVector(indices=[1], values=[1.0]),
-            )
+            results_a = await self.service.dense_search(copy_a, [1.0, 0.0])
+            results_b = await self.service.dense_search(copy_b, [1.0, 0.0])
 
             # Searches never cross-contaminate between copies.
             self.assertEqual([r.file_path for r in results_a], ["a/example.py"])
@@ -144,9 +139,7 @@ class MultiCopyMemoryIsolationTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(removed, 1)
             self.assertNotIn(copy_a, self.service._active)
-            results_b = await self.service.hybrid_search(
-                copy_b, [1.0, 0.0], SparseVector(indices=[1], values=[1.0]),
-            )
+            results_b = await self.service.dense_search(copy_b, [1.0, 0.0])
             self.assertEqual(len(results_b), 1)
 
 

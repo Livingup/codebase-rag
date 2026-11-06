@@ -16,7 +16,7 @@ hand-written glob translator:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple
 
 from pathspec import GitIgnoreSpec
@@ -59,7 +59,6 @@ class FilterResult:
 
     included: List[str]
     excluded: List[str]
-    uncertain: List[str] = field(default_factory=list)
 
 
 def compile_gitignore_lines(lines: Iterable[str]) -> GitIgnoreSpec:
@@ -231,11 +230,7 @@ class FileFilter:
             else:
                 included.append(normalized)
 
-        return FilterResult(
-            included=included,
-            excluded=excluded,
-            uncertain=[],
-        )
+        return FilterResult(included=included, excluded=excluded)
 
     def update_config(self, config: FileFilterConfig) -> None:
         """Re-compile filter rules from updated config (hot reload)."""

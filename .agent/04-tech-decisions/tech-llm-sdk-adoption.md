@@ -3,12 +3,11 @@
 ## 1. 启用依据与背景坑点
 
 - Agent 域原有 6 个 provider（openai_chat / openai_responses / anthropic / gemini / deepseek / zhipu）各自直接调用 `openai` / `anthropic` / `google-genai` 官方 SDK，Embedding 域原有 2 个 provider（gemini / dashscope）直接用 `httpx` 手写 JSON 请求与响应解析。
-- 由此产生 4 类重复实现与漂移风险：
+- 由此产生 3 类重复实现与漂移风险：
   1. 错误分类各自实现（鉴权、429、超时、协议错误的判定在 Agent 与 Embedding 两套代码里不一致）。
   2. SSE 流式解析、tool_call 增量拼装、usage 归集在每个 provider 各写一遍。
-  3. DashScope `text-embedding-v4` 的 `output_type=sparse` 端点无第三方 SDK 覆盖，只能手写。
-  4. 依赖体积大且版本相互牵制（openai + anthropic + google-genai 三套 SDK 同时存在）。
-- 结论：统一改为委托自研 `llm-sdk`（PyPI 包名 `multi-protocol-llm-client`，import 名 `pythonsdk`，零第三方依赖），并由 llm-sdk 补齐 DashScope sparse 客户端能力。
+  3. 依赖体积大且版本相互牵制（openai + anthropic + google-genai 三套 SDK 同时存在）。
+- 结论：统一委托自研 `llm-sdk`（PyPI 包名 `multi-protocol-llm-client`，import 名 `pythonsdk`，零第三方依赖）；Embedding 仅保留 Gemini 纯稠密向量协议。
 
 ## 2. 选定的技术方案与强制契约
 

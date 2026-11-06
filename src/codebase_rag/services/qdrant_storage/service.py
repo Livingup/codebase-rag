@@ -804,10 +804,10 @@ class QdrantStorageService:
         coll_cfg = self._config.collection
         collection_name = coll_cfg.name
 
-        collections = await self._client.get_collections()
-        existing_names = {c.name for c in collections.collections}
-
-        if collection_name in existing_names:
+        # collection_exists() resolves aliases; listing collections only returns
+        # physical collections, so an aliased name would be treated as missing and
+        # create_collection() would be rejected with "Alias with the same name".
+        if await self._client.collection_exists(collection_name):
             # Validate schema
             info = await self._client.get_collection(collection_name)
             await self._validate_collection_schema(info)
@@ -815,14 +815,11 @@ class QdrantStorageService:
             # Log schema details for debugging
             vectors = info.config.params.vectors
             dense_names = list(vectors.keys()) if isinstance(vectors, dict) else ["<single>"]
-            sparse_cfg = info.config.params.sparse_vectors
-            sparse_names = list(sparse_cfg.keys()) if sparse_cfg else []
             logger.info(
                 "collection_exists_validated",
                 collection=collection_name,
                 points_count=info.points_count,
                 dense_vectors=dense_names,
-                sparse_vectors=sparse_names,
             )
         else:
             # Create collection
@@ -899,14 +896,26 @@ class QdrantStorageService:
         coll_cfg = self._config.collection
         dense_name = coll_cfg.dense_vector.name
 
-        # Check dense vector dimension
-        vectors_config = info.config.params.vectors
-        if isinstance(vectors_config, dict) and dense_name in vectors_config:
-            actual_size = vectors_config[dense_name].size
-            expected_size = coll_cfg.dense_vector.size
-            if actual_size != expected_size:
-                raise QdrantSchemaError(
-                    f"Dense vector dimension mismatch: "
-                    f"collection has {actual_size}, config expects {expected_size}. "
-                    f"This must match the Embedding service's dense dimension."
-                )
+        params = info.config.params
+        if params.sparse_vectors:
+            sparse_names = ", ".join(sorted(params.sparse_vectors))
+            raise QdrantSchemaError(
+                f"Collection '{coll_cfg.name}' contains unsupported sparse vector "
+                f"configuration: {sparse_names}. Migrate it to a dense-only collection."
+            )
+
+        vectors_config = params.vectors
+        if not isinstance(vectors_config, dict) or set(vectors_config) != {dense_name}:
+            raise QdrantSchemaError(
+                f"Collection '{coll_cfg.name}' must define exactly one dense vector "
+                f"named '{dense_name}'."
+            )
+
+        actual_size = vectors_config[dense_name].size
+        expected_size = coll_cfg.dense_vector.size
+        if actual_size != expected_size:
+            raise QdrantSchemaError(
+                f"Dense vector dimension mismatch: "
+                f"collection has {actual_size}, config expects {expected_size}. "
+                f"This must match the Embedding service's dense dimension."
+            )
