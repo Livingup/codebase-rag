@@ -135,12 +135,13 @@ ${CODEBASE_RAG_DATA_DIR}/
 1. **纳入跟踪**：
    - 源码文本文件：`src/**`；
    - 系统配置文件：`config.example.yaml`、`.env.example`、`pyproject.toml`；
+   - 本文件 `AGENTS.md`：以仓库级忽略规则末尾的否定规则 `!/AGENTS.md` 显式放行，使工程约束路由表可被语义检索命中；
    - UI 设计切图文件（如有 `assets/**` 等）。
 2. **严格排除（不维护知识点）**：
    - 构建产物与二进制：`dist/`、`build/`、`wheels/`、`*.whl`、`*.zip`、`*.egg-info/`、`__pycache__/`、`*.pyc`；
    - 本地数据与虚拟环境：`.venv/`、`.venv-build/`、`.venv*/`、`data/`、`logs/`、`runtime/`；
    - 测试代码：`tests/`；
-   - 设计文档与规范文档：`docs/`、`.agent/`、`*.md`（含 `AGENTS.md`、`README.md` 等，避免将高频变更的规范与设计文档当做代码知识库索引）。
+   - 设计文档与规范文档：`docs/`、`.agent/`、`*.md`（`AGENTS.md` 除外，它已显式放行；其余 Markdown 如 `README.md`、设计稿不纳入，避免将高频变更的文档当作代码知识库索引）。
 3. **知识描述质量与容量约定**：
    - codebase-rag 单条知识点支持上限为 8192 tokens（图片固定占用 258 tokens）；
    - 对纳入跟踪的每个文件，应尽量详尽描述其在系统架构中的技术坐标、业务核心职责、上下游调用关系以及关键业务逻辑细节，提供高信噪比的自包含语义快照。
