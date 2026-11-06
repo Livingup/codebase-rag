@@ -128,6 +128,23 @@ ${CODEBASE_RAG_DATA_DIR}/
 
 `${CODEBASE_RAG_PROGRAM_DIR}` 可以随版本替换；`${CODEBASE_RAG_DATA_DIR}` 是用户配置、数据、日志和备份目录，更新时不得覆盖。两者均由 `.env` 中的同名变量指定，用户可自定义路径。
 
+
+### 1.3 项目 Git 文件知识点跟踪约束（.git/codebase-rag/ignore）
+
+当前仓库在 codebase-rag 中的知识点跟踪范围严格约束如下：
+1. **纳入跟踪**：
+   - 源码文本文件：`src/**`；
+   - 系统配置文件：`config.example.yaml`、`.env.example`、`pyproject.toml`；
+   - UI 设计切图文件（如有 `assets/**` 等）。
+2. **严格排除（不维护知识点）**：
+   - 构建产物与二进制：`dist/`、`build/`、`wheels/`、`*.whl`、`*.zip`、`*.egg-info/`、`__pycache__/`、`*.pyc`；
+   - 本地数据与虚拟环境：`.venv/`、`.venv-build/`、`.venv*/`、`data/`、`logs/`、`runtime/`；
+   - 测试代码：`tests/`；
+   - 设计文档与规范文档：`docs/`、`.agent/`、`*.md`（含 `AGENTS.md`、`README.md` 等，避免将高频变更的规范与设计文档当做代码知识库索引）。
+3. **知识描述质量与容量约定**：
+   - 新版 codebase-rag 单条知识点支持上限由 2048 tokens 提升至 8192 tokens（图片固定占用 258 tokens）；
+   - 对纳入跟踪的每个文件，应尽量详尽描述其在系统架构中的技术坐标、业务核心职责、上下游调用关系以及关键业务逻辑细节，提供高信噪比的自包含语义快照。
+
 ## 2. Windows 运维脚本目录
 
 所有 Windows 运维脚本位于：
