@@ -1,22 +1,27 @@
 """Gitignore-compatible file filter and modality classifier.
 
-Replaces the legacy three-layer (blacklist/whitelist/L3 LLM gray-area) filter with:
+Matching is delegated to the mature ``pathspec`` library (GitWildMatch
+semantics, the same engine used by black and other tools) instead of a
+hand-written glob translator:
 1. Global default ignore patterns (``FileFilterConfig.exclude_patterns``)
-2. Per-repository ``.git/codebase-rag/ignore`` rules (full ``.gitignore`` syntax,
-   including comments ``#``, directory rules ``dir/``, ``*``, ``**``, and
-   negation ``!pattern``)
-3. Automatic modality guard: only non-ignored text files and ``gemini-embedding-2``
+2. Per-repository ``.git/codebase-rag/ignore`` rules (full ``.gitignore``
+   syntax: comments ``#``, directory rules ``dir/``, ``*``, ``**``, character
+   classes, backslash escapes and negation ``!pattern``)
+3. Git's ancestor rule: a file cannot be re-included while any parent
+   directory is still excluded (``pathspec`` does not implement this, so it is
+   applied on top of the spec)
+4. Automatic modality guard: only non-ignored text files and ``gemini-embedding-2``
    supported image files (``.png``, ``.jpg``, ``.jpeg``) are tracked.
 """
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple
 
-from codebase_rag.common.types import MAX_IMAGE_BYTES, FileType
+from pathspec import GitIgnoreSpec
+
+from codebase_rag.common.types import MAX_IMAGE_BYTES
 
 if TYPE_CHECKING:
     from codebase_rag.config.schema import FileFilterConfig
@@ -57,150 +62,17 @@ class FilterResult:
     uncertain: List[str] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class _CompiledIgnoreRule:
-    """Single compiled gitignore rule."""
+def compile_gitignore_lines(lines: Iterable[str]) -> GitIgnoreSpec:
+    """Compile ``.gitignore``-format lines into a ``pathspec`` GitIgnoreSpec.
 
-    raw: str
-    negated: bool
-    dir_only: bool
-    regex: re.Pattern
-
-
-def _translate_gitignore_glob(pattern: str, anchored: bool, dir_only: bool) -> re.Pattern:
-    """Translate a gitignore pattern into a compiled regular expression."""
-    # Convert legacy patterns like `foo/**` into directory prefix match
-    if pattern.endswith("/**"):
-        base = pattern[:-3].lstrip("/")
-        if base.startswith("**/"):
-            base = base[3:]
-            prefix = r"(?:^|.*/)"
-        elif anchored or "/" in base:
-            prefix = r"^"
-        else:
-            prefix = r"(?:^|.*/)"
-        body = _glob_body_to_regex(base)
-        return re.compile(f"{prefix}{body}(?:/.*)?$")
-
-    if pattern.startswith("**/"):
-        pattern = pattern[3:]
-        anchored = False
-
-    if anchored:
-        prefix = r"^"
-    else:
-        prefix = r"(?:^|.*/)"
-
-    body = _glob_body_to_regex(pattern)
-    if dir_only:
-        # Matches any file inside the matched directory
-        return re.compile(f"{prefix}{body}/.*$")
-    # Matches either the file itself or anything inside a directory of that name
-    return re.compile(f"{prefix}{body}(?:$|/.*$)")
-
-
-def _glob_body_to_regex(pat: str) -> str:
-    """Convert glob tokens (``, ``*``, ``?``, ``[...]``) to regex."""
-    i = 0
-    n = len(pat)
-    out: List[str] = []
-    while i < n:
-        c = pat[i]
-        if c == "\\":
-            if i + 1 < n:
-                out.append(re.escape(pat[i + 1]))
-                i += 2
-            else:
-                out.append(r"\\")
-                i += 1
-        elif c == "*":
-            if i + 1 < n and pat[i + 1] == "*":
-                if i + 2 < n and pat[i + 2] == "/":
-                    out.append(r"(?:.*/)?")
-                    i += 3
-                else:
-                    out.append(r".*")
-                    i += 2
-            else:
-                out.append(r"[^/]*")
-                i += 1
-        elif c == "?":
-            out.append(r"[^/]")
-            i += 1
-        elif c == "[":
-            j = i + 1
-            if j < n and pat[j] in ("!", "^"):
-                j += 1
-            if j < n and pat[j] == "]":
-                j += 1
-            while j < n and pat[j] != "]":
-                j += 1
-            if j < n:
-                stuff = pat[i + 1 : j].replace("\\", "\\\\")
-                if stuff.startswith("!"):
-                    stuff = "^" + stuff[1:]
-                out.append(f"[{stuff}]")
-                i = j + 1
-            else:
-                out.append(r"\[")
-                i += 1
-        else:
-            out.append(re.escape(c))
-            i += 1
-    return "".join(out)
-
-
-def compile_gitignore_lines(lines: Iterable[str]) -> List[_CompiledIgnoreRule]:
-    """Compile an iterable of .gitignore lines into ordered rules."""
-    compiled: List[_CompiledIgnoreRule] = []
-    for raw_line in lines:
-        line = raw_line.rstrip("\r\n")
-        # Strip unescaped trailing spaces
-        while line.endswith(" ") and not line.endswith(r"\ "):
-            line = line[:-1]
-        if not line:
-            continue
-        if line.startswith("#"):
-            continue
-        if line.startswith(r"\#") or line.startswith(r"\!"):
-            pattern = line[1:]
-            negated = False
-        elif line.startswith("!"):
-            negated = True
-            pattern = line[1:]
-        else:
-            negated = False
-            pattern = line
-
-        pattern = pattern.replace("\\", "/").strip()
-        if not pattern:
-            continue
-
-        dir_only = pattern.endswith("/")
-        if dir_only:
-            pattern = pattern.rstrip("/")
-        if not pattern:
-            continue
-
-        anchored = pattern.startswith("/")
-        if anchored:
-            pattern = pattern.lstrip("/")
-
-        # In gitignore, if there is a slash anywhere in the middle of the pattern,
-        # the pattern is relative to the root directory (anchored).
-        if "/" in pattern and not pattern.startswith("**/"):
-            anchored = True
-
-        regex = _translate_gitignore_glob(pattern, anchored=anchored, dir_only=dir_only)
-        compiled.append(
-            _CompiledIgnoreRule(
-                raw=raw_line.strip(),
-                negated=negated,
-                dir_only=dir_only,
-                regex=regex,
-            )
-        )
-    return compiled
+    ``GitIgnoreSpec`` implements Git's own ordering rule (the last matching
+    pattern wins), so appending repository rules after global patterns preserves
+    the override order without re-implementing glob translation.
+    """
+    return GitIgnoreSpec.from_lines(
+        "gitignore",
+        [line.rstrip("\r\n") for line in lines],
+    )
 
 
 def is_unsupported_binary_extension(path: str) -> bool:
@@ -260,12 +132,13 @@ def classify_file_modality(
 
 
 class FileFilter:
-    """Compiled gitignore-style file filter.
+    """Gitignore-compatible file filter backed by ``pathspec``.
 
-    Evaluates global ``exclude_patterns`` followed by optional per-repository
-    ``.git/codebase-rag/ignore`` rules in order (last matching rule wins, so
-    ``!pattern`` in a project's ignore file can override earlier exclusions).
-    Also excludes known unsupported binary extensions.
+    Evaluates global ``exclude_patterns`` first, then optional per-repository
+    ``.git/codebase-rag/ignore`` rules (last matching rule wins, so ``!pattern``
+    in a project's ignore file can override earlier exclusions). A file whose
+    ancestor directory stays excluded is always ignored, matching Git. Also
+    rejects known unsupported binary extensions.
     """
 
     def __init__(
@@ -281,49 +154,55 @@ class FileFilter:
             if exclude_patterns is not None
             else (list(config.exclude_patterns) if config is not None else [])
         )
-        self._global_rules: List[_CompiledIgnoreRule] = compile_gitignore_lines(
-            base_patterns
+        lines = list(base_patterns)
+        if extra_ignore_lines is not None:
+            lines.extend(extra_ignore_lines)
+        self._base_spec = compile_gitignore_lines(lines)
+
+    def _resolve_spec(self, repo_rules: Optional[GitIgnoreSpec]) -> GitIgnoreSpec:
+        """Return the spec with repository rules appended in override order."""
+        if repo_rules is None or not repo_rules.patterns:
+            return self._base_spec
+        return GitIgnoreSpec([*self._base_spec.patterns, *repo_rules.patterns])
+
+    @staticmethod
+    def _has_ignored_ancestor(spec: GitIgnoreSpec, normalized: str) -> bool:
+        """Return True when any parent directory is still excluded by ``spec``.
+
+        Git cannot re-include a file whose parent directory is excluded, and
+        ``dir/`` patterns only match a trailing-slash form, so each ancestor is
+        probed as a directory path.
+        """
+        parts = normalized.split("/")
+        return any(
+            spec.match_file("/".join(parts[:index]) + "/")
+            for index in range(1, len(parts))
         )
-        self._extra_rules: List[_CompiledIgnoreRule] = (
-            compile_gitignore_lines(extra_ignore_lines)
-            if extra_ignore_lines is not None
-            else []
-        )
+
+    @classmethod
+    def _excluded_by_spec(cls, spec: GitIgnoreSpec, normalized: str) -> bool:
+        """Return True when rules (including the ancestor rule) exclude the path."""
+        if cls._has_ignored_ancestor(spec, normalized):
+            return True
+        return spec.match_file(normalized)
 
     def is_ignored(
         self,
         file_path: str,
-        repo_rules: Optional[Sequence[_CompiledIgnoreRule]] = None,
+        repo_rules: Optional[GitIgnoreSpec] = None,
     ) -> bool:
         """Return True if ``file_path`` should be excluded."""
         normalized = file_path.replace("\\", "/").lstrip("/")
         if not normalized:
             return True
 
-        ignored = False
-        for rule in self._global_rules:
-            if rule.regex.search(normalized):
-                ignored = not rule.negated
-
-        for rule in self._extra_rules:
-            if rule.regex.search(normalized):
-                ignored = not rule.negated
-
-        if repo_rules:
-            for rule in repo_rules:
-                if rule.regex.search(normalized):
-                    ignored = not rule.negated
-
-        if ignored:
+        if self._excluded_by_spec(self._resolve_spec(repo_rules), normalized):
             return True
 
-        # Reject known unsupported binary extensions unless explicitly un-ignored?
-        # Even if not in ignore file, unsupported binaries (.exe, .dll, .pdf, .gif, etc.)
-        # cannot be embedded as text or png/jpeg.
-        if is_unsupported_binary_extension(normalized):
-            return True
-
-        return False
+        # Unsupported binaries (.exe, .dll, .pdf, .gif, ...) can be embedded
+        # neither as text nor as png/jpeg, so they are rejected regardless of
+        # ignore rules.
+        return is_unsupported_binary_extension(normalized)
 
     def filter(
         self,
@@ -331,17 +210,23 @@ class FileFilter:
         repo_ignore_lines: Optional[Iterable[str]] = None,
     ) -> FilterResult:
         """Apply global + per-repo gitignore filtering to a list of file paths."""
-        included: List[str] = []
-        excluded: List[str] = []
         repo_rules = (
             compile_gitignore_lines(repo_ignore_lines)
             if repo_ignore_lines is not None
             else None
         )
+        spec = self._resolve_spec(repo_rules)
 
+        included: List[str] = []
+        excluded: List[str] = []
         for path in file_paths:
             normalized = path.replace("\\", "/")
-            if self.is_ignored(normalized, repo_rules=repo_rules):
+            stripped = normalized.lstrip("/")
+            if (
+                not stripped
+                or self._excluded_by_spec(spec, stripped)
+                or is_unsupported_binary_extension(stripped)
+            ):
                 excluded.append(normalized)
             else:
                 included.append(normalized)
@@ -355,4 +240,3 @@ class FileFilter:
     def update_config(self, config: FileFilterConfig) -> None:
         """Re-compile filter rules from updated config (hot reload)."""
         self.__init__(config)
-

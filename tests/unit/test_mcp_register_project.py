@@ -21,11 +21,17 @@ class _ManagementApi:
         self.error = error
         self.calls: list[dict] = []
 
-    async def register_project(self, git_repo_path: str, display_name: str = "") -> ProjectResponse:
+    async def register_project(
+        self,
+        git_repo_path: str,
+        display_name: str = "",
+        exclude_patterns: list[str] | None = None,
+    ) -> ProjectResponse:
         self.calls.append(
             {
                 "git_repo_path": git_repo_path,
                 "display_name": display_name,
+                "exclude_patterns": exclude_patterns,
             }
         )
         if self.error is not None:
@@ -54,8 +60,9 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("仅当用户明确要求", tool.description)
         self.assertIn("禁止未经用户同意私自调用", tool.description)
         self.assertIn("禁止因为“后续搜索更方便”", tool.description)
-        self.assertEqual(tool.inputSchema["required"], ["git_repo_path"])
+        self.assertEqual(tool.inputSchema["required"], ["git_repo_path", "exclude_patterns"])
         self.assertIn("git_repo_path", tool.inputSchema["properties"])
+        self.assertIn("exclude_patterns", tool.inputSchema["properties"])
         self.assertIn("display_name", tool.inputSchema["properties"])
 
     async def test_success_path_returns_key_fields_and_async_init_note(self) -> None:
@@ -64,6 +71,7 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
             {
                 "git_repo_path": "G:/project/demo",
                 "display_name": "demo",
+                "exclude_patterns": ["tests/**", "dist/**"],
             },
             api,  # type: ignore[arg-type]
         )
@@ -71,10 +79,12 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(api.calls[0]["git_repo_path"], "G:/project/demo")
         self.assertEqual(api.calls[0]["display_name"], "demo")
+        self.assertEqual(api.calls[0]["exclude_patterns"], ["tests/**", "dist/**"])
         self.assertEqual(
             text,
             "项目已登记，初始化已安排。\n名称：demo\n仓库：G:/project/demo\n"
             "project_id：proj-123\n登记时 HEAD：main @ abcdef12\n"
+            "排除规则：（已配置 2 条排除规则）\n"
             "登记完成不代表检索已就绪。",
         )
         self.assertNotIn("knowledge_points", text)
@@ -83,15 +93,38 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_git_repo_path_raises_value_error(self) -> None:
         api = _ManagementApi(response=_sample_project())
         with self.assertRaises(ValueError) as ctx:
-            await handle_register_project({}, api)  # type: ignore[arg-type]
+            await handle_register_project({"exclude_patterns": []}, api)  # type: ignore[arg-type]
         self.assertIn("git_repo_path", str(ctx.exception))
+        self.assertEqual(api.calls, [])
+
+    async def test_missing_exclude_patterns_raises_value_error(self) -> None:
+        api = _ManagementApi(response=_sample_project())
+        with self.assertRaises(ValueError) as ctx:
+            await handle_register_project(
+                {"git_repo_path": "G:/project/demo"},
+                api,  # type: ignore[arg-type]
+            )
+        self.assertIn("exclude_patterns", str(ctx.exception))
+        self.assertEqual(api.calls, [])
+
+    async def test_invalid_exclude_patterns_item_raises_value_error(self) -> None:
+        api = _ManagementApi(response=_sample_project())
+        with self.assertRaises(ValueError) as ctx:
+            await handle_register_project(
+                {
+                    "git_repo_path": "G:/project/demo",
+                    "exclude_patterns": ["valid/**", 123],
+                },
+                api,  # type: ignore[arg-type]
+            )
+        self.assertIn("exclude_patterns[1] must be a string", str(ctx.exception))
         self.assertEqual(api.calls, [])
 
     async def test_management_api_error_is_mapped_to_value_error(self) -> None:
         api = _ManagementApi(error=ManagementApiError("Invalid Git repository: missing .git"))
         with self.assertRaises(ValueError) as ctx:
             await handle_register_project(
-                {"git_repo_path": "G:/not-a-repo"},
+                {"git_repo_path": "G:/not-a-repo", "exclude_patterns": []},
                 api,  # type: ignore[arg-type]
             )
         self.assertIn("Invalid Git repository", str(ctx.exception))
@@ -104,17 +137,19 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
             arguments={
                 "git_repo_path": "G:/project/demo",
                 "display_name": "from-dispatch",
+                "exclude_patterns": ["*.tmp"],
             },
             mcp_service=SimpleNamespace(),  # type: ignore[arg-type]
             management_api=api,  # type: ignore[arg-type]
         )
         self.assertIn("名称：from-dispatch", contents[0].text)
         self.assertEqual(api.calls[0]["display_name"], "from-dispatch")
+        self.assertEqual(api.calls[0]["exclude_patterns"], ["*.tmp"])
 
     async def test_empty_display_name_is_forwarded_as_empty_string(self) -> None:
         api = _ManagementApi(response=_sample_project(display_name="fallback-name"))
         await handle_register_project(
-            {"git_repo_path": "G:/project/demo"},
+            {"git_repo_path": "G:/project/demo", "exclude_patterns": []},
             api,  # type: ignore[arg-type]
         )
         self.assertEqual(api.calls[0]["display_name"], "")
@@ -125,6 +160,7 @@ class McpRegisterProjectTest(unittest.IsolatedAsyncioTestCase):
             {
                 "git_repo_path": "G:/project/demo",
                 "display_name": "custom",
+                "exclude_patterns": [],
             },
             api,  # type: ignore[arg-type]
         )

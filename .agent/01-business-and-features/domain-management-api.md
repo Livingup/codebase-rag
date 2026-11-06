@@ -11,7 +11,7 @@
 ### [FEAT-MGMT-01] 仓库副本注册主链与 project_id 派生/迁移
 - **业务目标**：登记一个本地 Git 仓库副本为知识生产项目成员，建立稳定身份。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [注册五步]：① `validate_repository` 校验 .git；② 从 root commit 派生 project_id：`uuid5(uuid.NAMESPACE_DNS, "codebase-rag:project_id:v1:{root_commit}")`（前缀常量 `_PROJECT_ID_DERIVATION_PREFIX`，跨 clone/镜像稳定）；无 commit THEN 拒绝"has no commits yet"；③ event_detection 注册该副本；④ workflow 注册该副本（repo_key→project_id 映射）；⑤ enqueue_initialization（按副本串行队列异步初始化）。
+  1. [注册五步]：① `validate_repository` 校验 .git；② 从 root commit 派生 project_id：`uuid5(uuid.NAMESPACE_DNS, "codebase-rag:project_id:v1:{root_commit}")`（前缀常量 `_PROJECT_ID_DERIVATION_PREFIX`，跨 clone/镜像稳定）；无 commit THEN 拒绝"has no commits yet"；③ event_detection 注册该副本；④ workflow 注册该副本（repo_key→project_id 映射）；若提供 `exclude_patterns`，通过 `add_ignore_rules` 写入 `.git/codebase-rag/ignore`；⑤ enqueue_initialization（按副本串行队列异步初始化）。
   2. [多副本注册]：注册表键为 repo_key；同 repo_key 重复注册 = 刷新既有条目（保留 registered_at/display_name，路径重拼记 project_path_respelled）；同 project_id 新 repo_key = 新增副本条目（记 project_copy_registered），既有副本不受影响。
   3. [身份迁移]：IF `.git/codebase-rag/project_id` 缓存与派生值不一致 THEN 执行 5 步迁移（Qdrant rebrand_project_id → workflow → knowledge_sync → 销毁旧内存实例 → 注册表各条目 project_id 字段改写，键仍为 repo_key 无需换键，各步幂等可重试）。
   4. [保存失败表达]：注册表保存失败（`_save_registry(raise_on_error=True)`，临时文件 + `os.replace` 原子写）THEN 报"项目登记未完成：无法保存注册表……部分操作可能已执行，未进行完整回滚"——注册跨越登记、监控和任务安排的部分副作用不采用全链事务回滚。

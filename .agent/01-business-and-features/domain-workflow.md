@@ -46,11 +46,11 @@
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [变更解析入口]：`get_changed_files(previous→commit)` 经过 `.gitignore` 风格过滤后返回 `added`/`modified`/`deleted`/`renamed` 四类文件，并发处理（文件级 Semaphore，`content_commit.max_file_concurrency=5`）。
   2. [纯重命名复用]：`renamed` 且 blob 不变 → 取 `old_file_version_id` 源 points；IF 源为空且外发箱有 ready job → `ensure_published` 后重取；克隆 points 仅改 `file_path`/`blob_hash`（保留 `file_type` 与 `dense_vector`，无 LLM、无 embedding）→ `submit_points(source="rename_clone", update_latest=True, update_memory=True)`；IF `cancelled_stale` / `skipped_existing` → 静默返回；IF 无源 points → 记 `failed("no source points found")`。
-  3. [单文件守卫链]（added/modified）：stale 版本 skip → 内容寻址去重（`check_existence` 命中则按 repo_key 回补该副本内存并删旧版本点）→ 外发箱 ready 则 `ensure_published`（`cache_hit`）→ `get_file_bytes` + `detect_file_modality` 自动识别模态（`unsupported_binary` 直接跳过；`image` 将图片构造为 `image_url` data URL 多模态消息发给 `knowledge_producer` 视觉模型看图生成 `business_description`；`text` 解码 UTF-8 文本发给 `knowledge_producer`）→ 知识点逐条校验 `point_token_limit=8192`（图片文件每条额外加 `IMAGE_TOKEN_COST=258` tokens，超限整批拒绝重生成）→ `embedding.embed` 向量化（图片文件以 `MultimodalEmbedInput(text=desc, image_bytes=raw_bytes, mime_type=mime_type)` 将文字描述与图片联合向量化）→ `submit_points(repo_key=副本)`。
+  3. [单文件守卫链]（added/modified）：`is_file_ignored` 命中（全局 `exclude_patterns` 或 `.git/codebase-rag/ignore`）直接跳过 → stale 版本 skip → 内容寻址去重（`check_existence` 命中则按 repo_key 回补该副本内存并删旧版本点）→ 外发箱 ready 则 `ensure_published`（`cache_hit`）→ `get_file_bytes` + `detect_file_modality` 自动识别模态（`unsupported_binary` 直接跳过；`image` 将图片构造为 `image_url` data URL 多模态消息发给 `knowledge_producer` 视觉模型看图生成 `business_description`；`text` 解码 UTF-8 文本发给 `knowledge_producer`）→ 知识点逐条校验 `point_token_limit=8192`（图片文件每条额外加 `IMAGE_TOKEN_COST=258` tokens，超限整批拒绝重生成）→ `embedding.embed` 向量化（图片文件以 `MultimodalEmbedInput(text=desc, image_bytes=raw_bytes, mime_type=mime_type)` 将文字描述与图片联合向量化）→ `submit_points(repo_key=副本)`。
   4. [Provider 容量感知]：`select_provider` 全满时阻塞等待空位；同一服务商多 agent 逐个尝试、全败移出候选；全部候选耗尽 → `WorkflowError("All knowledge_producer providers exhausted")`。
   5. [失败重试入队]：added/modified 处理失败 → 进入持久化重试队列；入队前先移除同 `file_path` 但不同 `file_version_id` 的旧记录（新版本取代旧版本），再按 `file_version_id` 精确去重。
   6. [收尾]：全部文件处理完成后 `update_cache_commit` 更新活跃实例缓存键。
-- **级联依赖功能单元（Cascade Links）**：FEAT-GIT-01（get_changed_files）、FEAT-GIT-02（detect_file_modality）、FEAT-GIT-03（get_file_bytes / get_file_content）、FEAT-QS-04（check_existence）、FEAT-KS-01（submit_points）、FEAT-KS-03（ensure_published / is_stale_file_version / has_ready_job）、FEAT-AG-02（select_provider）、FEAT-AG-03（run_agent）、FEAT-EMB-02（embed）、FEAT-MQ-06（update_cache_commit）。
+- **级联依赖功能单元（Cascade Links）**：FEAT-GIT-01（get_changed_files）、FEAT-GIT-02（is_file_ignored / detect_file_modality）、FEAT-GIT-03（get_file_bytes / get_file_content）、FEAT-QS-04（check_existence）、FEAT-KS-01（submit_points）、FEAT-KS-03（ensure_published / is_stale_file_version / has_ready_job）、FEAT-AG-02（select_provider）、FEAT-AG-03（run_agent）、FEAT-EMB-02（embed）、FEAT-MQ-06（update_cache_commit）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
   - 技术架构抉择：`.agent/04-tech-decisions/tech-knowledge-outbox.md`
@@ -75,11 +75,11 @@
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [启动]：服务启动后常驻后台任务，先 sleep 5s 等项目注册完成。
   2. [每轮顺序]：①计算退避 `backoff = min(base_backoff×2^consecutive_failures, max_backoff)`，实际 sleep = `max(backoff−距上轮耗时, scan_interval)`；②汇集所有已注册 project_id（取 `_project_repos` 值去重）的持久化重试队列（`{data_dir}/retry_queue_{project_id}.json`）；③**先执行** `knowledge_sync.retry_ready_jobs`（外发箱优先于文件重试）；④逐条处理重试记录。
-  3. [单条重试裁决]：该 project_id 无任何已注册副本 → 死信；repo 取仍存活的注册副本（`get_repo_key_for_project` 优先返回 `.git` 仍存在的副本，全失效时回退首个匹配；blob 内容寻址，任一持有该对象的副本皆可）；`is_stale_file_version` → 移出队列视为成功；blob 探测 `GitFileNotFoundError` → 死信（`reason="blob_not_found"`）；其他 Git 异常 → `retry_count+1` 留队；agent 重跑（`skip_memory_update=True`、`update_latest=False`、`source="compensation_retry"`）异常 → `retry_count+1`，IF `≥ max_file_retries` → 死信（`"max_retries_exceeded"`）。
+  3. [单条重试裁决]：该 project_id 无任何已注册副本 → 死信；repo 取仍存活的注册副本（`get_repo_key_for_project` 优先返回 `.git` 仍存在的副本，全失效时回退首个匹配；blob 内容寻址，任一持有该对象的副本皆可）；`is_file_ignored` 命中（若待重试文件后续被加入排除规则）→ 移出队列视为成功；`is_stale_file_version` → 移出队列视为成功；blob 探测 `GitFileNotFoundError` → 死信（`reason="blob_not_found"`）；其他 Git 异常 → `retry_count+1` 留队；agent 重跑（`skip_memory_update=True`、`update_latest=False`、`source="compensation_retry"`）异常 → `retry_count+1`，IF `≥ max_file_retries` → 死信（`"max_retries_exceeded"`）。
   4. [死信归档]：共三种死信条件（blob 消失 / 重试超限 / 项目未注册），持久化到 `{data_dir}/dead_letter_{project_id}.json`。
   5. [探针退避]：本轮首个 LLM 失败且零成功 → `consecutive_failures+1` 并中断本轮；任一成功则清零。
   6. [重试期间不做内存更新]：补偿重试 `skip_memory_update=True`，内存视图由下一次事件触发重建。
-- **级联依赖功能单元（Cascade Links）**：FEAT-KS-02（retry_ready_jobs）、FEAT-KS-03（is_stale_file_version）、FEAT-GIT-03（get_file_bytes / get_file_content）、FEAT-WF-03（agent 重跑全链）。
+- **级联依赖功能单元（Cascade Links）**：FEAT-KS-02（retry_ready_jobs）、FEAT-KS-03（is_stale_file_version）、FEAT-GIT-02（is_file_ignored）、FEAT-GIT-03（get_file_bytes / get_file_content）、FEAT-WF-03（agent 重跑全链）。
 - **关联外部索引指针**：
   - 前端目前 UI 现状：无
   - 技术架构抉择：`.agent/04-tech-decisions/tech-knowledge-outbox.md`

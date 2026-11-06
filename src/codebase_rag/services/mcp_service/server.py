@@ -50,7 +50,7 @@ TOOL_DEFINITIONS: list[Tool] = [
         description=(
             "基于 Git 仓库与 Qdrant 向量数据库的 Codebase RAG 语义搜索工具。"
             "通过自然语言查询检索已索引的 Git 仓库代码知识库，"
-            "返回按相关性排序的源码文件业务描述。"
+            "返回按相关性排序的源码文件业务描述（命中图片文件知识点时自动附加 ImageContent 图片内容供视觉查看）。"
             "支持单次调用传入多条查询，每条查询可指定一个或多个 Git 仓库。"
             "结果按查询和仓库两层分组返回，单个仓库失败不影响其他仓库。"
             "使用前需确保目标 Git 仓库已通过管理 API 注册并完成索引。"
@@ -88,16 +88,13 @@ TOOL_DEFINITIONS: list[Tool] = [
     ),
     Tool(
         name="project_status",
-        description=(
-            "查询指定仓库在当前服务中的登记情况及正在执行的初始化任务；"
-            "不保证可检索。"
-        ),
+        description="查询指定 Git 仓库的索引状态（初始化索引中/已就绪/未登记）及其知识点忽略规则内容（.git/codebase-rag/ignore）。",
         inputSchema={
             "type": "object",
             "properties": {
                 "git_repo_path": {
                     "type": "string",
-                    "description": "Git 仓库根目录的绝对路径，即 .git/ 所在的父目录。例如 'G:/project/MyRepo'，而非 'G:/project/MyRepo/.git'。",
+                    "description": "Git 仓库根目录的绝对路径（即 .git/ 所在的父目录）。例如 'G:/project/MyRepo'，而非 'G:/project/MyRepo/.git'。",
                 },
             },
             "required": ["git_repo_path"],
@@ -168,7 +165,9 @@ TOOL_DEFINITIONS: list[Tool] = [
             "单条知识点最大支持 8192 tokens（图片文件每条知识点固定占用 258 图片 tokens，服务端对每条知识点以「文字描述 + 原始图片」一起生成多模态向量）。"
             "调用方必须提供当前文件内容对应的 git blob hash，"
             "后端会校验 blob_hash、自动识别文件类型（text / image）、生成嵌入向量并通过统一同步协调器落地。"
-            "已受理不代表立即可检索；同一文件版本已有知识时不覆盖已有内容。"
+            "已受理不代表立即可检索；同一文件版本已有知识时不覆盖已有内容。\n"
+            "注意：若目标文件在排除规则中（命中全局 exclude_patterns 或仓库 .git/codebase-rag/ignore），提交将被服务端直接拦截拒绝；"
+            "如确需建立知识库，需先通过 manage_project_ignore 工具调整排除规则。"
         ),
         inputSchema={
             "type": "object",
@@ -248,8 +247,12 @@ TOOL_DEFINITIONS: list[Tool] = [
             "- 禁止未经用户同意私自调用。\n"
             "- 禁止因为“后续搜索更方便”“分析前先注册一下”“自动补全索引”等理由默认调用。\n"
             "\n"
-            "入参使用仓库根目录绝对路径（含 .git 的父目录）。注册成功只表示已登记并入队初始化，"
-            "登记完成不代表检索已就绪。"
+            "【必填参数约定】\n"
+            "- 必须传入目标仓库绝对路径 git_repo_path；\n"
+            "- 必须显式传入排除规则列表 exclude_patterns（采用 .gitignore 语法，例如 ['tests/**', 'docs/**', '*.log']）。"
+            "服务端将规则原子写入该仓库的 .git/codebase-rag/ignore，在全量扫描与后续变更跟踪中立即生效，避免无关文件污染知识库。\n"
+            "\n"
+            "注册成功只表示已登记并入队初始化，登记完成不代表检索已就绪。"
         ),
         inputSchema={
             "type": "object",
@@ -261,12 +264,21 @@ TOOL_DEFINITIONS: list[Tool] = [
                         "例如 'G:/project/MyRepo'，而非 'G:/project/MyRepo/.git'。"
                     ),
                 },
+                "exclude_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "必填的排除规则列表（采用 .gitignore 语法，例如 ['tests/**', 'docs/**', '*.log']）。"
+                        "用于配置该仓库无需建立知识库的目录与文件。规则将写入 .git/codebase-rag/ignore，"
+                        "并在初始化扫描与后续变更跟踪中生效。"
+                    ),
+                },
                 "display_name": {
                     "type": "string",
                     "description": "可选的项目展示名；不传时由服务端使用目录名或已有注册名称。",
                 },
             },
-            "required": ["git_repo_path"],
+            "required": ["git_repo_path", "exclude_patterns"],
         },
     ),
 ]
@@ -403,18 +415,24 @@ async def handle_codebase_search(
 async def handle_project_status(
     args: dict, management_api: ManagementApiService,
 ) -> list[TextContent]:
-    """Report registration facts without probing or rebuilding an index."""
+    """Report registration, run state and ignore rules without probing an index."""
     git_repo_path = args.get("git_repo_path", "")
     if not isinstance(git_repo_path, str) or not git_repo_path.strip():
         raise ValueError("Missing required parameter: 'git_repo_path'.")
     info = await management_api.get_project_registration_status(git_repo_path)
-    lines = [f"仓库：{info.git_repo_path}"]
-    if info.registered:
-        lines.append("登记状态：已登记")
-        if info.initialization_running:
-            lines.append("初始化进行中。")
+    if not info.registered:
+        return [TextContent(
+            type="text", text=f"仓库：{info.git_repo_path}\n状态：未登记",
+        )]
+
+    state = "初始化索引中" if info.initialization_running else "已就绪"
+    lines = [f"仓库：{info.git_repo_path}", f"状态：{state}"]
+    ignore_content = (info.ignore_content or "").strip()
+    if ignore_content:
+        lines.append(f"忽略规则（{info.ignore_file}）：")
+        lines.extend(ignore_content.splitlines())
     else:
-        lines.extend(["登记状态：未登记", "本服务尚未登记此仓库。"])
+        lines.append("忽略规则：无自定义规则")
     return [TextContent(type="text", text="\n".join(lines))]
 
 
@@ -470,6 +488,13 @@ async def handle_register_project(
     if not git_repo_path or not isinstance(git_repo_path, str):
         raise ValueError("Missing required parameter: 'git_repo_path'.")
 
+    exclude_patterns = args.get("exclude_patterns")
+    if exclude_patterns is None or not isinstance(exclude_patterns, list):
+        raise ValueError("Missing required parameter: 'exclude_patterns' (array of string patterns).")
+    for idx, pat in enumerate(exclude_patterns):
+        if not isinstance(pat, str):
+            raise ValueError(f"exclude_patterns[{idx}] must be a string.")
+
     display_name = args.get("display_name", "")
     if display_name is None:
         display_name = ""
@@ -480,16 +505,23 @@ async def handle_register_project(
         project = await management_api.register_project(
             git_repo_path=git_repo_path,
             display_name=display_name,
+            exclude_patterns=exclude_patterns,
         )
     except ManagementApiError as e:
         raise ValueError(str(e)) from e
 
+    rules_summary = (
+        f"（已配置 {len(exclude_patterns)} 条排除规则）"
+        if exclude_patterns
+        else "（未指定自定义排除规则）"
+    )
     text = (
         f"项目已登记，初始化已安排。\n"
         f"名称：{project.display_name}\n"
         f"仓库：{project.git_repo_path}\n"
         f"project_id：{project.project_id}\n"
         f"登记时 HEAD：{project.branch or 'N/A'} @ {project.commit_hash or 'N/A'}\n"
+        f"排除规则：{rules_summary}\n"
         f"登记完成不代表检索已就绪。"
     )
     return [TextContent(type="text", text=text)]

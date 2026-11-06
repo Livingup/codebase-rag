@@ -31,23 +31,25 @@ class McpToolResponsesTest(unittest.IsolatedAsyncioTestCase):
         for label in ['Points','Status','Branch']:
             self.assertNotIn(label, result[0].text)
 
-    async def test_project_status_registered_initializing_and_unregistered(self):
-        for registered, running in [(True,False),(True,True),(False,False)]:
-            with self.subTest(registered=registered, running=running):
-                api = SimpleNamespace(get_project_registration_status=AsyncMock(return_value=ProjectRegistrationStatus(
-                    'G:/project/demo', registered, running,
-                )))
+    async def test_project_status_state_and_ignore_rules(self):
+        cases = [
+            (ProjectRegistrationStatus('G:/project/demo', True, True),
+             '仓库：G:/project/demo\n状态：初始化索引中\n忽略规则：无自定义规则'),
+            (ProjectRegistrationStatus(
+                'G:/project/demo', True, False, 'G:/project/demo/.git/codebase-rag/ignore', 'dist/\n# keep\n*.min.js\n',
+             ),
+             '仓库：G:/project/demo\n状态：已就绪\n忽略规则（G:/project/demo/.git/codebase-rag/ignore）：\ndist/\n# keep\n*.min.js'),
+            (ProjectRegistrationStatus('G:/project/demo', False),
+             '仓库：G:/project/demo\n状态：未登记'),
+        ]
+        for status, expected in cases:
+            with self.subTest(expected=expected):
+                api = SimpleNamespace(get_project_registration_status=AsyncMock(return_value=status))
                 result = await handle_call_tool('project_status', {'git_repo_path':'G:/project/demo'}, SimpleNamespace(), api)
-                text = result[0].text
-                expected = '仓库：G:/project/demo\n登记状态：' + ('已登记' if registered else '未登记')
-                if running:
-                    expected += '\n初始化进行中。'
-                if not registered:
-                    expected += '\n本服务尚未登记此仓库。'
-                self.assertEqual(text, expected)
+                self.assertEqual(result[0].text, expected)
                 api.get_project_registration_status.assert_awaited_once_with('G:/project/demo')
-                self.assertNotIn('ready',text)
-                self.assertNotIn('Points',text)
+                for label in ['Points','Branch','ready']:
+                    self.assertNotIn(label, result[0].text)
         api = SimpleNamespace(get_project_registration_status=AsyncMock())
         for value in [None, '', 123, ' ']:
             with self.subTest(value=value), self.assertRaises(ValueError):

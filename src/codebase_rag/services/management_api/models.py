@@ -35,11 +35,13 @@ class ProjectRecord:
 
 @dataclass
 class ProjectRegistrationStatus:
-    """Registration facts for MCP callers, not a search-readiness probe."""
+    """Registration facts plus this repo's ignore rules, not a readiness probe."""
 
     git_repo_path: str
     registered: bool
     initialization_running: bool = False
+    ignore_file: str = ""
+    ignore_content: str = ""
 
 
 # =============================================================================
@@ -52,6 +54,7 @@ class RegisterProjectRequest(BaseModel):
 
     git_repo_path: str
     display_name: str = ""
+    exclude_patterns: Optional[List[str]] = None
 
 
 class BatchRegisterProjectRequest(BaseModel):

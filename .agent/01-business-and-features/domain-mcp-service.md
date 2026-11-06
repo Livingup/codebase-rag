@@ -81,7 +81,7 @@
 - **业务目标**：受理客户端提交的文件版本知识说明（支持文本文件与 `.png`/`.jpg`/`.jpeg` 图片文件）。
 - **当前生效的业务需求约束（Current Truth Rules）**：
   1. [输入契约]：必填 `git_repo_path`、`file_path`、`blob_hash`（工作区内容的 Git blob SHA-1）、`knowledge_descriptions`（非空字符串数组，逐条校验非空）；工具描述明确声明仅支持文本文件与 `.png` / `.jpg` / `.jpeg` 图片文件（单张图片 ≤ 20MB），无需传入 `file_type`，由服务端自动识别。
-  2. [忽略规则与模态校验]：先校验 `is_file_ignored`（命中全局 `exclude_patterns` 或 `.git/codebase-rag/ignore` 则拒绝并提示使用 `manage_project_ignore`）；复算工作区 `blob_hash`；再通过 `get_workdir_file_bytes` + `detect_file_modality` 自动识别 `file_type`（`"text"` 或 `"image"`，若为 `"unsupported_binary"` 则报错拒绝）。
+  2. [忽略规则与模态校验]：先校验 `is_file_ignored`（命中全局 `exclude_patterns` 或 `.git/codebase-rag/ignore` 则直接拦截并返回提示该文件在排除规则中，如果确实需要添加知识点请先通过 `manage_project_ignore` 工具修改排除规则）；复算工作区 `blob_hash`；再通过 `get_workdir_file_bytes` + `detect_file_modality` 自动识别 `file_type`（`"text"` 或 `"image"`，若为 `"unsupported_binary"` 则报错拒绝）。
   3. [8192 Token 门禁与多模态嵌入]：逐条校验 `count_tokens(desc) + (258 if file_type == "image" else 0) <= point_token_limit (8192)`；当 `file_type == "image"` 时，对每条 `business_description` 构造 `MultimodalEmbedInput(text=desc, image_bytes=raw_bytes, mime_type=mime_type)`，将「文字描述 + 原始图片」一起送入 `gemini-embedding-2` 生成多模态向量，并在 `PointData` 中记录 `file_type="image"`。
   4. [受理 outcome 判定]：仅 `skipped_existing` → `unchanged`（表达为"该文件版本已有知识，本次未覆盖已有内容"）；仅 `published` → `accepted`（"知识提交已受理……无需重复提交；不代表立即可检索"）；`retry_saved` 且 `can_retry_pending()` → 也算 `accepted`；`cancelled_stale` → `McpServiceError`"该文件版本已被后续提交替代……"；其余 → "服务未能确认可继续处理本次知识，请稍后重试相同文件版本；无需因此重建索引"。
   5. [版本一致性]：返回的 `file_version_id` 与期望不一致 → `McpServiceError`；展示层失败走 `isError=True`。
@@ -96,9 +96,9 @@
 ### [FEAT-MCPS-06] 登记与忽略规则类北向工具（project_status / list_projects / register_project / manage_project_ignore / codebase_context_analysis）
 - **业务目标**：向客户端暴露登记状态查询、项目登记、仓库忽略规则管理与上下文分析入口。
 - **当前生效的业务需求约束（Current Truth Rules）**：
-  1. [project_status]：必填 `git_repo_path`；语义为"只报告登记事实，不保证可检索"；已登记 + 初始化任务运行中（`current_task.task_type=="initialization"`）附加"初始化进行中"；未登记则明确说明。
+  1. [project_status]：必填 `git_repo_path`；语义为"报告索引状态与忽略规则，不保证可检索"；状态取值为「初始化索引中」「已就绪」或「未登记」；同时返回该仓库 `.git/codebase-rag/ignore` 的当前规则内容；只读，不探测、不触发索引。
   2. [list_projects]：无参，列出 `display_name` + 路径；空 → "未注册任何 Git 仓库。"
-  3. [register_project]：必填 `git_repo_path`，可选 `display_name`；工具描述内嵌强制调用边界（仅用户明确要求注册时才可调用，禁止私自/默认调用）；成功返回"项目已登记，初始化已安排……登记完成不代表检索已就绪"；`ManagementApiError` 转 `ValueError` 抛出。
+  3. [register_project]：必填 `git_repo_path` 和 `exclude_patterns`（字符串列表，.gitignore 语法），可选 `display_name`；工具描述内嵌强制调用边界（仅用户明确要求注册时才可调用，禁止私自/默认调用）；若传入自定义 `exclude_patterns`，写入仓库 `.git/codebase-rag/ignore`；成功返回"项目已登记，初始化已安排……排除规则：……登记完成不代表检索已就绪"；`ManagementApiError` 转 `ValueError` 抛出。
   4. [manage_project_ignore]：必填 `git_repo_path`、`action`（`get` | `add` | `remove` | `set`），可选 `patterns`（字符串列表）或 `content`（完整规则文本）；读写 `.git/codebase-rag/ignore`（完全遵循 `.gitignore` 语法规则，仅控制 codebase-rag 知识点跟踪过滤）。
   5. [codebase_context_analysis]：委托 `context_engine`（FEAT-CE-01）执行，输入任务描述与目标仓库。
   6. [MCP Server 形态]：同端口双传输并存——SSE（`GET /sse` + `POST /messages`，legacy）与 Streamable HTTP（`POST|GET|DELETE /mcp`，stateless）。

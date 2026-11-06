@@ -70,6 +70,7 @@ def create_router(service: ManagementApiService) -> APIRouter:
             return await service.register_project(
                 git_repo_path=req.git_repo_path,
                 display_name=req.display_name,
+                exclude_patterns=req.exclude_patterns,
             )
         except ManagementApiError as e:
             _error(400, "INVALID_REQUEST", str(e))

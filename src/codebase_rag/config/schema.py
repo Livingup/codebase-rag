@@ -351,6 +351,7 @@ class GitOperationsConfig(BaseModel):
 
 
 class ContentCommitConfig(BaseModel):
+    auto_generate: bool = True
     max_file_concurrency: int = 5
     point_token_limit: int = 8192      # max tokens per knowledge point description
     skip_unchanged_hash: bool = True

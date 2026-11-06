@@ -12,6 +12,8 @@
 - 日志：统一 `structlog`，事件名 snake_case（如 `services_initializing`）。
 - 配置：`ConfigManager`（`config/loader.py`）是运行时配置唯一持有者；各服务通过注册 reconciler 支持热重载。
 - 测试：`tests/unit/` 与 `tests/integration/`；异步单测用 `unittest.IsolatedAsyncioTestCase` + `SimpleNamespace` 伪造依赖；pytest `asyncio_mode=auto`。
+- 第三方能力边界：LLM/向量协议统一委托 `pythonsdk`（llm-sdk），`.gitignore` 语义统一委托 `pathspec.GitIgnoreSpec`（`pathspec>=1.1`，wheel 随仓置于 `wheels/`）；禁止在业务代码内重写协议客户端或 glob→正则 翻译器。源码直装/发布包安装均需保留 `--find-links wheels` 以离线解析这两类 wheel。
+- 测试运行环境：项目为 src 布局，单测必须以 `PYTHONPATH=src`（或已安装包）执行，否则报 `No module named 'codebase_rag'`。
 
 ## 2. 目录职责映射
 
@@ -53,6 +55,7 @@ src/codebase_rag/
     ├── qdrant_storage/
     └── workflow/
 ops/windows/                           # [运维脚本] Windows 服务安装/注册/启停/构建/更新 PowerShell 脚本
+scripts/                               # [运维脚本] Python 数据迁移与维护脚本
 wheels/                                # [离线依赖包] 仓库自带私有 wheel（如 multi_protocol_llm_client）
 tests/unit/ tests/integration/         # [测试]
 config.example.yaml .env.example       # [配置模板] 仓库只留模板，真实配置不入 Git
@@ -69,7 +72,7 @@ config.example.yaml .env.example       # [配置模板] 仓库只留模板，真
 | 新 REST 管理端点 | `management_api/routes.py` | 错误体统一 `ErrorResponse{error:{code,message}}` |
 | 新配置字段 | `config/schema.py` 对应段 | 同步 `config.example.yaml`、`.env.example` 与相关 reconciler |
 | 新 Git hook 类型 | `event_detection/hooks/<hook-name>` 模板 + `MANAGED_HOOKS` 列表 | 模板必须含 `# Codebase RAG Event Hook` 托管标记 |
-| 新运维脚本 | `ops/windows/*.ps1` | 公共函数放 `ops/windows/common.ps1` |
+| 新运维脚本 | Windows 服务脚本放 `ops/windows/*.ps1`；Python 数据迁移/维护脚本放 `scripts/*.py` | PowerShell 公共函数放 `ops/windows/common.ps1`；迁移脚本必须复用真实配置 Schema 并提供确定性测试 |
 | 新异步后台循环 | 所属域 `service.py` 内 `asyncio.create_task` + shutdown 取消 | 参考补偿循环（workflow）与空闲清扫（memory_qdrant） |
 
 ## 4. 绝对禁止的跨层/跨模块调用行为

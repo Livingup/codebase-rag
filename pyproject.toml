@@ -27,6 +27,9 @@ dependencies = [
     "pyyaml>=6.0",
     "watchfiles>=1.0.0",
 
+    # --- 文件过滤（.gitignore 语法，GitWildMatch） ---
+    "pathspec>=1.1.0",
+
     # --- 调度 ---
     "apscheduler>=3.10.0",
 

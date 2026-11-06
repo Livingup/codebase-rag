@@ -34,7 +34,7 @@
 | `FEAT-QS-01` | 连接生命周期与自愈 | 连接, 自愈, PoolTimeout, 客户端重建, 探活 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-01` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
 | `FEAT-QS-02` | 确定性点写入 | upsert, 确认, uuid5, knowledge_set_id, point ID | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-02` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
 | `FEAT-QS-03` | 完整知识集读取 | scroll, 完整知识集, chunk, 字典序最小, 读取 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-03` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
-| `FEAT-QS-04` | 存在性检查与迁移 | check_existence, 内容寻址, 去重, rebrand, set_payload | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-04` | 无 |
+| `FEAT-QS-04` | 存在性检查与迁移 | check_existence, 内容寻址, 去重, rebrand, set_payload, rewrite_dense_vectors, 向量迁移 | `.agent/01-business-and-features/domain-qdrant-storage.md#FEAT-QS-04` | 无 |
 | `FEAT-MQ-01` | 实例创建与 LRU 缓存 | 实例创建, LRU, staging, 缓存命中, 容量, repo_key, 副本实例 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-01` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
 | `FEAT-MQ-02` | 稠密向量检索 | 稠密检索, dense_search, hybrid_search, Cosine, top_k | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-02` | 无 |
 | `FEAT-MQ-03` | 活跃实例管理与 staging 晋升 | 活跃实例, 提升, staging, active, 转正 | `.agent/01-business-and-features/domain-memory-qdrant.md#FEAT-MQ-03` | `.agent/04-tech-decisions/tech-memory-instance-lifecycle.md` |
@@ -46,7 +46,7 @@
 | `FEAT-MCPS-03` | 仓库根契约校验 | git_repo_path, 仓库根, project_id, 不上溯, ProjectNotRegistered | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-03` | `.agent/04-tech-decisions/tech-moved-repo-heal.md` |
 | `FEAT-MCPS-04` | 已提交知识查询 | get_file_knowledge, 知识查询, 严格模式, HEAD 版本 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-04` | 无 |
 | `FEAT-MCPS-05` | 知识提交 | add_file_knowledge, 受理, blob_hash, 未覆盖, accepted, 8192, 图片模态, 258 tokens | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-05` | `.agent/04-tech-decisions/tech-knowledge-outbox.md` |
-| `FEAT-MCPS-06` | 登记与忽略规则类北向工具 | project_status, list_projects, register_project, manage_project_ignore, 登记状态, 初始化中 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-06` | 无 |
+| `FEAT-MCPS-06` | 登记与忽略规则类北向工具 | project_status, list_projects, register_project, manage_project_ignore, 登记状态, 初始化中, 排除规则 | `.agent/01-business-and-features/domain-mcp-service.md#FEAT-MCPS-06` | 无 |
 | `FEAT-CE-01` | 深度上下文分析编排 | 上下文分析, 实现现状报告, submit_report, ripgrep, 多候选 | `.agent/01-business-and-features/domain-context-engine.md#FEAT-CE-01` | 无 |
 | `FEAT-CE-02` | 本地工具集与 rg 执行 | search_code, read_file, list_directory, rg, 行号 | `.agent/01-business-and-features/domain-context-engine.md#FEAT-CE-02` | 无 |
 | `FEAT-MGMT-01` | 仓库副本注册主链与身份派生 | 注册, project_id, uuid5, 身份迁移, 注册表, 批量注册, repo_key, 多副本 | `.agent/01-business-and-features/domain-management-api.md#FEAT-MGMT-01` | `.agent/04-tech-decisions/tech-repo-copy-identity.md` |

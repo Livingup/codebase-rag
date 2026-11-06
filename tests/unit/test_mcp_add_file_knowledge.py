@@ -413,12 +413,43 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result_over.failed), 1)
             self.assertIn("260 tokens > 259 limit", result_over.failed[0].error)
 
-            # Verify .gitignore-style FileFilter with negation and directory rules
-            ff = FileFilter(exclude_patterns=["node_modules/**", "*.lock"], extra_ignore_lines=["assets/raw/", "!assets/raw/keep.png"])
+            # A file negation cannot re-include a path whose parent directory is excluded.
+            ff = FileFilter(
+                exclude_patterns=["node_modules/**", "*.lock"],
+                extra_ignore_lines=["assets/raw/", "!assets/raw/keep.png"],
+            )
             self.assertTrue(ff.is_ignored("assets/raw/drop.png"))
-            self.assertFalse(ff.is_ignored("assets/raw/keep.png"))
+            self.assertTrue(ff.is_ignored("assets/raw/keep.png"))
             self.assertFalse(ff.is_ignored("docs/arch.png"))
 
+
+
+    async def test_add_file_knowledge_rejected_when_file_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            file_path = "tests/test_foo.py"
+            blob_hash = "someblob"
+
+            class _IgnoredGitOps(_GitOps):
+                def is_file_ignored(self, repo_path: str, rel_path: str) -> bool:
+                    return True
+
+            service = McpService(
+                config_manager=_ConfigManager(),
+                embedding=_Embedding(),
+                memory_qdrant=SimpleNamespace(),
+                agent=SimpleNamespace(),
+                git_ops=_IgnoredGitOps(blob_hash),
+                knowledge_sync=_KnowledgeSync(),
+            )
+
+            result = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["knowledge point for tests"],
+            )
+            self.assertEqual(len(result.succeeded), 0)
+            self.assertEqual(len(result.failed), 1)
+            self.assertIn("在排除规则中", result.failed[0].error)
+            self.assertIn("manage_project_ignore", result.failed[0].error)
 
 class _Store:
     def __init__(self) -> None:

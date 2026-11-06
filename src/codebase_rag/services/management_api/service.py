@@ -225,7 +225,10 @@ class ManagementApiService:
     # =========================================================================
 
     async def register_project(
-        self, git_repo_path: str, display_name: str = "",
+        self,
+        git_repo_path: str,
+        display_name: str = "",
+        exclude_patterns: Optional[List[str]] = None,
     ) -> ProjectResponse:
         """Register a local repository copy: validate, resolve id, trigger init.
 
@@ -311,6 +314,11 @@ class ManagementApiService:
                 f"原因：{e}"
             ) from e
 
+        # Step 4b: Apply custom exclude patterns to .git/codebase-rag/ignore if provided
+        if exclude_patterns:
+            if hasattr(self._git_ops, "add_ignore_rules"):
+                self._git_ops.add_ignore_rules(git_repo_path, exclude_patterns)
+
         # Step 5: Trigger full initialization (via task queue, serial per copy)
         branch = head_info.branch_name or "HEAD"
         self._workflow.enqueue_initialization(
@@ -351,10 +359,12 @@ class ManagementApiService:
         for item in projects:
             git_repo_path = item.get("git_repo_path", "")
             display_name = item.get("display_name", "")
+            exclude_patterns = item.get("exclude_patterns")
             try:
                 resp = await self.register_project(
                     git_repo_path=git_repo_path,
                     display_name=display_name,
+                    exclude_patterns=exclude_patterns,
                 )
                 results.append(BatchRegisterResultItem(
                     git_repo_path=git_repo_path,
@@ -402,7 +412,7 @@ class ManagementApiService:
     async def get_project_registration_status(
         self, git_repo_path: str,
     ) -> ProjectRegistrationStatus:
-        """Report registration and a running initialization, not readiness."""
+        """Report registration, run state and ignore rules; never probe indexes."""
         normalized = self._normalize_registered_path(git_repo_path)
         record = self._projects.get(normalized)
         if record is None:
@@ -410,10 +420,15 @@ class ManagementApiService:
                 git_repo_path=normalized, registered=False,
             )
         task = self._workflow.get_workflow_status(record.repo_key).current_task
+        git_ops = getattr(self, "_git_ops", None)
+        ignore_file = git_ops.get_ignore_file_path(record.git_repo_path) if git_ops else None
+        ignore_content = git_ops.get_ignore_content(record.git_repo_path) if git_ops else None
         return ProjectRegistrationStatus(
             git_repo_path=record.git_repo_path,
             registered=True,
             initialization_running=task is not None and task.task_type == "initialization",
+            ignore_file=ignore_file,
+            ignore_content=ignore_content,
         )
 
     # =========================================================================

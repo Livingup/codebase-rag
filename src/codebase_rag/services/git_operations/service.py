@@ -47,6 +47,34 @@ logger = get_logger(__name__)
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 
 
+def _parse_lfs_pointer(pointer_bytes: bytes) -> tuple[str, Optional[int]]:
+    """Return the expected SHA-256 OID and optional size from an LFS pointer."""
+    try:
+        pointer_text = pointer_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError("Invalid Git LFS pointer encoding") from e
+    oid: Optional[str] = None
+    size: Optional[int] = None
+    for line in pointer_text.splitlines():
+        if line.startswith("oid sha256:"):
+            oid = line.removeprefix("oid sha256:").strip()
+        elif line.startswith("size "):
+            try:
+                size = int(line.removeprefix("size ").strip())
+            except ValueError as e:
+                raise ValueError("Invalid Git LFS pointer size") from e
+    if not oid or not re.fullmatch(r"[0-9a-fA-F]{64}", oid):
+        raise ValueError("Git LFS pointer is missing a valid sha256 OID")
+    return oid.lower(), size
+
+
+def _lfs_content_matches(raw_bytes: bytes, oid: str, size: Optional[int]) -> bool:
+    """Verify that materialized bytes are exactly the object named by the pointer."""
+    if size is not None and len(raw_bytes) != size:
+        return False
+    return hashlib.sha256(raw_bytes).hexdigest() == oid
+
+
 class GitOperationsService:
     """Encapsulates all Git commands, providing structured data access.
 
@@ -440,10 +468,9 @@ class GitOperationsService:
         """Get raw file bytes by blob hash, automatically resolving Git LFS pointers.
 
         If the Git blob is a Git LFS pointer (``version https://git-lfs.github.com/spec/v1``):
-        1. Checks if the working tree file at ``file_path`` exists and is already
-           materialized (non-pointer bytes).
-        2. Otherwise pipes the pointer through ``git lfs smudge`` to retrieve
-           the actual binary bytes.
+        1. Reads the matching object from the repository's local LFS object store.
+        2. Uses the working tree file only when its SHA-256 and size match the pointer.
+        3. Otherwise pipes the pointer through ``git lfs smudge`` and verifies the result.
         """
         try:
             raw = await self._run_git_bytes(repo_path, ["cat-file", "blob", blob_hash])
@@ -475,20 +502,57 @@ class GitOperationsService:
         pointer_bytes: bytes,
         file_path: Optional[str] = None,
     ) -> bytes:
-        """Resolve a Git LFS pointer to actual binary bytes."""
-        # 1. Check working tree file if available and materialized
+        """Resolve a Git LFS pointer without mixing bytes from another file version."""
+        try:
+            oid, expected_size = _parse_lfs_pointer(pointer_bytes)
+        except ValueError as e:
+            raise GitCommandError(
+                command="git lfs pointer", returncode=1, stderr=str(e),
+            ) from e
+
+        # 1. Prefer the exact object from the local LFS object store.
+        try:
+            common_dir_raw = await self._run_git_bytes(
+                repo_path, ["rev-parse", "--git-common-dir"],
+            )
+            common_dir_text = common_dir_raw.decode("utf-8").strip()
+            common_dir = Path(common_dir_text)
+            if not common_dir.is_absolute():
+                common_dir = Path(repo_path) / common_dir
+            object_path = (
+                common_dir / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
+            )
+            if object_path.is_file():
+                object_bytes = await asyncio.to_thread(object_path.read_bytes)
+                if _lfs_content_matches(object_bytes, oid, expected_size):
+                    return object_bytes
+                logger.warning(
+                    "git_lfs_local_object_hash_mismatch",
+                    repo=repo_path, file_path=file_path, oid=oid,
+                )
+        except Exception as e:
+            logger.debug(
+                "git_lfs_local_object_lookup_failed",
+                repo=repo_path, file_path=file_path, error=str(e)[:200],
+            )
+
+        # 2. Use working tree bytes only if they are the exact pointed-to version.
         if file_path:
             clean_path = normalize_repo_relative_path(repo_path, file_path)
             abs_path = os.path.join(repo_path, clean_path)
             if os.path.isfile(abs_path):
                 try:
                     wt_bytes = await asyncio.to_thread(Path(abs_path).read_bytes)
-                    if wt_bytes and not wt_bytes.startswith(_LFS_POINTER_PREFIX):
+                    if (
+                        wt_bytes
+                        and not wt_bytes.startswith(_LFS_POINTER_PREFIX)
+                        and _lfs_content_matches(wt_bytes, oid, expected_size)
+                    ):
                         return wt_bytes
                 except OSError:
                     pass
 
-        # 2. Try git lfs smudge
+        # 3. Fall back to smudge and verify that the returned bytes match the OID.
         smudge_args = ["lfs", "smudge"]
         if file_path:
             smudge_args.append(normalize_repo_relative_path(repo_path, file_path))
@@ -496,8 +560,16 @@ class GitOperationsService:
             smudged = await self._run_git_bytes(
                 repo_path, smudge_args, stdin_bytes=pointer_bytes,
             )
-            if smudged and not smudged.startswith(_LFS_POINTER_PREFIX):
+            if (
+                smudged
+                and not smudged.startswith(_LFS_POINTER_PREFIX)
+                and _lfs_content_matches(smudged, oid, expected_size)
+            ):
                 return smudged
+            logger.warning(
+                "git_lfs_smudged_content_mismatch",
+                repo=repo_path, file_path=file_path, oid=oid,
+            )
         except Exception as e:
             logger.warning(
                 "git_lfs_smudge_failed",
@@ -510,8 +582,8 @@ class GitOperationsService:
             command="git lfs smudge",
             returncode=1,
             stderr=(
-                f"文件 {file_path or ''} 是 Git LFS 指针文件且本地未检出真实二进制内容，"
-                "请先执行 git lfs pull 检出真实文件。"
+                f"文件 {file_path or ''} 对应的 Git LFS 对象 {oid} 无法在本地准确还原，"
+                "请先执行 git lfs pull 检出该版本的真实文件。"
             ),
         )
 

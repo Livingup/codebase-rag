@@ -837,8 +837,8 @@ class McpService:
         # Check ignore rules (.git/codebase-rag/ignore + global exclude_patterns)
         if hasattr(self._git_ops, "is_file_ignored") and self._git_ops.is_file_ignored(project_path, canon_path):
             raise ValueError(
-                f"文件 '{canon_path}' 被忽略规则（全局 exclude_patterns 或 .git/codebase-rag/ignore）拦截，"
-                "无需提交知识点；如需跟踪该文件，请通过 manage_project_ignore 工具调整忽略规则。"
+                f"文件 '{canon_path}' 在排除规则中（全局 exclude_patterns 或 .git/codebase-rag/ignore）。"
+                "如果确实需要添加知识点，请先通过 manage_project_ignore 工具修改排除规则。"
             )
 
         # Verify the client-provided blob hash against current worktree content

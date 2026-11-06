@@ -57,6 +57,7 @@ class OpenAIResponsesProvider(LLMProvider):
         request = OpenAIResponsesRequest(
             model=model,
             input=self._build_input(messages),
+            instructions=self._build_instructions(messages),
             tools=self._build_tools(tools),
             tool_choice=tool_choice if tools and tool_choice else None,
             temperature=temperature,
@@ -93,6 +94,57 @@ class OpenAIResponsesProvider(LLMProvider):
     # -----------------------------------------------------------------------
 
     @staticmethod
+    def _build_instructions(messages: List[Message]) -> Optional[str]:
+        parts: List[str] = []
+        for msg in messages:
+            if msg.role != "system":
+                continue
+            if isinstance(msg.content, str):
+                parts.append(msg.content)
+            elif isinstance(msg.content, list):
+                parts.extend(
+                    str(block.get("text", ""))
+                    for block in msg.content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+        value = "\n\n".join(part for part in parts if part)
+        return value or None
+
+    @staticmethod
+    def _convert_content(content: Any, role: str) -> Any:
+        if not isinstance(content, list):
+            return content
+        converted: List[Dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                converted.append(
+                    {
+                        "type": "output_text" if role == "assistant" else "input_text",
+                        "text": str(block.get("text", "")),
+                    }
+                )
+            elif block_type == "image_url":
+                image_value = block.get("image_url") or {}
+                image_url = (
+                    image_value.get("url", "")
+                    if isinstance(image_value, dict)
+                    else str(image_value)
+                )
+                if image_url:
+                    image_part: Dict[str, Any] = {
+                        "type": "input_image", "image_url": image_url,
+                    }
+                    if isinstance(image_value, dict) and image_value.get("detail"):
+                        image_part["detail"] = image_value["detail"]
+                    converted.append(image_part)
+            else:
+                converted.append(block)
+        return converted
+
+    @staticmethod
     def _build_input(messages: List[Message]) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for msg in messages:
@@ -127,7 +179,9 @@ class OpenAIResponsesProvider(LLMProvider):
                     {
                         "type": "message",
                         "role": msg.role,
-                        "content": msg.content or "",
+                        "content": OpenAIResponsesProvider._convert_content(
+                            msg.content or "", msg.role,
+                        ),
                     }
                 )
             items.extend(assistant_tool_calls)

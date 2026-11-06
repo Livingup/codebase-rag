@@ -20,6 +20,7 @@
   - 错误映射：`AUTH_ERROR`→`LLMAuthError`；`RATE_LIMIT`/`OVERLOADED`→`LLMRateLimitError`；`ABORTED`→`asyncio.CancelledError`（恢复任务取消语义）；其余→`LLMAPIError`。
   - base_url 版本段规则：OpenAI 系补 `/v1`（deepseek 原样、zhipu 补 `/api/paas/v4`）、Anthropic 补 `/v1`、Gemini 补 `/v1beta`；已带同版本段则不重复追加。
   - token 计数：OpenAI 系用 tiktoken；Gemini 用 `GeminiEmbeddingClient.count_tokens`；Anthropic 用 `ClaudeCountTokensClient`（`/v1/messages/count_tokens`）。
+  - 多模态消息适配：OpenAI Chat 透传 `text` / `image_url` 内容块；OpenAI Responses 转为 `input_text` / `input_image` 并将 system 消息写入 `instructions`；Anthropic 转为 `text` / `image.source(type=base64)`；Gemini 将 Data URL 转为 `inlineData(mimeType,data)`。禁止把 Chat Completions 内容块原样发送给 Responses API，禁止丢失 system 指令。
 - **Embedding provider 契约**：`gemini.py`（`gemini-embedding-2`）委托 `GeminiEmbeddingClient.batch_embed_contents`（检索时 `taskType=RETRIEVAL_QUERY`、索引时 `taskType=RETRIEVAL_DOCUMENT`、支持 `MultimodalEmbedInput` 在单点 `parts` 中同时携带文本与 `inlineData` 图片 base64、子维度 < 3072 时自动 `l2_normalize`）。
 - **重试归属不变**：llm-sdk 客户端一律 `RetryPolicy(max_attempts=1)` 关闭内置重试；Key 轮换、同 Key 重试、429 退避、熔断仍由 `agent/service.py` 与 `embedding/service.py` 承担（FEAT-AG-04 / FEAT-EMB-02）。
 - **健康校验语义**：Embedding 的 `health_check` 由 SDK 调用真实接口（Gemini `countTokens`）实现；Agent provider 不再提供 `health_check`，实时探活统一走 `probe_stream`。

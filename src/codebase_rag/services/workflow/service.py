@@ -787,11 +787,13 @@ class WorkflowOrchestratorService:
             nonlocal modified_count, skipped_count, sync_cache_hit_count, total_points, total_agent_calls
             async with file_sem:
                 try:
-                    # Get old descriptions for context
-                    old_records = await self._qdrant.get_file_points(
-                        project_id, entry.old_file_version_id,
-                    )
-                    old_descriptions = self._extract_descriptions_list(old_records)
+                    # Get old descriptions for context only when auto_generate is enabled
+                    old_descriptions: List[str] = []
+                    if self._config.content_commit.auto_generate:
+                        old_records = await self._qdrant.get_file_points(
+                            project_id, entry.old_file_version_id,
+                        )
+                        old_descriptions = self._extract_descriptions_list(old_records)
 
                     pts, skipped, agents, cache_hit = await self._process_file_with_agent(
                         project_id, repo_path, entry.file_path,
@@ -1301,6 +1303,31 @@ class WorkflowOrchestratorService:
             if sync_result.cancelled_stale or sync_result.skipped_existing:
                 return (0, True, 0, True)
             return (sync_result.points_count, False, 0, True)
+
+        # Check ignore rules (.git/codebase-rag/ignore + global exclude_patterns)
+        if hasattr(self._git_ops, "is_file_ignored") and self._git_ops.is_file_ignored(repo_path, file_path):
+            logger.info(
+                "workflow_file_ignored_skip",
+                project_id=project_id,
+                file_path=file_path,
+                file_version_id=file_version_id[:16] if file_version_id else "",
+            )
+            return (0, True, 0, False)
+
+        # Check if auto_generate is enabled for workflow commit
+        if sync_source in ("commit_event", "compensation_retry") and not self._config.content_commit.auto_generate:
+            logger.info(
+                "workflow_file_auto_generate_disabled_skip",
+                project_id=project_id,
+                file_path=file_path,
+                file_version_id=file_version_id[:16],
+                sync_source=sync_source,
+            )
+            if not skip_memory_update and old_file_version_id:
+                await self._delete_from_memory(
+                    project_id, repo_key, old_file_version_id,
+                )
+            return (0, True, 0, False)
 
         # Detect file modality (text vs supported image .png/.jpg/.jpeg)
         raw_bytes = await self._git_ops.get_file_bytes(
@@ -2334,6 +2361,15 @@ class WorkflowOrchestratorService:
                 file_path=record.file_path,
             )
             return "dead_lettered"
+
+        if hasattr(self._git_ops, "is_file_ignored") and self._git_ops.is_file_ignored(repo_path, record.file_path):
+            self._remove_from_retry_queue(record)
+            logger.info(
+                "compensation_skip_ignored_file",
+                project_id=project_id,
+                file_path=record.file_path,
+            )
+            return "success"
 
         if self._knowledge_sync is not None and self._knowledge_sync.is_stale_file_version(
             project_id,

@@ -620,6 +620,7 @@ git_operations:
 workflow:
   data_dir: "${CODEBASE_RAG_DATA_DIR}/data"             # 重试队列/死信队列持久化目录
   content_commit:
+    auto_generate: true                  # 是否自动调用 LLM 补齐知识点（适用于 commit、pull、merge、rebase 等所有触发 Git 文件更新的场景，默认 true；设为 false 则跳过自动补齐，允许后续手动录入）
     max_file_concurrency: 5
     point_token_limit: 8192              # 单条知识描述最大 tokens（含图片固定 258 tokens）
   initialization:
