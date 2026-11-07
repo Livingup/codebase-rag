@@ -317,6 +317,8 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             (r"src\agent_runtime\focus_context\inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
             (r"src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
             (r"/src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r"./src/agent_runtime/focus_context/inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
+            (r".\src\agent_runtime\focus_context\inner_brain_prompt.py", "src/agent_runtime/focus_context/inner_brain_prompt.py"),
         ]
         for inp, expected in cases:
             self.assertEqual(normalize_repo_relative_path(repo, inp), expected)
@@ -438,6 +440,96 @@ class McpAddFileKnowledgeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result.failed), 1)
             self.assertIn("在排除规则中", result.failed[0].error)
             self.assertIn("manage_project_ignore", result.failed[0].error)
+
+    async def test_manage_project_ignore_updates_take_effect_immediately_with_whitelist(self) -> None:
+        from codebase_rag.services.git_operations.service import GitOperationsService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = _create_project_path(tmp)
+            file_path = "src/shared/performance/performanceMonitor.ts"
+            blob_hash = "885e6fd41d7976f20e6e57a6fc67665743450534"
+
+            git_cfg_mgr = SimpleNamespace(
+                config=SimpleNamespace(
+                    git_operations=SimpleNamespace(
+                        git_executable="git",
+                        command_timeout=30,
+                        max_concurrency=4,
+                        file_filter=SimpleNamespace(
+                            exclude_patterns=["tests/**", "**/*.test.*", "*.md"]
+                        ),
+                    )
+                )
+            )
+            real_git_ops = GitOperationsService(git_cfg_mgr)
+
+            async def _fake_workdir_blob(repo_path: str, rel_path: str) -> str:
+                return blob_hash
+
+            async def _fake_workdir_bytes(repo_path: str, rel_path: str) -> bytes:
+                return b"export const monitor = true;\n"
+
+            real_git_ops.get_workdir_blob_hash = _fake_workdir_blob  # type: ignore[method-assign]
+            real_git_ops.get_workdir_file_bytes = _fake_workdir_bytes  # type: ignore[method-assign]
+
+            service = McpService(
+                config_manager=_ConfigManager(),
+                embedding=_Embedding(),
+                memory_qdrant=SimpleNamespace(),
+                agent=SimpleNamespace(),
+                git_ops=real_git_ops,
+                knowledge_sync=_KnowledgeSync(),
+            )
+
+            # 1. Set default-deny (*) without TS negation -> rejected
+            service.manage_project_ignore(
+                project_path=project_path,
+                action="set",
+                patterns=["*"],
+            )
+            res_blocked = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["knowledge point"],
+            )
+            self.assertEqual(len(res_blocked.succeeded), 0)
+            self.assertEqual(len(res_blocked.failed), 1)
+            self.assertIn("manage_project_ignore", res_blocked.failed[0].error)
+
+            # 2. Add !*/ and !**/*.ts whitelist -> immediately accepted without cache staleness
+            service.manage_project_ignore(
+                project_path=project_path,
+                action="add",
+                patterns=["!*/", "!**/*.ts"],
+            )
+            res_allowed = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["knowledge point"],
+            )
+            self.assertEqual(len(res_allowed.succeeded), 1)
+            self.assertEqual(len(res_allowed.failed), 0)
+            self.assertEqual(res_allowed.succeeded[0].outcome, "accepted")
+
+            # 3. Remove !**/*.ts and add exact file negation !src/shared/performance/performanceMonitor.ts -> accepted
+            service.manage_project_ignore(
+                project_path=project_path,
+                action="remove",
+                patterns=["!**/*.ts"],
+            )
+            res_blocked_again = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["knowledge point"],
+            )
+            self.assertEqual(len(res_blocked_again.succeeded), 0)
+            self.assertEqual(len(res_blocked_again.failed), 1)
+
+            service.manage_project_ignore(
+                project_path=project_path,
+                action="add",
+                patterns=["!src/shared/performance/performanceMonitor.ts"],
+            )
+            res_exact_allowed = await service.add_file_knowledge(
+                project_path, file_path, blob_hash, ["knowledge point"],
+            )
+            self.assertEqual(len(res_exact_allowed.succeeded), 1)
+            self.assertEqual(len(res_exact_allowed.failed), 0)
+            self.assertEqual(res_exact_allowed.succeeded[0].outcome, "accepted")
 
 class _Store:
     def __init__(self) -> None:

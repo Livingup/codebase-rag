@@ -870,7 +870,10 @@ def normalize_repo_relative_path(repo_path: str, file_path: str) -> str:
         try:
             rel = os.path.relpath(norm_file, norm_repo)
             if not rel.startswith(".."):
-                return rel.replace("\\", "/").strip().lstrip("/")
+                clean_rel = rel.replace("\\", "/").strip()
+                while clean_rel.startswith("./") or clean_rel.startswith("/"):
+                    clean_rel = clean_rel[2:] if clean_rel.startswith("./") else clean_rel[1:]
+                return "" if clean_rel == "." else clean_rel
         except ValueError:
             pass
 
@@ -879,7 +882,10 @@ def normalize_repo_relative_path(repo_path: str, file_path: str) -> str:
     if clean_file.lower().startswith(clean_repo.lower() + "/"):
         clean_file = clean_file[len(clean_repo) + 1 :]
 
-    return clean_file.replace("\\", "/").strip().lstrip("/")
+    while clean_file.startswith("./") or clean_file.startswith("/"):
+        clean_file = clean_file[2:] if clean_file.startswith("./") else clean_file[1:]
+
+    return "" if clean_file == "." else clean_file
 
 
 def compute_file_version_id(file_path: str, blob_hash: str) -> str:

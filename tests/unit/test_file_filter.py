@@ -46,6 +46,71 @@ def test_global_and_repository_rules_are_combined():
     assert not ff.is_ignored("docs/arch.png")
 
 
+def test_default_deny_with_directory_and_nested_extension_whitelist():
+    ff = FileFilter(
+        exclude_patterns=[],
+        extra_ignore_lines=["*", "!*/", "!**/*.ts"],
+    )
+    assert not ff.is_ignored("src/shared/performance/performanceMonitor.ts")
+    assert not ff.is_ignored("src/a/b.ts")
+    assert not ff.is_ignored("./src/a/b.ts")
+    assert not ff.is_ignored("src\\a\\b.ts")
+    assert ff.is_ignored("src/a/b.js")
+    assert ff.is_ignored("README.md")
+
+
+def test_default_deny_with_exact_file_whitelist():
+    ff = FileFilter(
+        exclude_patterns=[],
+        extra_ignore_lines=["*", "!*/", "!src/a/b.ts"],
+    )
+    assert not ff.is_ignored("src/a/b.ts")
+    assert ff.is_ignored("src/a/c.ts")
+    assert ff.is_ignored("a.ts")
+
+
+def test_whitelist_can_still_be_overridden_by_later_test_and_build_exclusions():
+    ff = FileFilter(
+        exclude_patterns=[],
+        extra_ignore_lines=[
+            "*",
+            "!*/",
+            "!**/*.ts",
+            "!**/*.js",
+            "**/*.test.*",
+            "dist/",
+        ],
+    )
+    assert not ff.is_ignored("src/a/b.ts")
+    assert ff.is_ignored("src/a/b.test.ts")
+    assert ff.is_ignored("dist/a.js")
+
+
+def test_build_directory_cannot_be_rescued_by_extension_negation():
+    for rules in [
+        ["!**/*.js", "dist/"],
+        ["dist/", "!**/*.js"],
+        ["*", "!*/", "dist/", "!**/*.js"],
+    ]:
+        ff = FileFilter(exclude_patterns=[], extra_ignore_lines=rules)
+        assert ff.is_ignored("dist/a.js"), rules
+
+
+def test_global_rules_can_be_overridden_by_repo_whitelist():
+    from codebase_rag.services.git_operations.file_filter import compile_gitignore_lines
+
+    ff = FileFilter(
+        exclude_patterns=["tests/**", "**/*.test.*", "*.md"],
+    )
+    repo_rules = compile_gitignore_lines(
+        ["*", "!*/", "!**/*.ts", "!/AGENTS.md", "** /tests/".replace(" ", ""), "**/*.test.*"]
+    )
+    assert not ff.is_ignored("src/shared/performance/performanceMonitor.ts", repo_rules=repo_rules)
+    assert not ff.is_ignored("AGENTS.md", repo_rules=repo_rules)
+    assert ff.is_ignored("README.md", repo_rules=repo_rules)
+    assert ff.is_ignored("src/shared/performance/performanceMonitor.test.ts", repo_rules=repo_rules)
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
 def test_supported_cases_match_git_check_ignore(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -54,6 +119,17 @@ def test_supported_cases_match_git_check_ignore(tmp_path):
         ([r"foo\ bar"], "foo bar"),
         (["assets/*", "!assets/keep.png"], "assets/keep.png"),
         ([r"\#literal"], "#literal"),
+        (["*", "!*/", "!**/*.ts"], "src/shared/performance/performanceMonitor.ts"),
+        (["*", "!*/", "!src/a/b.ts"], "src/a/b.ts"),
+        (["*", "!*/", "!src/a/b.ts"], "src/a/c.ts"),
+        (["*", "!**/*.ts"], "src/a/b.ts"),
+        (["*", "!*/", "!**/*.ts", "**/*.test.*"], "src/a/b.test.ts"),
+        (["*", "!*/", "!**/*.ts", "**/*.test.*"], "src/a/b.ts"),
+        (["!**/*.js", "dist/"], "dist/a.js"),
+        (["dist/", "!**/*.js"], "dist/a.js"),
+        (["*", "!src/", "!src/shared/a.ts"], "src/shared/a.ts"),
+        (["*", "!src/", "!src/shared/", "!src/shared/a.ts"], "src/shared/a.ts"),
+        (["src/**", "!src/shared/", "!src/shared/a.ts"], "src/shared/a.ts"),
     ]
     for rules, relative_path in cases:
         (tmp_path / ".gitignore").write_text("\n".join(rules) + "\n", encoding="utf-8")

@@ -4,7 +4,7 @@
 
 ## 0. 项目架构约束记忆路由表（L0）
 
-项目工程约束记忆位于 `.agent/` 目录：13 份业务域文档（`.agent/01-business-and-features/`）、1 份分层规范（`.agent/02-code-structure/architecture-rules.md`，全项目分层词汇唯一来源）、7 篇非平凡技术机制文档（`.agent/04-tech-decisions/`）。本项目为纯后端服务，无独立 UI 现状文档（说明见 architecture-rules.md 第 5 节）。查找业务规则、放码位置或源码清单时，从下表按关键词定位功能单元（共 55 个），跳转至对应域文档。
+项目工程约束记忆位于 `.agent/` 目录：13 份业务域文档（`.agent/01-business-and-features/`）、1 份分层规范（`.agent/02-code-structure/architecture-rules.md`，全项目分层词汇唯一来源）、8 篇非平凡技术机制文档（`.agent/04-tech-decisions/`）。本项目为纯后端服务，无独立 UI 现状文档（说明见 architecture-rules.md 第 5 节）。查找业务规则、放码位置或源码清单时，从下表按关键词定位功能单元（共 55 个），跳转至对应域文档。
 
 | 功能单元 ID | 功能名称 | 业务关键词 | 所属业务域文档与锚点 | 关联技术架构抉择 |
 | --- | --- | --- | --- | --- |
@@ -64,7 +64,7 @@
 | `FEAT-MCPC-01` | 三种 Transport 连接 | stdio, sse, streamable_http, 工具发现, 外部 MCP | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-01` | 无 |
 | `FEAT-MCPC-02` | 懒初始化与差量重建 | 懒初始化, 部分成功, 差量重建, 工具缓存 | `.agent/01-business-and-features/domain-mcp-client.md#FEAT-MCPC-02` | `.agent/04-tech-decisions/tech-config-reconcile.md` |
 
-配套全局文档：业务域边界与全局铁律见 `.agent/01-business-and-features/00-domain-boundaries.md`；代码分层与放码位置见 `.agent/02-code-structure/architecture-rules.md`。业务域文档共 13 份，非平凡技术机制文档共 7 篇。
+配套全局文档：业务域边界与全局铁律见 `.agent/01-business-and-features/00-domain-boundaries.md`；代码分层与放码位置见 `.agent/02-code-structure/architecture-rules.md`。业务域文档共 13 份，非平凡技术机制文档共 8 篇。
 
 ## 1. 目录约定
 

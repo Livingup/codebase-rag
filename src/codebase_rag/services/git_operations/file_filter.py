@@ -17,9 +17,14 @@ hand-written glob translator:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional, Tuple
 
 from pathspec import GitIgnoreSpec
+from pathspec.patterns.gitignore.spec import (
+    GitIgnoreSpecPattern,
+    _DIR_MARK,
+    _DIR_MARK_CG,
+)
 
 from codebase_rag.common.types import MAX_IMAGE_BYTES
 
@@ -165,25 +170,102 @@ class FileFilter:
         return GitIgnoreSpec([*self._base_spec.patterns, *repo_rules.patterns])
 
     @staticmethod
-    def _has_ignored_ancestor(spec: GitIgnoreSpec, normalized: str) -> bool:
-        """Return True when any parent directory is still excluded by ``spec``.
+    def _normalize_rel_path(file_path: str) -> str:
+        """Normalize path separators and strip leading './' or '/' prefixes."""
+        clean = file_path.replace("\\", "/")
+        while clean.startswith("./") or clean.startswith("/"):
+            clean = clean[2:] if clean.startswith("./") else clean[1:]
+        if clean == ".":
+            return ""
+        return clean.rstrip("/")
 
-        Git cannot re-include a file whose parent directory is excluded, and
-        ``dir/`` patterns only match a trailing-slash form, so each ancestor is
-        probed as a directory path.
+    @staticmethod
+    def _pattern_matches_target(
+        pattern: GitIgnoreSpecPattern,
+        path_no_slash: str,
+        *,
+        is_dir: bool,
+    ) -> bool:
+        """Return True when a compiled ``GitIgnoreSpecPattern`` directly matches
+        ``path_no_slash`` as a directory (``is_dir=True``) or file (``is_dir=False``).
+
+        ``GitIgnoreSpecPattern`` compiles trailing-slash directory rules with capture
+        group ``(?P<ps_d>/)`` while ``SimpleGiBackend`` assigns lower priority (1)
+        to matches capturing ``ps_d`` than to matches without ``ps_d`` (priority 2,
+        such as ``*`` or ``**`` compiled to ``.``). Probing ``spec.match_file("dir/")``
+        therefore lets ``*`` override a later ``!*/`` or ``!dir/``, and lets
+        ``dir/**`` (compiled to ``^dir/``) falsely match ``dir`` itself. Evaluating
+        each ancestor directory and the target file directly against the compiled
+        ``GitIgnoreSpecPattern`` regexes preserves strict last-matching-rule-wins
+        order and Git's directory-vs-file semantics.
         """
-        parts = normalized.split("/")
-        return any(
-            spec.match_file("/".join(parts[:index]) + "/")
-            for index in range(1, len(parts))
-        )
+        if pattern.include is None:
+            return False
+        raw_regex = pattern.regex.pattern
+        if raw_regex.endswith(_DIR_MARK_CG):
+            if not is_dir:
+                return False
+            if raw_regex == _DIR_MARK_CG:
+                return True
+            target = path_no_slash + "/"
+            match = pattern.regex.search(target)
+            return match is not None and match.end() == len(target)
+
+        match = pattern.regex.search(path_no_slash)
+        if match is None:
+            return False
+        return match.groupdict().get(_DIR_MARK) is None
 
     @classmethod
-    def _excluded_by_spec(cls, spec: GitIgnoreSpec, normalized: str) -> bool:
+    def _is_target_excluded(
+        cls,
+        spec: GitIgnoreSpec,
+        path_no_slash: str,
+        *,
+        is_dir: bool,
+    ) -> bool:
+        """Return True when the last matching rule in ``spec`` excludes the target."""
+        for pattern in reversed(spec.patterns):
+            if cls._pattern_matches_target(pattern, path_no_slash, is_dir=is_dir):
+                return bool(pattern.include)
+        return False
+
+    @classmethod
+    def _has_ignored_ancestor(
+        cls,
+        spec: GitIgnoreSpec,
+        normalized: str,
+        dir_cache: Optional[Dict[str, bool]] = None,
+    ) -> bool:
+        """Return True when any parent directory is still excluded by ``spec``.
+
+        Git cannot re-include a file whose parent directory is excluded; each
+        ancestor directory is evaluated in top-down order.
+        """
+        parts = normalized.split("/")
+        for index in range(1, len(parts)):
+            ancestor = "/".join(parts[:index])
+            if dir_cache is not None and ancestor in dir_cache:
+                excluded = dir_cache[ancestor]
+            else:
+                excluded = cls._is_target_excluded(spec, ancestor, is_dir=True)
+                if dir_cache is not None:
+                    dir_cache[ancestor] = excluded
+            if excluded:
+                return True
+        return False
+
+    @classmethod
+    def _excluded_by_spec(
+        cls,
+        spec: GitIgnoreSpec,
+        normalized: str,
+        dir_cache: Optional[Dict[str, bool]] = None,
+    ) -> bool:
         """Return True when rules (including the ancestor rule) exclude the path."""
-        if cls._has_ignored_ancestor(spec, normalized):
+        if cls._has_ignored_ancestor(spec, normalized, dir_cache=dir_cache):
             return True
-        return spec.match_file(normalized)
+        return cls._is_target_excluded(spec, normalized, is_dir=False)
 
     def is_ignored(
         self,
@@ -191,7 +273,7 @@ class FileFilter:
         repo_rules: Optional[GitIgnoreSpec] = None,
     ) -> bool:
         """Return True if ``file_path`` should be excluded."""
-        normalized = file_path.replace("\\", "/").lstrip("/")
+        normalized = self._normalize_rel_path(file_path)
         if not normalized:
             return True
 
@@ -215,15 +297,16 @@ class FileFilter:
             else None
         )
         spec = self._resolve_spec(repo_rules)
+        dir_cache: Dict[str, bool] = {}
 
         included: List[str] = []
         excluded: List[str] = []
         for path in file_paths:
             normalized = path.replace("\\", "/")
-            stripped = normalized.lstrip("/")
+            stripped = self._normalize_rel_path(normalized)
             if (
                 not stripped
-                or self._excluded_by_spec(spec, stripped)
+                or self._excluded_by_spec(spec, stripped, dir_cache=dir_cache)
                 or is_unsupported_binary_extension(stripped)
             ):
                 excluded.append(normalized)
